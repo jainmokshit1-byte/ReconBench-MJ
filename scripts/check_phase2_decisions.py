@@ -10,8 +10,14 @@ SECTION = "## 3. Remaining Backend Schema §13 decisions"
 EXPECTED_ROWS = {
     12: "| 12 | Ledger completeness detection remains a proposed rule. | G-15 |",
     14: "| 14 | Whether `rules_hash` excludes `body.app` remains unconfirmed. | G-25 |",
-    16: "| 16 | KPI/list treatment of approved, held, and rejected cases needs confirmation; the effective-status interpretation is still a proposal. | G-14 |",
-    24: "| 24 | Reason-code titles, messages, and suggested actions await the missing copy deck and Finance review. | G-06 |",
+    16: (
+        "| 16 | KPI/list treatment of approved, held, and rejected cases needs confirmation; "
+        "the effective-status interpretation is still a proposal. | G-14 |"
+    ),
+    24: (
+        "| 24 | Reason-code titles, messages, and suggested actions await the missing copy deck "
+        "and Finance review. | G-06 |"
+    ),
 }
 
 

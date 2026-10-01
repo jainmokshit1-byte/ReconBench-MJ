@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from reconbench_app.db.metadata import metadata
+from reconbench_app.db.metadata import metadata  # noqa: E402
 
 _PROCRASTINATE_TABLES = {
     "procrastinate_events",

@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from reconbench_app.db.seed import BootstrapSettings, seed_database
+from reconbench_app.db.seed import BootstrapSettings, seed_database  # noqa: E402
 
 
 def main() -> int:

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
 
-from reconbench_app.db.migration_config import migration_url
+from reconbench_app.db.migration_config import migration_url  # noqa: E402
 
 CONTRACT_FILE = BACKEND / "reconbench_app" / "db" / "schema_contract.json"
 
@@ -188,7 +188,8 @@ def _catalog_contract(connection: Any) -> dict[str, Any]:
 
     sequences = connection.execute(
         text(
-            "SELECT s.relname AS name, format_type(q.seqtypid,NULL) AS type, owner.rolname AS owner, "
+            "SELECT s.relname AS name, format_type(q.seqtypid,NULL) AS type, "
+            "owner.rolname AS owner, "
             "q.seqstart AS start, q.seqincrement AS increment, q.seqmin AS min, "
             "q.seqmax AS max, q.seqcache AS cache, q.seqcycle AS cycle, "
             "tbl.relname AS owned_by_table, att.attname AS owned_by_column, "

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
 
-from reconbench_app.db.migration_config import migration_url
+from reconbench_app.db.migration_config import migration_url  # noqa: E402
 
 
 def _database_name(value: str) -> str:
@@ -91,7 +91,8 @@ def main() -> int:
                 )
             if copied_heads != set(heads):
                 raise RuntimeError(
-                    f"copied schema did not reach head: expected {heads}, found {sorted(copied_heads)}"
+                    "copied schema did not reach head: "
+                    f"expected {heads}, found {sorted(copied_heads)}"
                 )
         finally:
             copied_engine.dispose()
