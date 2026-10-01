@@ -33,7 +33,7 @@ export interface paths {
         };
         /**
          * Readyz
-         * @description Readiness is successful only when PostgreSQL and the S3 endpoint respond.
+         * @description Readiness checks PostgreSQL migration head and the S3 endpoint.
          */
         get: operations["readyz_readyz_get"];
         put?: never;

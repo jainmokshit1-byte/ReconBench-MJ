@@ -34,7 +34,7 @@
     },
     "/readyz": {
       "get": {
-        "description": "Readiness is successful only when PostgreSQL and the S3 endpoint respond.",
+        "description": "Readiness checks PostgreSQL migration head and the S3 endpoint.",
         "operationId": "readyz_readyz_get",
         "responses": {
           "200": {
