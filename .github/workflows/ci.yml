@@ -117,9 +117,23 @@ jobs:
 
       - name: Scan container images
         run: |
-          for image in api web minio; do
-            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasecurity/trivy:0.74.0 image --exit-code 1 --severity CRITICAL,HIGH "reconbench-$image:ci"
+          # Reuse Trivy's vulnerability database across images in this job.
+          for image in api web; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v reconbench-trivy-cache:/root/.cache \
+              docker.io/aquasec/trivy:0.74.0 image \
+              --ignore-unfixed --exit-code 1 --severity CRITICAL,HIGH \
+              "reconbench-$image:ci"
           done
+
+          # G-28 keeps archived MinIO Community local-only until a supported
+          # object store is selected. Scan and report it, but do not gate CI on it.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v reconbench-trivy-cache:/root/.cache \
+            docker.io/aquasec/trivy:0.74.0 image \
+            --exit-code 0 --severity CRITICAL,HIGH reconbench-minio:ci
 
       - name: Upload SBOMs
         uses: actions/upload-artifact@v7.0.1

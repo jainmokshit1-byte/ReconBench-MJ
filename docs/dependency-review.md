@@ -71,10 +71,14 @@ Reviewed against the checked-in Python and npm lockfiles on 2026-10-01. “Activ
 
 | Component | Version/source | Licence and maintenance | Known advisories | Decision |
 |---|---|---|---|---|
-| PostgreSQL | 16.15 Bookworm image | PostgreSQL licence; supported major line | Image scan runs in CI | Keep for local and CI |
+| PostgreSQL | 16.15 Bookworm image | PostgreSQL licence; supported major line | Used by Compose and the Phase 2 CI service; not included in the Trivy image loop | Keep for local and CI |
 | MinIO Community | Source-built `RELEASE.2025-10-15T17-29-55Z` | AGPL-3.0; upstream repository archived 2026-04-25, community edition is source-only and no longer maintained | Not covered by Python/npm lockfile audits; Trivy scans the built image | Keep only to satisfy local Phase 1 parity with the TRD; do not use for staging/production without an explicit, current licence and support decision (G-28) |
 
-PyMuPDF is absent from both lockfiles. No package in Phase 1 uses SQLite. The API image uses Python 3.12 slim; the web build uses Node 24 and Nginx Alpine. Syft and Trivy inventory and scan the source and built images in CI so operating-system and Go dependencies are included in supply-chain evidence.
+PyMuPDF is absent from both lockfiles. No package in Phase 1 uses SQLite. The API image uses Python 3.12 slim on Debian Trixie; the web build uses Node 24 and Nginx Alpine. Syft inventories the source and built application images in CI so operating-system and Go dependencies are included in supply-chain evidence.
+
+## Phase 1 CI image-scan policy
+
+CI blocks on fixable HIGH/CRITICAL findings in the API and web images. Trivy's `--ignore-unfixed` excludes findings for which the vendor has not released a fix; those findings still need review before deployment under the Phase 7 security gate. The MinIO Community image is scanned and its findings are reported, but it does not block Phase 1 CI while G-28 restricts it to local development and its upstream is archived. Before staging, replace it with a supported object store and make its scan blocking. The PostgreSQL service image is not included in the current Trivy image loop.
 
 ## Secret scanning
 
