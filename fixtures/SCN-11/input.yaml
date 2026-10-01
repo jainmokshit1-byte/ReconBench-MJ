@@ -1,0 +1,13 @@
+scenario_id: SCN-11
+synthetic: true
+title: A repeated invoice is marked duplicate and consumes no ledger balance
+input:
+  purchase_order:
+    number: SYN-PO-1011
+    qty: '10'
+  invoices:
+  - number: SYN-INV-1011
+    qty: '4'
+  - number: SYN-INV-1011
+    qty: '4'
+    upload: rescan

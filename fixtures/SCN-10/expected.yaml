@@ -1,0 +1,7 @@
+scenario_id: SCN-10
+link:
+  po: PO-26-27-142
+  method: labeled
+status: Matched
+reason_codes: []
+canonical_po: PO2627142

@@ -1,0 +1,17 @@
+scenario_id: SCN-03
+synthetic: true
+title: Cumulative receipts of 60 and 30 cover one invoice for 90
+input:
+  purchase_order:
+    number: SYN-PO-1003
+    qty: '100'
+    rate: '200.00'
+  grns:
+  - number: SYN-GRN-1003A
+    accepted_qty: '60'
+  - number: SYN-GRN-1003B
+    accepted_qty: '30'
+  invoice:
+    number: SYN-INV-1003
+    qty: '90'
+    rate: '200.00'

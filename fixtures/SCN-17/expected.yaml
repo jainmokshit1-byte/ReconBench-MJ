@@ -1,0 +1,9 @@
+scenario_id: SCN-17
+in_pool:
+  status: Matched
+  reason_codes: []
+not_in_pool:
+  status: Unlinked
+  reason_codes:
+  - NO_PO_LINK
+  detail: PO_NOT_IN_POOL

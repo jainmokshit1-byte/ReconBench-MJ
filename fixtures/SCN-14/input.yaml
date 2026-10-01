@@ -1,0 +1,20 @@
+scenario_id: SCN-14
+synthetic: true
+title: One invoice has separate lines linked to two purchase orders
+input:
+  purchase_orders:
+  - number: SYN-PO-1014A
+    item: Monitor
+    qty: '10'
+  - number: SYN-PO-1014B
+    item: Dock
+    qty: '5'
+  invoice:
+    number: SYN-INV-1014
+    lines:
+    - item: Monitor
+      qty: '10'
+      po: SYN-PO-1014A
+    - item: Dock
+      qty: '5'
+      po: SYN-PO-1014B

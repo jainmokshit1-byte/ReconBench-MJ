@@ -1,0 +1,4 @@
+scenario_id: SCN-16
+status: Matched (flags)
+reason_codes:
+- EXTRA_CHARGE

@@ -1,0 +1,11 @@
+scenario_id: SCN-17
+synthetic: true
+title: A prior-period PO in the pool links; a PO outside the pool is unlinked
+input:
+  period: 2026-09
+  in_pool:
+    purchase_order: SYN-PO-1017A
+    invoice: SYN-INV-1017A
+  not_in_pool:
+    invoice_po: SYN-PO-1017B
+    po_uploaded: false

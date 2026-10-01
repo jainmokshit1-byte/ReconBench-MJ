@@ -1,0 +1,17 @@
+scenario_id: SCN-09
+synthetic: true
+title: PO-link ladder uses labelled reference, reverse lookup, then a suggestion
+input:
+  purchase_order:
+    number: BM-PO-0142
+    open_qty: '10'
+  invoice:
+    number: ACR/26-27/2260
+  grn:
+    number: GRN-2609-047
+    invoice_reference: ACR/26-27/2260
+    po: BM-PO-0142
+  variants:
+  - po_ref_on_invoice
+  - po_ref_in_grn
+  - single_open_candidate

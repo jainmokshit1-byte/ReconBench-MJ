@@ -1,0 +1,6 @@
+scenario_id: SCN-19
+status: Needs Review
+reason_codes:
+- NO_TEXT_LAYER
+auto_matched: false
+pending_until: real scan supplied for later parser work

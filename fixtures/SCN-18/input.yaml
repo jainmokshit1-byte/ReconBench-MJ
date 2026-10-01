@@ -1,0 +1,14 @@
+scenario_id: SCN-18
+synthetic: true
+title: Ingestion order does not change final reconciliation results
+input:
+  documents:
+  - SYN-INV-1018-SEP
+  - SYN-INV-1018-OCT
+  - SYN-PO-1018
+  - SYN-GRN-1018
+  orders_to_compare:
+  - - SYN-INV-1018-SEP
+    - SYN-INV-1018-OCT
+  - - SYN-INV-1018-OCT
+    - SYN-INV-1018-SEP

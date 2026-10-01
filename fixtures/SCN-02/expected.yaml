@@ -1,0 +1,26 @@
+scenario_id: SCN-02
+results:
+- invoice: ACR/26-27/2201
+  link:
+    po: BM-PO-0142
+    method: labeled
+  status: Matched
+  reason_codes: []
+  ledger:
+    ordered: '100'
+    billed_before: '0'
+    this_invoice: '90'
+    grn_accepted_cumulative: '90'
+    balance: '10'
+- invoice: ACR/26-27/2260
+  link:
+    po: BM-PO-0142
+    method: labeled
+  status: Matched
+  reason_codes: []
+  ledger:
+    ordered: '100'
+    billed_before: '90'
+    this_invoice: '10'
+    grn_accepted_cumulative: '100'
+    balance: '0'

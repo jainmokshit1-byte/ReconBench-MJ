@@ -1,0 +1,6 @@
+scenario_id: SCN-11
+duplicate_invoice:
+  status: Duplicate
+  reason_codes:
+  - DUP_INVOICE
+  ledger_consumed: '0'

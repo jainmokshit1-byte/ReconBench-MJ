@@ -1,0 +1,16 @@
+scenario_id: SCN-05
+synthetic: true
+title: Late GRN leaves the invoice pending, then resolves
+input:
+  purchase_order:
+    number: SYN-PO-1005
+    qty: '10'
+    rate: '800.00'
+  grns_before:
+  - accepted_qty: '8'
+  invoice:
+    number: SYN-INV-1005
+    qty: '10'
+  grns_after:
+  - number: SYN-GRN-1005B
+    accepted_qty: '2'

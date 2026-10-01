@@ -1,0 +1,146 @@
+name: ReconBench CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scaffold-gates:
+    name: Scaffold, core purity, integration, and image gates
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: 0.12.19
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install locked dependencies
+        run: |
+          uv sync --project backend --all-groups --locked
+          npm ci --prefix web
+
+      - name: Generate ephemeral service credentials
+        shell: bash
+        run: |
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> "$GITHUB_ENV"
+          echo "MINIO_ROOT_PASSWORD=$(openssl rand -hex 24)" >> "$GITHUB_ENV"
+
+      # 1. Lint, type checks, and architecture contracts
+      - name: Lint and type check
+        run: make check-static
+
+      # 2. Unit, property, and scenario smoke tests
+      - name: Run Python and web smoke tests
+        run: make test
+
+      # 3. PostgreSQL and object-store integration checks
+      - name: Start PostgreSQL and MinIO
+        run: docker compose --env-file .env.example up -d postgres minio
+        env:
+          POSTGRES_PASSWORD: ci-postgres-secret-20261001
+          MINIO_ROOT_PASSWORD: ci-minio-secret-20261001
+
+      - name: Wait for integration services
+        run: |
+          RB_DATABASE_URL="postgresql+psycopg://reconbench:${POSTGRES_PASSWORD}@127.0.0.1:15432/reconbench" \
+          RB_S3_ENDPOINT_URL=http://127.0.0.1:9000 \
+          RB_S3_REGION=us-east-1 \
+          RB_S3_BUCKET=reconbench-local \
+          RB_S3_API_ACCESS_KEY=reconbench-local \
+          RB_S3_API_SECRET_KEY="$MINIO_ROOT_PASSWORD" \
+          RB_PUBLIC_BASE_URL=http://localhost:5173 \
+          uv run --project backend python scripts/wait_for_services.py --attempts 60 --delay 2
+
+      - name: Verify database and object store
+        run: |
+          RB_DATABASE_URL="postgresql+psycopg://reconbench:${POSTGRES_PASSWORD}@127.0.0.1:15432/reconbench" \
+          RB_S3_ENDPOINT_URL=http://127.0.0.1:9000 \
+          RB_S3_REGION=us-east-1 \
+          RB_S3_BUCKET=reconbench-local \
+          RB_S3_API_ACCESS_KEY=reconbench-local \
+          RB_S3_API_SECRET_KEY="$MINIO_ROOT_PASSWORD" \
+          RB_PUBLIC_BASE_URL=http://localhost:5173 \
+          uv run --project backend pytest backend/tests/integration -q
+
+      - name: Run Procrastinate lifecycle spike
+        run: |
+          RB_DATABASE_URL="postgresql+psycopg://reconbench:${POSTGRES_PASSWORD}@127.0.0.1:15432/reconbench" \
+          uv run --project backend python -m scripts.spikes.sp1_procrastinate
+
+      - name: Stop integration services
+        if: always()
+        run: docker compose --env-file .env.example down --volumes --remove-orphans
+
+      # 4. Golden-set fail-closed harness
+      - name: Run golden-set harness and false-Matched self-check
+        run: make golden
+
+      # 5. Pure-engine rules hash
+      - name: Verify rules hash
+        run: uv run --project backend python scripts/check_rules_hash.py
+
+      # 6. Lockfile advisories, image build, and SBOM
+      - name: Audit locked dependencies
+        run: make audit
+
+      - name: Build API image
+        run: docker build --file deploy/backend.Dockerfile --tag reconbench-api:ci .
+
+      - name: Build web image
+        run: docker build --file deploy/web.Dockerfile --tag reconbench-web:ci .
+
+      - name: Build local MinIO image
+        run: docker build --file deploy/minio.Dockerfile --tag reconbench-minio:ci .
+
+      - name: Generate source and image SBOMs
+        run: |
+          mkdir -p artifacts
+          docker run --rm -v "$PWD:/source" anchore/syft:v1.52.0 dir:/source -o cyclonedx-json=/source/artifacts/sbom-source.cdx.json
+          for image in api web minio; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/artifacts:/artifacts" anchore/syft:v1.52.0 "reconbench-$image:ci" -o "cyclonedx-json=/artifacts/sbom-$image.cdx.json"
+          done
+
+      - name: Scan container images
+        run: |
+          for image in api web minio; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasecurity/trivy:0.74.0 image --exit-code 1 --severity CRITICAL,HIGH "reconbench-$image:ci"
+          done
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: reconbench-phase-1-sboms
+          path: artifacts/*.cdx.json
+          if-no-files-found: error
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Scan repository history
+        run: >-
+          docker run --rm --volume "$PWD:/repo"
+          ghcr.io/gitleaks/gitleaks:v8.29.1@sha256:aa036a2f4bdfe3cc3c55fa4326308efabb4a6be498c883c864fd1d0d5585438a
+          git --redact --no-banner /repo

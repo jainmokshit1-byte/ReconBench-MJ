@@ -1,0 +1,5 @@
+scenario_id: SCN-20
+status: Matched
+reason_codes: []
+math_and_verdict_identical_between_modes: true
+provider_verdict_ignored: true

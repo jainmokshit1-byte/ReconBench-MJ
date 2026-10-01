@@ -1,0 +1,8 @@
+scenario_id: SCN-14
+line_links:
+- line: 1
+  po: SYN-PO-1014A
+- line: 2
+  po: SYN-PO-1014B
+status: Matched
+reason_codes: []

@@ -1,0 +1,15 @@
+scenario_id: SCN-16
+synthetic: true
+title: An extra freight line is visible as a matched flag
+input:
+  purchase_order:
+    number: SYN-PO-1016
+    item: Equipment
+  invoice:
+    number: SYN-INV-1016
+    lines:
+    - type: goods
+      item: Equipment
+    - type: charge
+      item: Freight
+      amount: '250.00'

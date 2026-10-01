@@ -1,0 +1,108 @@
+[project]
+name = "reconbench-app"
+version = "0.1.0"
+description = "Auditable three-way invoice reconciliation"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic>=1.16",
+  "boto3>=1.40",
+  "botocore>=1.40,<2",
+  "charset-normalizer>=3.4",
+  "fastapi>=0.120",
+  "lxml>=6.0",
+  "opentelemetry-api>=1.37",
+  "opentelemetry-sdk>=1.37",
+  "opentelemetry-exporter-otlp-proto-http>=1.37",
+  "pdfplumber>=0.11",
+  "prometheus-client>=0.23",
+  "procrastinate>=3.0",
+  "psycopg[binary]>=3.2",
+  "pydantic>=2.12,<3",
+  "pydantic-settings>=2.11",
+  "pypdfium2>=4.30",
+  "python-dotenv>=1.1",
+  "rapidfuzz>=3.14",
+  "scipy>=1.16",
+  "sentry-sdk>=2.40",
+  "sqlalchemy>=2.0.44,<2.1",
+  "structlog>=25.4",
+  "uvicorn[standard]>=0.38",
+  "xlsxwriter>=3.2",
+]
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.145",
+  "import-linter>=2.7",
+  "mypy>=1.18",
+  "pip-audit>=2.9",
+  "pytest>=8.4",
+  "pytest-cov>=7.0",
+  "pyyaml>=6.0",
+  "reportlab>=4.4",
+  "ruff>=0.16",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["reconbench_core", "reconbench_app"]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["reconbench_core", "reconbench_app"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["reconbench_core"]
+mypy_path = "."
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = [".."]
+
+[tool.coverage.run]
+branch = true
+source = ["reconbench_core", "reconbench_app"]
+
+[tool.importlinter]
+root_packages = ["reconbench_core", "reconbench_app"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Core package layers follow the pure-library dependency rule"
+type = "layers"
+layers = [
+  "reconbench_core.export",
+  "reconbench_core.parsers | reconbench_core.mapping | reconbench_core.recon",
+  "reconbench_core.align",
+  "reconbench_core.normalize",
+  "reconbench_core.schema",
+]
+
+[[tool.importlinter.contracts]]
+name = "Core must not import app or infrastructure adapters"
+type = "forbidden"
+source_modules = ["reconbench_core"]
+forbidden_modules = [
+  "reconbench_app",
+  "sqlalchemy",
+  "boto3",
+  "httpx",
+  "requests",
+  "anthropic",
+  "openai",
+  "google",
+]

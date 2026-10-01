@@ -1,0 +1,14 @@
+scenario_id: SCN-06
+link:
+  po: SYN-PO-1006
+  method: labeled
+status: Exception
+reason_codes:
+- QTY_OVER_GRN
+ledger:
+  ordered: '10'
+  this_invoice: '10'
+  grn_accepted_cumulative: '8'
+  eligible: '8'
+  payable_qty: '8'
+  at_risk: '2000.00'

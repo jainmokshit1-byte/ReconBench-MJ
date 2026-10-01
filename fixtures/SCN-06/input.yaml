@@ -1,0 +1,14 @@
+scenario_id: SCN-06
+synthetic: true
+title: Rejected receipt quantity is not payable
+input:
+  purchase_order:
+    number: SYN-PO-1006
+    qty: '10'
+    rate: '1000.00'
+  grn:
+    accepted_qty: '8'
+    rejected_qty: '2'
+  invoice:
+    number: SYN-INV-1006
+    qty: '10'

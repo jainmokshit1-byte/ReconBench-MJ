@@ -1,0 +1,10 @@
+scenario_id: SCN-08
+synthetic: true
+title: Specification guard rejects a 16GB item against an 8GB PO line
+input:
+  purchase_order:
+    number: SYN-PO-1008
+    item: Laptop 8GB RAM
+  invoice:
+    number: SYN-INV-1008
+    item: Laptop 16GB RAM

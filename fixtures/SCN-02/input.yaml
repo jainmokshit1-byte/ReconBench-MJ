@@ -1,0 +1,35 @@
+scenario_id: SCN-02
+synthetic: true
+title: 'Partial delivery C1: 90 now and 10 later'
+input:
+  purchase_order:
+    number: BM-PO-0142
+    vendor: Acer India Pvt Ltd
+    item: Acer Aspire 5 (i5 / 16GB / 512GB)
+    hsn: '8471'
+    qty: '100'
+    rate: '48000.00'
+    gst_rate: '18'
+  documents:
+  - type: grn
+    number: GRN-2609-011
+    date: '2026-09-12'
+    accepted_qty: '90'
+  - type: invoice
+    number: ACR/26-27/2201
+    date: '2026-09-14'
+    qty: '90'
+    taxable: '4320000.00'
+    gst: '777600.00'
+    total: '5097600.00'
+  - type: grn
+    number: GRN-2609-047
+    date: '2026-09-26'
+    accepted_qty: '10'
+  - type: invoice
+    number: ACR/26-27/2260
+    date: '2026-09-28'
+    qty: '10'
+    taxable: '480000.00'
+    gst: '86400.00'
+    total: '566400.00'

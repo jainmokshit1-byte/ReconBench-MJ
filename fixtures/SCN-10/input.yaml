@@ -1,0 +1,6 @@
+scenario_id: SCN-10
+synthetic: true
+title: PO number canonicalization ignores separators and leading-zero formatting
+input:
+  purchase_order: PO/26-27/0142
+  invoice: PO-26-27-142

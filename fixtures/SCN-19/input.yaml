@@ -1,0 +1,7 @@
+scenario_id: SCN-19
+synthetic: true
+title: Unreadable scanned document never passes silently
+input:
+  document: synthetic-only.pdf-placeholder
+  scan_quality: unreadable
+  real_pdf_included: false

@@ -1,0 +1,7 @@
+scenario_id: SCN-13
+synthetic: true
+title: An invoice citing another supplier's PO fails the vendor check
+input:
+  invoice_vendor: Vendor A Synthetic Ltd
+  po_vendor: Vendor B Synthetic Ltd
+  invoice_po: SYN-PO-1013

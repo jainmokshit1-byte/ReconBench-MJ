@@ -1,0 +1,12 @@
+scenario_id: SCN-01
+link:
+  po: SYN-PO-1001
+  method: labeled
+status: Matched
+reason_codes: []
+ledger:
+  ordered: '10'
+  billed_before: '0'
+  this_invoice: '10'
+  grn_accepted_cumulative: '10'
+  balance: '0'

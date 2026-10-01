@@ -1,0 +1,12 @@
+scenario_id: SCN-20
+synthetic: true
+title: AI mode does not change calculations or verdicts
+input:
+  invoice: SYN-INV-1020
+  purchase_order: SYN-PO-1020
+  ai_modes:
+  - rules_only
+  - ai_assisted
+  stub_provider_response:
+    qty: '999999'
+    verdict: Matched

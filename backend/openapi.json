@@ -1,0 +1,56 @@
+{
+  "info": {
+    "description": "Phase 1 API skeleton; product endpoints arrive in later phases.",
+    "title": "ReconBench API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/healthz": {
+      "get": {
+        "description": "Liveness check with no infrastructure or configuration detail.",
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Healthz Healthz Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Healthz",
+        "tags": [
+          "Operations"
+        ]
+      }
+    },
+    "/readyz": {
+      "get": {
+        "description": "Readiness is successful only when PostgreSQL and the S3 endpoint respond.",
+        "operationId": "readyz_readyz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Readyz",
+        "tags": [
+          "Operations"
+        ]
+      }
+    }
+  }
+}

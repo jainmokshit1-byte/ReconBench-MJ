@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgres:16.15-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reconbench}
+      POSTGRES_USER: ${POSTGRES_USER:?Run make up to generate local configuration}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run make up to generate local credentials}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?Run make up to generate local configuration} -d ${POSTGRES_DB:-reconbench}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  minio:
+    build:
+      context: .
+      dockerfile: deploy/minio.Dockerfile
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Run make up to generate local configuration}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Run make up to generate local credentials}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "--spider", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    environment:
+      RB_ENV: ${RB_ENV:-local}
+      RB_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Run make up to generate local configuration}:${POSTGRES_PASSWORD:?Run make up to generate local credentials}@postgres:5432/${POSTGRES_DB:-reconbench}
+      RB_S3_ENDPOINT_URL: http://minio:9000
+      RB_S3_REGION: ${RB_S3_REGION:-us-east-1}
+      RB_S3_BUCKET: ${RB_S3_BUCKET:-reconbench-local}
+      RB_S3_API_ACCESS_KEY: ${MINIO_ROOT_USER:?Run make up to generate local configuration}
+      RB_S3_API_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Run make up to generate local credentials}
+      RB_SECRET_MASTER_KEY: ${RB_SECRET_MASTER_KEY:-}
+      RB_SECRET_MASTER_KEY_ID: ${RB_SECRET_MASTER_KEY_ID:-local-dev-only}
+      RB_PUBLIC_BASE_URL: ${RB_PUBLIC_BASE_URL:-http://localhost:5173}
+      RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
+      RB_OTEL_EXPORTER_OTLP_ENDPOINT: ${RB_OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      RB_SENTRY_DSN: ${RB_SENTRY_DSN:-}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: reconbench_phase1_postgres_data
+  minio_data:
+    name: reconbench_phase1_minio_data

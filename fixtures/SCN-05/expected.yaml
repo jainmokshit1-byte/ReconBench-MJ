@@ -1,0 +1,14 @@
+scenario_id: SCN-05
+before_late_grn:
+  status: Pending
+  reason_codes:
+  - GRN_PENDING
+  ledger:
+    ordered: '10'
+    billed_before: '0'
+    this_invoice: '10'
+    grn_accepted_cumulative: '8'
+    balance: '0'
+after_late_grn:
+  status: Matched
+  reason_codes: []

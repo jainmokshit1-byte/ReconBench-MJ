@@ -1,0 +1,7 @@
+scenario_id: SCN-13
+link:
+  po: SYN-PO-1013
+  method: labeled
+status: Exception
+reason_codes:
+- VENDOR_MISMATCH

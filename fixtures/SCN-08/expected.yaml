@@ -1,0 +1,7 @@
+scenario_id: SCN-08
+link:
+  po: SYN-PO-1008
+  method: labeled
+status: Exception
+reason_codes:
+- ITEM_NOT_ON_PO

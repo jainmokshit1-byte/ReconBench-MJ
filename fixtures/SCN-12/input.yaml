@@ -1,0 +1,7 @@
+scenario_id: SCN-12
+synthetic: true
+title: Ledger name and legal name resolve to the same supplier
+input:
+  vendor_alias: Example Components
+  vendor_legal_name: Example Components Private Limited
+  gstin: 27ABCDE1234F1Z5

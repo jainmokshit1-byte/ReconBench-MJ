@@ -1,0 +1,10 @@
+scenario_id: SCN-07
+variants:
+- invoice: SYN-INV-1007A
+  status: Matched
+  reason_codes: []
+- invoice: SYN-INV-1007B
+  status: Exception
+  reason_codes:
+  - RATE_HIGH
+  at_risk: '200.00'

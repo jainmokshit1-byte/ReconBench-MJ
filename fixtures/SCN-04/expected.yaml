@@ -1,0 +1,17 @@
+scenario_id: SCN-04
+link:
+  po: SYN-PO-1004
+  method: labeled
+status: Exception
+reason_codes:
+- QTY_OVER_PO
+- QTY_OVER_GRN
+ledger:
+  ordered: '100'
+  billed_before: '90'
+  this_invoice: '15'
+  billed_cumulative: '105'
+  grn_accepted_cumulative: '105'
+  eligible: '10'
+  balance: '0'
+  at_risk: '2500.00'

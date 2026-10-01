@@ -1,0 +1,4 @@
+scenario_id: SCN-15
+status: Matched (flags)
+reason_codes:
+- TAX_TYPE_MISMATCH

@@ -1,0 +1,8 @@
+scenario_id: SCN-15
+synthetic: true
+title: IGST on a synthetic intra-state supply is surfaced as a tax warning
+input:
+  supplier_state: '27'
+  buyer_state: '27'
+  invoice_tax: IGST
+  invoice: SYN-INV-1015

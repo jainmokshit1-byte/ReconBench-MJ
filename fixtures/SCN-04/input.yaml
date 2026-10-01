@@ -1,0 +1,16 @@
+scenario_id: SCN-04
+synthetic: true
+title: Second invoice exceeds the cumulative PO cap
+input:
+  purchase_order:
+    number: SYN-PO-1004
+    qty: '100'
+    rate: '500.00'
+  grns:
+  - accepted_qty: '60'
+  - accepted_qty: '45'
+  invoices:
+  - number: SYN-INV-1004A
+    qty: '90'
+  - number: SYN-INV-1004B
+    qty: '15'

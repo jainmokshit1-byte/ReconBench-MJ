@@ -1,0 +1,16 @@
+scenario_id: SCN-01
+synthetic: true
+title: Exact one PO, one GRN, one invoice
+input:
+  purchase_order:
+    number: SYN-PO-1001
+    qty: '10'
+    rate: '1250.00'
+  grn:
+    number: SYN-GRN-1001
+    accepted_qty: '10'
+  invoice:
+    number: SYN-INV-1001
+    po_ref: SYN-PO-1001
+    qty: '10'
+    rate: '1250.00'

@@ -1,0 +1,22 @@
+scenario_id: SCN-09
+variants:
+- variant: po_ref_on_invoice
+  link:
+    po: BM-PO-0142
+    method: labeled
+  status: Matched
+  reason_codes: []
+- variant: po_ref_in_grn
+  link:
+    po: BM-PO-0142
+    method: via_grn
+  status: Matched
+  reason_codes: []
+- variant: single_open_candidate
+  link:
+    po: BM-PO-0142
+    method: content
+    state: suggested
+  status: Needs Review
+  reason_codes:
+  - LINK_INFERRED
