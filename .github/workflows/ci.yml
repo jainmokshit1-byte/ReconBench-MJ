@@ -54,9 +54,6 @@ jobs:
       # 3. PostgreSQL and object-store integration checks
       - name: Start PostgreSQL and MinIO
         run: docker compose --env-file .env.example up -d postgres minio
-        env:
-          POSTGRES_PASSWORD: ci-postgres-secret-20261001
-          MINIO_ROOT_PASSWORD: ci-minio-secret-20261001
 
       - name: Wait for integration services
         run: |
