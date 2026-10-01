@@ -4,22 +4,27 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import boto3
 import structlog
+from alembic.config import Config as AlembicConfig
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from botocore.config import Config
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from reconbench_app.json_serialization import DecimalJSONResponse
 from reconbench_app.logging_config import configure_logging
 from reconbench_app.middleware import JsonBodyLimitMiddleware, RequestIdMiddleware
 from reconbench_app.settings import Settings
 
 logger = structlog.get_logger(__name__)
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -54,6 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="ReconBench API",
         description="Phase 1 API skeleton; product endpoints arrive in later phases.",
         version="0.1.0",
+        default_response_class=DecimalJSONResponse,
         openapi_url="/openapi.json",
         docs_url="/docs/api",
         redoc_url=None,
@@ -63,13 +69,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(RequestIdMiddleware)
 
     @app.exception_handler(StarletteHTTPException)
-    async def problem_details(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def problem_details(request: Request, exc: StarletteHTTPException) -> DecimalJSONResponse:
         status = exc.status_code
         detail = (
             exc.detail if isinstance(exc.detail, str) else "The request could not be processed."
         )
         code = "not_found" if status == 404 else "request_error"
-        return JSONResponse(
+        return DecimalJSONResponse(
             status_code=status,
             media_type="application/problem+json",
             content={
@@ -86,9 +92,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def validation_problem_details(
         request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
+    ) -> DecimalJSONResponse:
         del exc  # Do not echo submitted values; payloads can contain personal or financial data.
-        return JSONResponse(
+        return DecimalJSONResponse(
             status_code=422,
             media_type="application/problem+json",
             content={
@@ -102,9 +108,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.exception_handler(Exception)
-    async def unexpected_problem_details(request: Request, exc: Exception) -> JSONResponse:
+    async def unexpected_problem_details(request: Request, exc: Exception) -> DecimalJSONResponse:
         logger.error("unhandled_request_error", error_type=type(exc).__name__)
-        return JSONResponse(
+        return DecimalJSONResponse(
             status_code=500,
             media_type="application/problem+json",
             content={
@@ -124,18 +130,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/readyz", include_in_schema=True, tags=["Operations"], response_model=None)
-    def readyz() -> JSONResponse:
-        """Readiness is successful only when PostgreSQL and the S3 endpoint respond."""
+    def readyz() -> DecimalJSONResponse:
+        """Readiness checks PostgreSQL migration head and the S3 endpoint."""
 
         checks: dict[str, Any] = {}
         try:
             with engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
+                current_heads = set(MigrationContext.configure(connection).get_current_heads())
+            scripts = ScriptDirectory.from_config(AlembicConfig(str(BACKEND_ROOT / "alembic.ini")))
+            expected_heads = set(scripts.get_heads())
             checks["database"] = True
+            checks["migrations"] = current_heads == expected_heads
+            if not checks["migrations"]:
+                logger.warning(
+                    "readiness_check_failed",
+                    dependency="migrations",
+                    current_head_count=len(current_heads),
+                    expected_head_count=len(expected_heads),
+                )
         except Exception as exc:  # noqa: BLE001 - return a stable, non-sensitive readiness response.
             checks["database"] = False
             logger.warning(
-                "readiness_check_failed", dependency="database", error_type=type(exc).__name__
+                "readiness_check_failed",
+                dependency="database_migrations",
+                error_type=type(exc).__name__,
             )
         try:
             s3.list_buckets()
@@ -147,8 +166,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         if all(checks.values()):
-            return JSONResponse(content={"status": "ready"})
-        return JSONResponse(status_code=503, content={"status": "not_ready"})
+            return DecimalJSONResponse(content={"status": "ready"})
+        return DecimalJSONResponse(status_code=503, content={"status": "not_ready"})
 
     api_v1 = APIRouter(prefix="/api/v1", tags=["API v1"])
     app.include_router(api_v1)

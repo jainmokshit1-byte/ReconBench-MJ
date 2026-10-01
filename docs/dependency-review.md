@@ -32,6 +32,7 @@ Reviewed against the checked-in Python and npm lockfiles on 2026-10-01. “Activ
 | Library | Locked version | Licence | Maintenance at review | Known advisories | Decision |
 |---|---:|---|---|---|---|
 | Hypothesis | 6.168.3 | MPL-2.0 | Active | None reported by `pip-audit` | Keep; dev only |
+| httpx2 | 2.13.1 | BSD-3-Clause | Active | None reported by refreshed `pip-audit` | Keep; dev only, required by Starlette's integration-test client |
 | import-linter | 2.15 | BSD-2-Clause | Active | None reported by `pip-audit` | Keep; dev only |
 | mypy | 2.3.1 | MIT | Active | None reported by `pip-audit` | Keep; dev only |
 | pip-audit | 2.10.1 | Apache-2.0 (includes ISC-licensed reused examples) | Active | None reported by `pip-audit` | Keep; dev only |

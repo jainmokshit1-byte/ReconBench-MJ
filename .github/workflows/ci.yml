@@ -144,3 +144,77 @@ jobs:
           docker run --rm --volume "$PWD:/repo"
           ghcr.io/gitleaks/gitleaks:v8.29.1@sha256:aa036a2f4bdfe3cc3c55fa4326308efabb4a6be498c883c864fd1d0d5585438a
           git --redact --no-banner /repo
+
+  phase2-database:
+    name: Phase 2 PostgreSQL schema gates
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.15-bookworm
+        env:
+          POSTGRES_DB: reconbench_phase2_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: phase2-ephemeral-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d reconbench_phase2_ci"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      RB_ENV: ci
+      RB_MIGRATOR_DATABASE_URL: postgresql+psycopg://postgres:phase2-ephemeral-ci-only@127.0.0.1:5432/reconbench_phase2_ci
+      RB_DATABASE_URL: postgresql+psycopg://postgres:phase2-ephemeral-ci-only@127.0.0.1:5432/reconbench_phase2_ci
+      RB_PHASE2_TEST_DATABASE_URL: postgresql+psycopg://postgres:phase2-ephemeral-ci-only@127.0.0.1:5432/reconbench_phase2_ci
+      RB_BOOTSTRAP_EMAIL: phase2-manager@example.invalid
+      RB_BOOTSTRAP_DISPLAY_NAME: Synthetic Phase 2 Manager
+      RB_BOOTSTRAP_PASSWORD_HASH: $argon2id$v=19$m=65536,t=3,p=4$c3ludGhldGlj$bm90LWF1dGhlbnRpY2F0ZWQ
+      RB_BOOTSTRAP_WORKSPACE_NAME: Synthetic Phase 2 Workspace
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: 0.12.19
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --project backend --all-groups --locked
+
+      - name: Build the previous schema
+        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0014
+
+      - name: Test the migration on a copy of the previous schema
+        run: uv run --project backend python scripts/check_migration_safety.py
+
+      - name: Upgrade the disposable database to head
+        run: uv run --project backend alembic -c backend/alembic.ini upgrade head
+
+      - name: Check metadata drift and the planned index list
+        run: |
+          uv run --project backend python scripts/check_schema_drift.py
+          uv run --project backend python scripts/check_phase2_catalog.py
+          uv run --project backend python scripts/check_phase2_indexes.py
+
+      - name: Verify the open Schema §13 decisions remain logged
+        run: uv run --project backend python scripts/check_phase2_decisions.py
+
+      - name: Verify seed idempotence
+        run: |
+          uv run --project backend python scripts/seed_database.py > seed-first.txt
+          uv run --project backend python scripts/seed_database.py > seed-second.txt
+          diff -u seed-first.txt seed-second.txt
+
+      - name: Run Phase 2 PostgreSQL integration checks
+        run: uv run --project backend pytest backend/tests/integration/test_phase2_database.py backend/tests/integration/test_phase2_readyz.py -q
+
+      - name: Apply the pinned Procrastinate schema separately
+        run: uv run --project backend procrastinate --app reconbench_app.db.procrastinate_schema.app schema --apply
+
+      - name: Count ReconBench and queue tables
+        run: uv run --project backend python scripts/check_phase2_table_count.py

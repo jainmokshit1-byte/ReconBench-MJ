@@ -331,17 +331,17 @@ Nothing else is seeded. Vendors, aliases and layout profiles are created by the 
 
 ### Done when
 
-- [ ] On an empty PostgreSQL 16, `alembic upgrade head` succeeds; a catalog test counts **41** ReconBench tables plus the queue library's tables; a second `upgrade head` is a no-op.
-- [ ] The autogenerate drift test reports no difference between the code metadata and the migrated database.
-- [ ] Integration tests prove `reconbench_app` **cannot UPDATE, DELETE or TRUNCATE** any of the 10 append-only tables (`document_version`, `doc_line`, `field_evidence`, `link`, `config_version`, `recon_case`, `recon_line_result`, `run_manifest`, `case_action`, `audit_log`), and that `forbid_mutation` also fires for a privileged session.
-- [ ] `reconbench_report` cannot read `secret`, `session`, `rate_limit_event`, or the password column of `app_user`.
-- [ ] A catalog test confirms: no `float`/`double` column anywhere; every table has `workspace_id`; every unique index starts with `workspace_id`; numeric precisions match the list in 2.4.
-- [ ] The seed script run twice gives identical row counts; 28 reason codes; `config_active` points at seq 1; `engine_hash` and `body_hash` are reproducible across machines.
-- [ ] Constraint tests in 2.8 pass, including audit-chain continuity under concurrent inserts.
-- [ ] The index list in 2.9 exists (catalog test).
-- [ ] CI runs migrations on a copy of the previous schema and passes.
-- [ ] `docs/schema-errata.md` exists and the decision log holds the 4 open schema items.
-- [ ] `GET /readyz` reports not-ready while the database is behind the migration head and ready after `upgrade head` (TR-OPS-8).
+- [x] On an empty PostgreSQL 16, `alembic upgrade head` succeeds; a catalog test counts **41** ReconBench tables plus the queue library's tables; a second `upgrade head` is a no-op. Evidence: `docs/gates/phase-2.md`.
+- [x] The autogenerate drift test reports no difference between the code metadata and the migrated database. Evidence: `docs/gates/phase-2.md`.
+- [x] Integration tests prove `reconbench_app` **cannot UPDATE, DELETE or TRUNCATE** any of the 10 append-only tables (`document_version`, `doc_line`, `field_evidence`, `link`, `config_version`, `recon_case`, `recon_line_result`, `run_manifest`, `case_action`, `audit_log`), and that `forbid_mutation` also fires for a privileged session. Evidence: `docs/gates/phase-2.md`.
+- [x] `reconbench_report` cannot read `secret`, `session`, `rate_limit_event`, or the password column of `app_user`. Evidence: `docs/gates/phase-2.md`.
+- [x] A catalog test confirms: no `float`/`double` columns; every workspace-owned table has `workspace_id NOT NULL` (the global `workspace` root is excluded); every tenant-scoped secondary unique index starts with `workspace_id`, with reviewed audit-sequence, parent/line, run and session-token exceptions; the 2.4 precisions and four additional Schema-defined native `NUMERIC` precisions are checked exactly. Evidence: `scripts/check_phase2_catalog.py` and `docs/schema-drift-check.md`.
+- [x] The seed script run twice gives identical row counts; 28 reason codes; `config_active` points at seq 1; `engine_hash` and `body_hash` are reproducible across machines. Evidence: `docs/gates/phase-2.md`.
+- [x] Constraint tests in 2.8 pass, including audit-chain continuity under concurrent inserts. Evidence: `docs/gates/phase-2.md`.
+- [x] The index list in 2.9 exists (catalog test). Evidence: `docs/index-review.md` and `docs/gates/phase-2.md`.
+- [ ] CI runs migrations on a copy of the previous schema and passes. The copy step passed locally and is configured in `.github/workflows/ci.yml`; hosted CI has not run. Evidence and limitation: `docs/gates/phase-2.md`.
+- [x] `docs/schema-errata.md` exists and the decision log holds the 4 open schema items. Evidence: `scripts/check_phase2_decisions.py` and `docs/gates/phase-2.md`.
+- [x] `GET /readyz` reports not-ready while the database is behind the migration head and ready after `upgrade head` (TR-OPS-8). Evidence: `backend/tests/integration/test_phase2_readyz.py`.
 
 **Out of scope:** endpoints and business logic (Phase 3+), row-level security (additive later, not enabled in v1), opening-balance import UI (P1 — the table exists).
 

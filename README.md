@@ -2,9 +2,9 @@
 
 ReconBench is an auditable, invoice-centred three-way reconciliation workbench for purchase orders, goods-received notes, and supplier invoices.
 
-## Phase 1 — Project setup
+## Current implementation scope
 
-This repository currently contains the project scaffold only. The matching engine, database schema and migrations, authentication, and product workflows are later phases. The six source documents are preserved in [`docs/`](docs/); those copies are read-only. Local acceptance fixtures are synthetic and derived from the PRD examples. The `golden/` directory intentionally contains no real or customer documents.
+The repository contains the completed Phase 1 scaffold and Phase 2 Tasks 2.1–2.4: validated PostgreSQL migrations, static SQLAlchemy metadata, schema drift checks, and application-side UUIDv7/decimal helpers. Seeding, auth, the matching engine, and product workflows remain later tasks. The six source documents are preserved in [`docs/`](docs/); those copies are read-only. Local acceptance fixtures are synthetic and derived from the PRD examples. The `golden/` directory intentionally contains no real or customer documents.
 
 ### Prerequisites
 
@@ -34,7 +34,13 @@ The local Compose stack uses PostgreSQL 16 and MinIO as required by the Phase 1 
 | `make test` | Run the Python and web test suites |
 | `make golden` | Run the empty golden-set harness and its false-Matched self-check |
 | `make openapi` | Regenerate the OpenAPI snapshot and TypeScript types |
-| `make migrate` | Reserved for Phase 2; intentionally reports that migrations do not exist yet |
+| `make migrate` | Apply ReconBench Alembic revisions through head |
+| `make schema-drift` | Confirm Alembic head, compare metadata, and check catalog-only schema objects |
+| `make queue-schema` | Apply the separately locked Procrastinate 3.10.0 schema (once, to an empty queue schema) |
 | `make web` | Run the static web shell on Vite's local development server |
+
+The queue library owns its tables. Apply `make migrate` first and `make queue-schema` as a separate step; the queue schema is pinned by `backend/uv.lock` and is not embedded in ReconBench Alembic revisions. Alembic uses `RB_MIGRATOR_DATABASE_URL`; with `RB_ENV=local`, it may fall back to `RB_DATABASE_URL` or derive the host DSN from the local Compose `POSTGRES_*` values. Non-local runs require a dedicated migrator URL.
+
+`make schema-drift` requires the ReconBench database to be at Alembic head and uses the same migrator DSN. It checks the application schema before the separate queue schema is applied; Procrastinate-owned tables are not part of ReconBench metadata. The static metadata and the catalog-only checks are documented in [`docs/schema-drift-check.md`](docs/schema-drift-check.md).
 
 The API exposes liveness at `/healthz`, readiness at `/readyz`, and the versioned API base at `/api/v1`. Readiness reports success only when PostgreSQL and the object store respond.

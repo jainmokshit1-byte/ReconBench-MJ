@@ -33,6 +33,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "hypothesis>=6.145",
+  "httpx2>=2.13,<3",
   "import-linter>=2.7",
   "mypy>=1.18",
   "pip-audit>=2.9",

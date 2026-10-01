@@ -2,7 +2,7 @@
 
 This register copies every Phase 1 item G-01 through G-27 from `ReconBench_Implementation_Plan.md` §2. The plan's user-confirmed decisions are authoritative. `docs/ReconBench_*.md` are read-only source copies.
 
-## Current status at Phase 1 start
+## Current status
 
 | ID | Status | Applied decision / current state |
 |---|---|---|
@@ -27,7 +27,7 @@ This register copies every Phase 1 item G-01 through G-27 from `ReconBench_Imple
 | G-19 | Resolved by user | Failed invoices consume balance except Duplicate/Rejected; store GST beside at-risk; show Duplicate/Unlinked in blocked value. |
 | G-20 | Open | Reject manual cross-PAN vendor merges until Finance/Product decides. |
 | G-21 | Default recorded | P0 bootstrap account only; user creation/reset flows remain outside this phase. |
-| G-22 | Open | Schema DDL has not been run; Phase 2 owns its PostgreSQL validation. |
+| G-22 | Resolved (Task 2.1) | Schema §§3–8 DDL and privilege blocks executed in order on a blank, disposable PostgreSQL 16.15 database with no DDL errors. The final catalog contains 41 tables, 4 views, 37 functions, and the 4 declared ReconBench roles. No DDL correction was needed; scope notes and evidence are in `docs/schema-errata.md`. |
 | G-23 | Provisional / follow-up required | SP-1 through SP-4 outcomes are recorded below. Queue commit/rollback, lock exclusion, stalled-job detection plus explicit retry, and SIGTERM drain passed. Automatic killed-worker retry was not proven; Procrastinate stays behind `JobQueue` pending the M2 load test and a recovery supervisor. |
 | G-24 | In review | Direct dependencies and licenses are recorded in `docs/dependency-review.md`; MinIO has an added upstream-maintenance caveat in G-28. |
 | G-25 | Open | Rules-hash scope needs confirmation before the Phase 4 engine hash gate. |
@@ -100,7 +100,7 @@ Each row is specific and actionable: what the documents say, what this plan does
 
 | ID | Uncertainty | Early test |
 |---|---|---|
-| G-22 | **The schema DDL has never been run on a live PostgreSQL** (stated in the Schema header). | Task 2.1 |
+| G-22 | **Resolved:** the schema DDL was validated on PostgreSQL 16.15 for Task 2.1. | `docs/schema-errata.md`; no DDL defect or product-default change. |
 | G-23 | Procrastinate is provisional until the M2 load test; Hungarian tie-break determinism; pdfplumber accuracy; Tally XML variants. | Spikes SP-1 to SP-4 (task 1.9) |
 | G-24 | Library versions and licences in TRD §4 "come from the author's knowledge". | Dependency review (task 1.8) |
 | G-25 | `rules_hash` covers `engine` only, not `app` settings (Schema §13 #14); TRD says "config". | Confirm in decision log; hash test in 4.6 |
@@ -113,3 +113,25 @@ Each row is specific and actionable: what the documents say, what this plan does
 | G-28 | The selected MinIO Community image is no longer available from the Docker Hub repository, and the upstream Community repository is archived. | The pinned 2025-10-15 source image builds and runs for local-only development. Treat it as an unmaintained local fixture; approve a maintained, supported object-store target and its licence before staging or production. | Product + Tech lead | Before staging |
 
 ---
+
+## 3. Remaining Backend Schema §13 decisions
+
+These inputs and proposed rules remain open after DDL validation and migration work. They do not change the user's confirmed P0 defaults or block the structural migration chain.
+
+| Schema §13 item | Unresolved input or decision | Tracking |
+|---:|---|---|
+| 1 | Opening-balance upload/API flow is not defined; the P1 table remains available. | Product / Finance, Phase 6 |
+| 2 | Whether identical bytes re-uploaded after removal reactivate the same `source_file` row is still a proposed behavior. | Product, Phase 4.3 |
+| 3 | CSV mapping and retry behavior is a plan default for the App Flow gap, pending product acceptance. | G-17 |
+| 6 | Manual vendor merges across different PANs remain blocked pending a decision. | G-20 |
+| 12 | Ledger completeness detection remains a proposed rule. | G-15 |
+| 14 | Whether `rules_hash` excludes `body.app` remains unconfirmed. | G-25 |
+| 15 | Release-action semantics need the missing UI/UX B2 decision; stale-override validation is P1. | Product / Finance, Phase 5 |
+| 16 | KPI/list treatment of approved, held, and rejected cases needs confirmation; the effective-status interpretation is still a proposal. | G-14 |
+| 17 | The view computes staleness directly; caching it is conditional on M2 performance evidence. | G-23 |
+| 20 | The schema assumes USD for AI budget caps; the budget unit and auto-accept policy need confirmation with the AI-provider decision. | G-09, Product / Compliance |
+| 22 | Retention periods, DPDP applicability, and retention scope for evidence snippets await legal review. | G-10 |
+| 23 | Procrastinate remains provisional until M2 automatic-recovery/load behavior is proven; its tables stay a separate pinned schema step. | G-23 |
+| 24 | Reason-code titles, messages, and suggested actions await the missing copy deck and Finance review. | G-06 |
+| 25 | The `/reasoncodes` route conflict and missing alias/user endpoints remain API design gaps. | G-02, G-13 |
+| 26 | Reconciliation against the missing All Fields Reference remains pending. | G-05 |

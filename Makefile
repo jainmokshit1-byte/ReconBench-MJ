@@ -1,4 +1,4 @@
-.PHONY: up down clean-local check check-static check-python check-web test golden openapi migrate api web secrets audit services spikes
+.PHONY: up down clean-local check check-static check-python check-web test golden openapi migrate schema-drift phase2-catalog phase2-indexes phase2-decisions phase2-migration-safety phase2-table-count seed-phase2 phase2-db-tests queue-schema api web secrets audit services spikes
 
 up:
 	uv run --project backend python scripts/ensure_local_env.py
@@ -53,8 +53,36 @@ audit:
 	npm audit --prefix web --audit-level=high
 
 migrate:
-	@echo "Database migrations are Phase 2 work; no migration command is available yet."
-	@exit 2
+	uv run --project backend python scripts/ensure_local_env.py
+	uv run --project backend alembic -c backend/alembic.ini upgrade head
+
+schema-drift:
+	uv run --project backend python scripts/check_schema_drift.py
+
+phase2-catalog:
+	uv run --project backend python scripts/check_phase2_catalog.py
+
+phase2-indexes:
+	uv run --project backend python scripts/check_phase2_indexes.py
+
+phase2-decisions:
+	uv run --project backend python scripts/check_phase2_decisions.py
+
+phase2-migration-safety:
+	uv run --project backend python scripts/check_migration_safety.py
+
+seed-phase2:
+	uv run --project backend python scripts/seed_database.py
+
+phase2-db-tests:
+	uv run --project backend pytest backend/tests/integration/test_phase2_database.py backend/tests/integration/test_phase2_readyz.py -q
+
+phase2-table-count:
+	uv run --project backend python scripts/check_phase2_table_count.py
+
+queue-schema:
+	uv run --project backend python scripts/ensure_local_env.py
+	uv run --project backend procrastinate --app reconbench_app.db.procrastinate_schema.app schema --apply
 
 api:
 	uv run --project backend uvicorn reconbench_app.api.main:app --reload --host 127.0.0.1 --port 8000

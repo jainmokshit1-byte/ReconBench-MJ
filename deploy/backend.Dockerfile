@@ -9,6 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY --from=uv /uv /uvx /bin/
 COPY backend/pyproject.toml backend/uv.lock /app/backend/
+COPY backend/alembic.ini /app/backend/alembic.ini
+COPY backend/migrations /app/backend/migrations
 COPY backend/reconbench_core /app/backend/reconbench_core
 COPY backend/reconbench_app /app/backend/reconbench_app
 RUN uv sync --project /app/backend --locked --no-dev
