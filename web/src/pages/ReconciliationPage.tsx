@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Clipboard, Download, RefreshCw, X } from "lucide-react";
 import { useSearchParams } from "react-router";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -37,6 +37,7 @@ const statusOptions = [
   ["on_hold", "On hold"],
   ["rejected", "Rejected"],
 ] as const;
+const dateFormatter = new Intl.DateTimeFormat("en-IN", { dateStyle: "medium" });
 
 function monthStart(): string {
   const now = new Date();
@@ -51,7 +52,7 @@ function today(): string {
 function displayDate(value: unknown): string {
   if (typeof value !== "string" || !value) return "—";
   const parsed = new Date(`${value.slice(0, 10)}T00:00:00`);
-  return Number.isNaN(parsed.getTime()) ? value : new Intl.DateTimeFormat("en-IN", { dateStyle: "medium" }).format(parsed);
+  return Number.isNaN(parsed.getTime()) ? value : dateFormatter.format(parsed);
 }
 
 function amount(value: unknown): string {
@@ -61,6 +62,58 @@ function amount(value: unknown): string {
 function label(value: unknown): string {
   return typeof value === "string" ? value.replaceAll("_", " ") : "—";
 }
+
+interface CaseTableRowProps {
+  item: CaseSummary;
+  virtualIndex: number;
+  isSelected: boolean;
+  isActive: boolean;
+  onSelect: (caseId: string) => void;
+  onToggleSelected: (caseId: string, selected: boolean) => void;
+}
+
+const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isSelected, isActive, onSelect, onToggleSelected }: CaseTableRowProps) {
+  return (
+    <tr
+      data-index={virtualIndex}
+      style={{ height: 36 }}
+      className={isActive ? "is-selected" : ""}
+      onClick={() => onSelect(item.case_id)}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect(item.case_id);
+        }
+      }}
+    >
+      <td>
+        <input
+          type="checkbox"
+          aria-label={`Select invoice ${item.invoice_no ?? item.case_id}`}
+          checked={isSelected}
+          onClick={(event) => event.stopPropagation()}
+          onChange={(event) => onToggleSelected(item.case_id, event.currentTarget.checked)}
+        />
+      </td>
+      <td title={`${item.invoice_no ?? item.canonical_doc_no ?? "Invoice number unavailable"} · ${item.vendor_id ? `Vendor ${item.vendor_id}` : "Unassigned vendor"}`}>
+        <strong>{item.invoice_no ?? item.canonical_doc_no ?? "Invoice number unavailable"}</strong>
+      </td>
+      <td title={item.invoice_date ?? "Date unavailable"}>{displayDate(item.invoice_date)}</td>
+      <td title={item.po_nos.join(", ")}>{item.po_nos.length ? item.po_nos.join(", ") : "—"}</td>
+      <td title={item.grn_nos.join(", ")}>{item.grn_nos.length ? item.grn_nos.join(", ") : "—"}</td>
+      <td title={String(item.invoice_total ?? item.invoice_taxable ?? "—")}>{amount(item.invoice_total ?? item.invoice_taxable)}</td>
+      <td title={String(item.expected_taxable ?? "—")}>{amount(item.expected_taxable)}</td>
+      <td title={String(item.variance ?? "—")}>{amount(item.variance)}</td>
+      <td title={item.overlay ? `Computed: ${label(item.computed_status)}` : label(item.effective_status)}>
+        <span className={`recon-status recon-status-${item.effective_status}`}>
+          <span>{item.overlay ? `${label(item.effective_status)} / ${label(item.computed_status)}` : label(item.effective_status)}{item.is_stale ? " · stale" : ""}</span>
+        </span>
+      </td>
+      <td title={item.reason_codes.map(label).join(", ")}>{item.reason_codes.length ? item.reason_codes.map(label).join(", ") : "None"}</td>
+    </tr>
+  );
+});
 
 function checks(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null) : [];
@@ -109,7 +162,8 @@ export function ReconciliationPage() {
   const [manualResult, setManualResult] = useState<Record<string, unknown> | null>(null);
   const canRun = hasCapability("recon.run");
   const canDecide = hasCapability("cases.decide");
-  const hasStaleCases = items.some((item) => item.is_stale);
+  const hasStaleCases = useMemo(() => items.some((item) => item.is_stale), [items]);
+  const getCaseKey = useCallback((index: number) => items[index]?.case_id ?? index, [items]);
 
   useEffect(() => {
     const year = Number(period.slice(0, 4));
@@ -153,7 +207,7 @@ export function ReconciliationPage() {
     getScrollElement: () => tableWrapRef.current,
     estimateSize: () => 36,
     overscan: 4,
-    getItemKey: (index) => items[index]?.case_id ?? index,
+    getItemKey: getCaseKey,
   });
   const virtualRows = rowVirtualizer.getVirtualItems();
   const firstVirtualRow = virtualRows[0];
@@ -341,7 +395,7 @@ export function ReconciliationPage() {
     }
   };
 
-  const selectCase = (caseId: string | null) => {
+  const selectCase = useCallback((caseId: string | null) => {
     if (caseId) setDetail(null);
     setSearchParams((previous) => {
       const next = new URLSearchParams(previous);
@@ -349,7 +403,17 @@ export function ReconciliationPage() {
       else next.delete("case_id");
       return next;
     });
-  };
+  }, [setSearchParams]);
+
+  const selectCaseFromRow = useCallback((caseId: string) => selectCase(caseId), [selectCase]);
+  const toggleCaseSelection = useCallback((caseId: string, selected: boolean) => {
+    setSelectedCases((previous) => {
+      const next = new Set(previous);
+      if (selected) next.add(caseId);
+      else next.delete(caseId);
+      return next;
+    });
+  }, []);
 
   const runBulkAction = async () => {
     if (!user?.csrf_token || !bulkReason.trim()) {
@@ -494,18 +558,7 @@ export function ReconciliationPage() {
               {virtualRows.map((virtualRow) => {
                 const item = items[virtualRow.index];
                 if (!item) return null;
-                return <tr key={item.case_id} data-index={virtualRow.index} style={{ height: 36 }} className={selectedCaseId === item.case_id ? "is-selected" : ""} onClick={() => selectCase(item.case_id)} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectCase(item.case_id); } }}>
-                <td><input type="checkbox" aria-label={`Select invoice ${item.invoice_no ?? item.case_id}`} checked={selectedCases.has(item.case_id)} onClick={(event) => event.stopPropagation()} onChange={(event) => setSelectedCases((previous) => { const next = new Set(previous); if (event.currentTarget.checked) next.add(item.case_id); else next.delete(item.case_id); return next; })} /></td>
-                <td title={`${item.invoice_no ?? item.canonical_doc_no ?? "Invoice number unavailable"} · ${item.vendor_id ? `Vendor ${item.vendor_id}` : "Unassigned vendor"}`}><strong>{item.invoice_no ?? item.canonical_doc_no ?? "Invoice number unavailable"}</strong></td>
-                <td title={item.invoice_date ?? "Date unavailable"}>{displayDate(item.invoice_date)}</td>
-                <td title={item.po_nos.join(", ")}>{item.po_nos.length ? item.po_nos.join(", ") : "—"}</td>
-                <td title={item.grn_nos.join(", ")}>{item.grn_nos.length ? item.grn_nos.join(", ") : "—"}</td>
-                <td title={String(item.invoice_total ?? item.invoice_taxable ?? "—")}>{amount(item.invoice_total ?? item.invoice_taxable)}</td>
-                <td title={String(item.expected_taxable ?? "—")}>{amount(item.expected_taxable)}</td>
-                <td title={String(item.variance ?? "—")}>{amount(item.variance)}</td>
-                <td title={item.overlay ? `Computed: ${label(item.computed_status)}` : label(item.effective_status)}><span className={`recon-status recon-status-${item.effective_status}`}><span>{item.overlay ? `${label(item.effective_status)} / ${label(item.computed_status)}` : label(item.effective_status)}{item.is_stale ? " · stale" : ""}</span></span></td>
-                <td title={item.reason_codes.map(label).join(", ")}>{item.reason_codes.length ? item.reason_codes.map(label).join(", ") : "None"}</td>
-              </tr>;
+                return <CaseTableRow key={item.case_id} item={item} virtualIndex={virtualRow.index} isSelected={selectedCases.has(item.case_id)} isActive={selectedCaseId === item.case_id} onSelect={selectCaseFromRow} onToggleSelected={toggleCaseSelection} />;
               })}
               {lastVirtualRow && lastVirtualRow.end < rowVirtualizer.getTotalSize() ? <tr aria-hidden="true" className="recon-virtual-spacer"><td colSpan={10} style={{ height: rowVirtualizer.getTotalSize() - lastVirtualRow.end }} /></tr> : null}
               {!loading && items.length === 0 ? <tr><td className="recon-table-empty" colSpan={10}>No cases for these filters yet. Run reconciliation after documents are mapped.</td></tr> : null}
