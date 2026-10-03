@@ -11,6 +11,41 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 MAX_JSON_BODY_BYTES = 1_048_576
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+}
+
+
+class SecurityHeadersMiddleware:
+    """Set the shared security policy on every HTTP response; CORS stays closed."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        protected_names = {name.lower().encode("ascii") for name in SECURITY_HEADERS}
+
+        async def send_with_security_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in protected_names
+                ]
+                headers.extend(
+                    (name.lower().encode("ascii"), value.encode("latin-1"))
+                    for name, value in SECURITY_HEADERS.items()
+                )
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_security_headers)
 
 
 class RequestIdMiddleware:

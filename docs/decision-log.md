@@ -23,19 +23,52 @@ This register copies every Phase 1 item G-01 through G-27 from `ReconBench_Imple
 | G-15 | Open | Use the plan's ledger completeness proposal in Phase 4. |
 | G-16 | Open | Period selector scoping follows the plan proposal in Phase 4. |
 | G-17 | Open | Apply the listed screen-flow defaults in the relevant Phase 4 step. |
-| G-18 | Open | Seed the proposed catalogue entries only in a later database/config phase. |
+| G-18 | Resolved for engine; API follows in 4.7 | `DUP_SUSPECTED`, `ITEM_UNSURE`, and `NO_TEXT_LAYER` are present as proposed Review-level reason codes. The API catalogue is next in 4.7. |
 | G-19 | Resolved by user | Failed invoices consume balance except Duplicate/Rejected; store GST beside at-risk; show Duplicate/Unlinked in blocked value. |
 | G-20 | Open | Reject manual cross-PAN vendor merges until Finance/Product decides. |
 | G-21 | Default recorded | P0 bootstrap account only; user creation/reset flows remain outside this phase. |
 | G-22 | Resolved (Task 2.1) | Schema §§3–8 DDL and privilege blocks executed in order on a blank, disposable PostgreSQL 16.15 database with no DDL errors. The final catalog contains 41 tables, 4 views, 37 functions, and the 4 declared ReconBench roles. No DDL correction was needed; scope notes and evidence are in `docs/schema-errata.md`. |
 | G-23 | Provisional / follow-up required | SP-1 through SP-4 outcomes are recorded below. Queue commit/rollback, lock exclusion, stalled-job detection plus explicit retry, and SIGTERM drain passed. Automatic killed-worker retry was not proven; Procrastinate stays behind `JobQueue` pending the M2 load test and a recovery supervisor. |
 | G-24 | In review | Direct dependencies and licenses are recorded in `docs/dependency-review.md`; MinIO has an added upstream-maintenance caveat in G-28. |
-| G-25 | Open | Rules-hash scope needs confirmation before the Phase 4 engine hash gate. |
+| G-25 | Resolved (Task 4.6) | `rules_hash` covers the versioned check registry and `body.engine` only; changes to `body.app` do not change it. |
 | G-26 | Default recorded | Login required and one role in P0; Phase 3 owns authentication. |
 | G-27 | Open | The proposed error dashboard is a Phase 4 product addition. |
 | G-28 | Open / Phase 7 gate | The plan names MinIO for local Compose. Its upstream community repository was archived on 25 Apr 2026 and releases are no longer maintained. Keep the named dependency local to Phase 1; before deployment, decide whether to build from source or replace it with an actively maintained S3-compatible service. Owner: Tech lead / Product. |
+| G-29 | Resolved by user (2026-10-01) | P0 login throttling uses independent normalized-email and source-IP rolling buckets, with 10 failures / 15 minutes and 30 failures / 15 minutes respectively; each lock/throttle expires after 15 minutes. A success clears only that account's consecutive-failure state. See the policy below. |
+| G-30 | Resolved by user (2026-10-02); implementation present, validation pending | Scanned invoices are a required input, so OCR is promoted from P1/v1.1 to a pre-pilot Phase 4 deliverable under PDF extraction (Task 4.9b). Use the TRD's OCRmyPDF + Tesseract starting point, lower OCR confidence, preserve evidence, and require the same extraction/arithmetic gates. Unreadable or low-confidence critical fields remain Needs Review. |
 
 G-03, G-04, G-08, and G-19 reflect the user-confirmed build-decision note in the Implementation Plan dated 1 Oct 2026. G-07 remains explicitly open; no real sample files were inspected.
+
+### M1 questions closed to documented defaults (Task 4.6)
+
+These close the decision questions, not future application work. The user's samples remain unopened.
+
+| TRD question | Applied decision | Implementation timing |
+|---|---|---|
+| OQ-1 | Exception and Needs Review invoices consume PO balance; Duplicate and Rejected do not. | Engine in 4.5 |
+| OQ-2 | Follow Appendix C1 / TR-REC-6: a PO-cap shortfall is also `QTY_OVER_GRN`. | User resolved; engine in 4.5 |
+| OQ-3 | A newly ingested GRN automatically re-evaluates Pending cases only. | Decision closed; worker orchestration in 4.11 |
+| OQ-4 | Show GST on at-risk value beside the taxable at-risk amount, not inside it. | Engine in 4.5 |
+| OQ-5 | Suspected duplicates use the Plan's date/number/value criteria, get `DUP_SUSPECTED` at Review, and continue consuming balance until a human decision. Exact duplicates are blocked. | Engine in 4.5 |
+| OQ-8 | `DUP_SUSPECTED`, `ITEM_UNSURE`, and `NO_TEXT_LAYER` are Review-level proposed codes. User-facing copy still waits for G-06 review. | Core catalogue in 4.1/4.5; API in 4.7 |
+
+### G-29 — P0 login throttling (user-authorized, 1 Oct 2026)
+
+- `app.security.login_email_max_failures=10`, `login_email_window_minutes=15`, and `login_email_lockout_minutes=15`.
+- `app.security.login_ip_max_failures=30`, `login_ip_window_minutes=15`, and `login_ip_throttle_minutes=15`.
+- The email/account bucket is keyed by normalized email across source IPs. The IP bucket is keyed by source IP across submitted emails; the buckets are independent, and either one can block login. They are never combined into an IP-plus-email key.
+- A successful login clears that email/account's consecutive-failure state. It does not clear the IP bucket; IP failures age out through their rolling window. Account lockouts and IP throttles expire automatically after 15 minutes; there is no permanent lockout or manual-unlock path.
+- Unknown and known accounts receive the same generic 401 response, and either throttle bucket receives the same generic 429 response with a constant coarse `Retry-After: 900`. Responses do not reveal registration state or the bucket that fired.
+- Use the ASGI socket peer address. Ignore `X-Forwarded-For` unless a future deployment explicitly configures a trusted proxy boundary.
+- The values are in `backend/reconbench_app/db/seed_data.py` and validated by `AuthSecurityConfig`. Older immutable config versions that predate these keys use the same approved defaults at runtime; no schema change is required.
+
+### G-30 — Scanned invoice OCR scope (user-confirmed, 2 Oct 2026)
+
+- The source PRD and Implementation Plan placed scanned-PDF OCR in P1 / v1.1. Because the user's intended invoice input is scanned PDFs, OCR is promoted to a required deliverable before the full-month reconciliation demo/pilot.
+- Implement it as an extension to **Phase 4, Task 4.9 (PDF extraction), tracked as Task 4.9b**. It belongs in document ingestion before mapping/reconciliation; Phase 5 is UI polish, and optional AI assist in 4.17 is not OCR.
+- Follow the TRD starting design: OCRmyPDF with Tesseract, then send the resulting text through the existing PDF extraction, normalization, and arithmetic-QA pipeline. Keep the original scan and source-page evidence; record OCR extraction provenance and the lower OCR confidence.
+- Never promote a scan to Matched solely because OCR returned text. Missing/low-confidence critical fields or failed arithmetic QA must remain Needs Verification / Needs Review. OCR runs inside the existing resource-limited PDF child-process boundary.
+- The local code path now runs OCRmyPDF + Tesseract in a separately bounded child process, stores per-page OCR provenance, and records `pdf_ocr` on document versions that used OCR. Runtime/system-package verification and real accuracy validation remain pending. G-07's representative scanned samples and hand-labelled truth set remain necessary to validate languages/layouts, tune confidence, and report measured extraction accuracy.
 
 ## Phase 1 spike outcomes (2026-10-01)
 
@@ -125,7 +158,7 @@ These inputs and proposed rules remain open after DDL validation and migration w
 | 3 | CSV mapping and retry behavior is a plan default for the App Flow gap, pending product acceptance. | G-17 |
 | 6 | Manual vendor merges across different PANs remain blocked pending a decision. | G-20 |
 | 12 | Ledger completeness detection remains a proposed rule. | G-15 |
-| 14 | Whether `rules_hash` excludes `body.app` remains unconfirmed. | G-25 |
+| 14 | **Resolved in Task 4.6:** `rules_hash` includes the check registry and `body.engine`; `body.app` is excluded. | G-25 |
 | 15 | Release-action semantics need the missing UI/UX B2 decision; stale-override validation is P1. | Product / Finance, Phase 5 |
 | 16 | KPI/list treatment of approved, held, and rejected cases needs confirmation; the effective-status interpretation is still a proposal. | G-14 |
 | 17 | The view computes staleness directly; caching it is conditional on M2 performance evidence. | G-23 |

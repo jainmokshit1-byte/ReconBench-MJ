@@ -1,4 +1,4 @@
-.PHONY: up down clean-local check check-static check-python check-web test golden openapi migrate schema-drift phase2-catalog phase2-indexes phase2-decisions phase2-migration-safety phase2-table-count seed-phase2 phase2-db-tests queue-schema api web secrets audit services spikes
+.PHONY: up down clean-local check check-static check-python check-web test test-e2e golden openapi migrate schema-drift phase2-catalog phase2-indexes phase2-decisions phase2-migration-safety phase2-table-count seed-phase2 phase2-db-tests queue-schema ingestion-worker api web secrets audit services spikes
 
 up:
 	uv run --project backend python scripts/ensure_local_env.py
@@ -17,9 +17,10 @@ check: check-static test
 check-static: check-python check-web
 	uv run --project backend python scripts/check_core_purity.py
 	uv run --project backend python scripts/check_rules_hash.py
+	uv run --project backend python scripts/export_reconciliation_schemas.py
 	uv run --project backend python scripts/export_openapi.py
 	npm run api:generate --prefix web
-	git diff --exit-code -- backend/openapi.json web/src/api/generated.ts
+	git diff --exit-code -- backend/openapi.json web/src/api/generated.ts docs/schemas
 
 check-python:
 	cd backend && uv run ruff check reconbench_core reconbench_app tests ../scripts
@@ -35,6 +36,9 @@ test:
 	uv run --project backend pytest backend/tests/unit backend/tests/property backend/tests/scenarios -q
 	npm run test --prefix web -- --run --pool=threads --maxWorkers=1
 
+test-e2e:
+	npm run test:e2e --prefix web
+
 golden:
 	uv run --project backend python scripts/golden_run.py --self-check
 
@@ -45,6 +49,7 @@ spikes:
 	uv run --project backend python scripts/spikes/sp4_profiles.py
 
 openapi:
+	uv run --project backend python scripts/export_reconciliation_schemas.py
 	uv run --project backend python scripts/export_openapi.py
 	npm run api:generate --prefix web
 
@@ -83,6 +88,9 @@ phase2-table-count:
 queue-schema:
 	uv run --project backend python scripts/ensure_local_env.py
 	uv run --project backend procrastinate --app reconbench_app.db.procrastinate_schema.app schema --apply
+
+ingestion-worker:
+	docker compose up -d --build worker
 
 api:
 	uv run --project backend uvicorn reconbench_app.api.main:app --reload --host 127.0.0.1 --port 8000

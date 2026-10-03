@@ -1,0 +1,10 @@
+<Invoice>
+  <InvoiceNo>INV-SYN-1</InvoiceNo><InvoiceDate>2026-04-03</InvoiceDate>
+  <Supplier>Example Components</Supplier><SupplierGSTIN>27AAPFU0939F1ZV</SupplierGSTIN>
+  <POReference>PO-SYN-1</POReference>
+  <TaxableValue>1000</TaxableValue><CGST>90</CGST><SGST>90</SGST>
+  <InvoiceTotal>1180</InvoiceTotal>
+  <Line><Description>Steel Washer M8</Description><ItemCode>W-M8</ItemCode>
+    <Qty>10</Qty><Rate>100</Rate><Amount>1000</Amount><Unit>NOS</Unit>
+    <GSTRate>18</GSTRate></Line>
+</Invoice>

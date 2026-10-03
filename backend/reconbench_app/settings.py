@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         env_ignore_empty=True,
         extra="ignore",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     environment: Literal["local", "ci", "staging", "production"] = Field(
@@ -34,6 +35,22 @@ class Settings(BaseSettings):
         default=None, validation_alias="RB_SECRET_MASTER_KEY_ID"
     )
     public_base_url: str
+    pdf_ocr_languages: str = Field(
+        default="eng",
+        pattern=r"^[a-z0-9_]+(?:\+[a-z0-9_]+)*$",
+        validation_alias="RB_PDF_OCR_LANGUAGES",
+    )
+    argon2_time_cost: int = Field(default=3, ge=1)
+    argon2_memory_cost_kib: int = Field(default=65_536, ge=8_192)
+    argon2_parallelism: int = Field(default=4, ge=1)
+    argon2_hash_len: int = Field(default=32, ge=16)
+    argon2_salt_len: int = Field(default=16, ge=8)
+    reconciliation_processes: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        validation_alias="RB_RECONCILIATION_PROCESSES",
+    )
     log_level: str = "INFO"
     otel_exporter_otlp_endpoint: str | None = None
     sentry_dsn: str | None = None

@@ -1,0 +1,601 @@
+{
+  "$defs": {
+    "AlignmentState": {
+      "enum": [
+        "aligned",
+        "unsure",
+        "not_on_po",
+        "charge",
+        "unlinked"
+      ],
+      "title": "AlignmentState",
+      "type": "string"
+    },
+    "CaseStatus": {
+      "enum": [
+        "duplicate",
+        "unlinked",
+        "needs_review",
+        "exception",
+        "pending",
+        "matched_flags",
+        "matched"
+      ],
+      "title": "CaseStatus",
+      "type": "string"
+    },
+    "CheckOutcome": {
+      "enum": [
+        "pass",
+        "info",
+        "warn",
+        "pending",
+        "review",
+        "fail",
+        "block"
+      ],
+      "title": "CheckOutcome",
+      "type": "string"
+    },
+    "CheckResult": {
+      "additionalProperties": false,
+      "properties": {
+        "actual": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actual"
+        },
+        "check_id": {
+          "minLength": 1,
+          "title": "Check Id",
+          "type": "string"
+        },
+        "check_version": {
+          "minimum": 1,
+          "title": "Check Version",
+          "type": "integer"
+        },
+        "code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasonCode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "evidence": {
+          "additionalProperties": true,
+          "title": "Evidence",
+          "type": "object"
+        },
+        "expected": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected"
+        },
+        "level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasonLevel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "result": {
+          "$ref": "#/$defs/CheckOutcome"
+        },
+        "tolerance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tolerance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "variance": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Variance"
+        },
+        "variance_pct": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Variance Pct"
+        }
+      },
+      "required": [
+        "check_id",
+        "check_version",
+        "result"
+      ],
+      "title": "CheckResult",
+      "type": "object"
+    },
+    "LineType": {
+      "enum": [
+        "goods",
+        "charge"
+      ],
+      "title": "LineType",
+      "type": "string"
+    },
+    "ReasonCode": {
+      "enum": [
+        "DUP_INVOICE",
+        "NO_PO_LINK",
+        "LINK_INFERRED",
+        "LOW_CONFIDENCE_DATA",
+        "DUP_SUSPECTED",
+        "ITEM_UNSURE",
+        "NO_TEXT_LAYER",
+        "VENDOR_MISMATCH",
+        "PO_NOT_OPEN",
+        "ITEM_NOT_ON_PO",
+        "QTY_OVER_PO",
+        "QTY_OVER_GRN",
+        "RATE_HIGH",
+        "TOTAL_MISMATCH",
+        "MATH_ERROR",
+        "PO_VALUE_EXCEEDED",
+        "CURRENCY_DIFF",
+        "UOM_MISMATCH",
+        "DATE_ORDER",
+        "GRN_PENDING",
+        "RATE_LOW",
+        "TAX_RATE_DIFF",
+        "TAX_TYPE_MISMATCH",
+        "HSN_DIFF",
+        "GSTIN_INVALID",
+        "EXTRA_CHARGE",
+        "GRN_OVER_PO",
+        "LATE_DELIVERY"
+      ],
+      "title": "ReasonCode",
+      "type": "string"
+    },
+    "ReasonLevel": {
+      "enum": [
+        "block",
+        "review",
+        "fail",
+        "pending",
+        "warn",
+        "info"
+      ],
+      "title": "ReasonLevel",
+      "type": "string"
+    },
+    "Tolerance": {
+      "additionalProperties": false,
+      "properties": {
+        "abs": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Abs",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ToleranceMode"
+        },
+        "pct": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Pct",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/ToleranceSource"
+        }
+      },
+      "required": [
+        "pct",
+        "abs",
+        "mode",
+        "source"
+      ],
+      "title": "Tolerance",
+      "type": "object"
+    },
+    "ToleranceMode": {
+      "enum": [
+        "or",
+        "both"
+      ],
+      "title": "ToleranceMode",
+      "type": "string"
+    },
+    "ToleranceSource": {
+      "enum": [
+        "item",
+        "vendor",
+        "global"
+      ],
+      "title": "ToleranceSource",
+      "type": "string"
+    }
+  },
+  "$id": "https://reconbench.local/schemas/line-result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Frozen per-line output, including alignment, ledger, and payable values.",
+  "properties": {
+    "alignment_score": {
+      "anyOf": [
+        {
+          "ge": "0",
+          "le": "1",
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Alignment Score"
+    },
+    "alignment_state": {
+      "$ref": "#/$defs/AlignmentState"
+    },
+    "at_risk": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "At Risk"
+    },
+    "balance_after": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Balance After"
+    },
+    "billed_before": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Billed Before"
+    },
+    "billed_qty": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Billed Qty"
+    },
+    "checks": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/CheckResult"
+      },
+      "title": "Checks",
+      "type": "array"
+    },
+    "eligible_qty": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Eligible Qty"
+    },
+    "engine_version": {
+      "minLength": 1,
+      "title": "Engine Version",
+      "type": "string"
+    },
+    "grn_accepted_cum": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Grn Accepted Cum"
+    },
+    "grn_document_ids": {
+      "default": [],
+      "items": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "title": "Grn Document Ids",
+      "type": "array"
+    },
+    "grn_rejected_cum": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Grn Rejected Cum"
+    },
+    "invoice_line_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Invoice Line Id"
+    },
+    "invoice_net_rate": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Invoice Net Rate"
+    },
+    "line_no": {
+      "minimum": 1,
+      "title": "Line No",
+      "type": "integer"
+    },
+    "line_taxable": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Line Taxable"
+    },
+    "line_type": {
+      "$ref": "#/$defs/LineType",
+      "default": "goods"
+    },
+    "payable_rate": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Payable Rate"
+    },
+    "payable_taxable": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Payable Taxable"
+    },
+    "po_cap": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Po Cap"
+    },
+    "po_doc_line_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Po Doc Line Id"
+    },
+    "po_document_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Po Document Id"
+    },
+    "po_line_no": {
+      "anyOf": [
+        {
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Po Line No"
+    },
+    "po_qty": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Po Qty"
+    },
+    "po_rate": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Po Rate"
+    },
+    "reason_codes": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ReasonCode"
+      },
+      "title": "Reason Codes",
+      "type": "array"
+    },
+    "rules_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Rules Hash",
+      "type": "string"
+    },
+    "shortfall_qty": {
+      "anyOf": [
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Shortfall Qty"
+    },
+    "status": {
+      "$ref": "#/$defs/CaseStatus"
+    },
+    "uom": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Uom"
+    }
+  },
+  "required": [
+    "engine_version",
+    "rules_hash",
+    "line_no",
+    "status",
+    "alignment_state"
+  ],
+  "title": "LineResult",
+  "type": "object"
+}

@@ -14,6 +14,8 @@ dist/
 build/
 node_modules/
 web/dist/
+web/test-results/
+web/playwright-report/
 backend/.venv/
 backend/requirements-audit.txt
 backend/reconbench_app.egg-info/
@@ -24,3 +26,4 @@ golden/**/documents/
 *.tmp
 .DS_Store
 Thumbs.db
+/work/

@@ -23,6 +23,14 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKER_QUEUES = ["phase1-spike"]
 
 
+def configure_platform_event_loop() -> None:
+    """Use the selector loop required by psycopg's async connections on Windows."""
+
+    policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy_factory is not None:
+        asyncio.set_event_loop_policy(policy_factory())
+
+
 def normalize_dsn(value: str) -> str:
     """Convert the SQLAlchemy psycopg scheme to a libpq DSN."""
 
@@ -35,9 +43,7 @@ def create_app(database_url: str) -> tuple[App, object]:
     app = App(connector=PsycopgConnector(conninfo=database_url))
 
     @app.task(name="phase1.spike_marker", queue="phase1-spike", pass_context=True)
-    async def write_marker(
-        context: JobContext, marker_path: str, delay_seconds: float
-    ) -> None:
+    async def write_marker(context: JobContext, marker_path: str, delay_seconds: float) -> None:
         marker = Path(marker_path)
 
         def record_start() -> None:
@@ -48,9 +54,7 @@ def create_app(database_url: str) -> tuple[App, object]:
         await asyncio.to_thread(record_start)
         first_attempt = marker.with_suffix(".first")
         if not first_attempt.exists():
-            await asyncio.to_thread(
-                first_attempt.write_text, "first-attempt\n", encoding="utf-8"
-            )
+            await asyncio.to_thread(first_attempt.write_text, "first-attempt\n", encoding="utf-8")
             await asyncio.sleep(delay_seconds)
         await asyncio.to_thread(
             marker.with_suffix(".done").write_text, "complete\n", encoding="utf-8"
@@ -98,9 +102,9 @@ async def verify_transactional_enqueue(app: App, task: object, database_url: str
                     "INSERT INTO phase1_spike_records (record_key) VALUES (%s)",
                     ("rollback-pair",),
                 )
-                await task.configure(
-                    queue="atomic-proof", connection=connection
-                ).defer_async(marker_path="rollback-pair", delay_seconds=0)
+                await task.configure(queue="atomic-proof", connection=connection).defer_async(
+                    marker_path="rollback-pair", delay_seconds=0
+                )
                 raise RollbackProof
         except RollbackProof:
             pass
@@ -151,15 +155,11 @@ async def verify_advisory_lock(database_url: str) -> None:
         async with first.transaction():
             await first.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
             row = await (
-                await second.execute(
-                    "SELECT pg_try_advisory_xact_lock(%s) AS acquired", (lock_id,)
-                )
+                await second.execute("SELECT pg_try_advisory_xact_lock(%s) AS acquired", (lock_id,))
             ).fetchone()
             assert row is not None and row[0] is False
         row = await (
-            await second.execute(
-                "SELECT pg_try_advisory_xact_lock(%s) AS acquired", (lock_id,)
-            )
+            await second.execute("SELECT pg_try_advisory_xact_lock(%s) AS acquired", (lock_id,))
         ).fetchone()
         assert row is not None and row[0] is True
     print("PASS: PostgreSQL transaction advisory locks reject a concurrent holder.")
@@ -243,9 +243,7 @@ async def verify_killed_worker_recovery(
     )
 
 
-async def verify_sigterm_drain(
-    task: object, database_url: str, temp_dir: Path
-) -> None:
+async def verify_sigterm_drain(task: object, database_url: str, temp_dir: Path) -> None:
     """Send SIGTERM during a synthetic job and verify the worker drains it."""
 
     if os.name == "nt":
@@ -270,6 +268,7 @@ async def verify_sigterm_drain(
 
 
 def worker_main() -> int:
+    configure_platform_event_loop()
     database_url = normalize_dsn(os.environ["RB_DATABASE_URL"])
     app, _task = create_app(database_url)
     app.run_worker(
@@ -310,6 +309,7 @@ async def run_spikes(database_url: str) -> None:
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
         return worker_main()
+    configure_platform_event_loop()
     database_url = os.environ.get("RB_DATABASE_URL")
     if not database_url:
         print(

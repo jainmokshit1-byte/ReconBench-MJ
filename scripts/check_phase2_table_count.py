@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from importlib import import_module
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
@@ -12,7 +13,7 @@ from sqlalchemy.engine import make_url
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from reconbench_app.db.metadata import metadata  # noqa: E402
+metadata = import_module("reconbench_app.db.metadata").metadata
 
 _PROCRASTINATE_TABLES = {
     "procrastinate_events",

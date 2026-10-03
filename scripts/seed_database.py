@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from importlib import import_module
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,7 +13,9 @@ from sqlalchemy import create_engine
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from reconbench_app.db.seed import BootstrapSettings, seed_database  # noqa: E402
+seed_module = import_module("reconbench_app.db.seed")
+BootstrapSettings = seed_module.BootstrapSettings
+seed_database = seed_module.seed_database
 
 
 def main() -> int:

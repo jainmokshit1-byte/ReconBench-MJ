@@ -109,7 +109,10 @@ def seed_database(engine: Engine, settings: BootstrapSettings) -> dict[str, int]
         config_row = (
             connection.execute(
                 sa.select(
-                    config_version.c.id, config_version.c.engine_hash, config_version.c.body_hash
+                    config_version.c.id,
+                    config_version.c.body,
+                    config_version.c.engine_hash,
+                    config_version.c.body_hash,
                 ).where(config_version.c.workspace_id == workspace_id, config_version.c.seq == 1)
             )
             .mappings()
@@ -117,8 +120,14 @@ def seed_database(engine: Engine, settings: BootstrapSettings) -> dict[str, int]
         )
         if config_row is None:
             raise RuntimeError("config_version seq 1 was not created")
-        if config_row["engine_hash"] != engine_hash or config_row["body_hash"] != body_hash:
-            raise RuntimeError("existing config_version seq 1 differs from the canonical defaults")
+        # Config versions are append-only. A later release may extend the
+        # canonical defaults, but a rerun must preserve a valid historical seq 1.
+        existing_body = config_row["body"]
+        existing_engine = existing_body.get("engine") if isinstance(existing_body, dict) else None
+        if config_row["engine_hash"] != canonical_hash(existing_engine) or config_row[
+            "body_hash"
+        ] != canonical_hash(existing_body):
+            raise RuntimeError("existing config_version seq 1 has invalid canonical hashes")
 
         connection.execute(
             pg_insert(config_active)

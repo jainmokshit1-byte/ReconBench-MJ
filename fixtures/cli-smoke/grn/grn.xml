@@ -1,0 +1,7 @@
+<GRN>
+  <GRNNo>GRN-SYN-1</GRNNo><GRNDate>2026-04-02</GRNDate>
+  <Supplier>Example Components</Supplier><SupplierGSTIN>27AAPFU0939F1ZV</SupplierGSTIN>
+  <POReference>PO-SYN-1</POReference>
+  <Line><Description>Steel Washer M8</Description><ItemCode>W-M8</ItemCode>
+    <ReceivedQty>10</ReceivedQty><AcceptedQty>10</AcceptedQty><Unit>NOS</Unit></Line>
+</GRN>

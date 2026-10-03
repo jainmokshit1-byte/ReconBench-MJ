@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
 
-from reconbench_app.db.migration_config import migration_url  # noqa: E402
+migration_url = import_module("reconbench_app.db.migration_config").migration_url
 
 CONTRACT_FILE = BACKEND / "reconbench_app" / "db" / "schema_contract.json"
 

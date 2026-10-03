@@ -12,6 +12,7 @@ Reviewed against the checked-in Python and npm lockfiles on 2026-10-01. “Activ
 | FastAPI | 0.142.2 | MIT | Active | None reported by `pip-audit` | Keep |
 | lxml | 6.1.3 | BSD-3-Clause | Active | None reported by `pip-audit` | Keep |
 | OpenTelemetry API, SDK, OTLP HTTP exporter | 1.45.0 | Apache-2.0 | Active | None reported by `pip-audit` | Keep; exporter remains optional at runtime |
+| OCRmyPDF | 17.13.0 | MPL-2.0 | Active upstream on 2026-10-02 | Not re-audited after addition | Add for scanned-PDF text layers; no OCRmyPDF source modifications |
 | pdfplumber | 0.11.10 | MIT | Active | None reported by `pip-audit` | Keep; synthetic-only baseline in SP-3 |
 | Prometheus client | 0.26.0 | Apache-2.0 AND BSD-2-Clause | Active | None reported by `pip-audit` | Keep |
 | Procrastinate | 3.10.0 | MIT | Active; upstream requests additional maintainers | None reported by `pip-audit` | Keep behind `JobQueue`; see SP-1 qualification |
@@ -72,6 +73,7 @@ Reviewed against the checked-in Python and npm lockfiles on 2026-10-01. “Activ
 | Component | Version/source | Licence and maintenance | Known advisories | Decision |
 |---|---|---|---|---|
 | PostgreSQL | 16.15 Bookworm image | PostgreSQL licence; supported major line | Used by Compose and the Phase 2 CI service; not included in the Trivy image loop | Keep for local and CI |
+| Tesseract OCR | Debian Trixie `tesseract-ocr` plus English and Hindi trained-data packages | Apache-2.0 for Tesseract; Debian language/font data carry their own notices | Not reviewed independently after addition | Install only in the backend worker image for OCR; default language is English and Hindi is opt-in |
 | MinIO Community | Source-built `RELEASE.2025-10-15T17-29-55Z` | AGPL-3.0; upstream repository archived 2026-04-25, community edition is source-only and no longer maintained | Not covered by Python/npm lockfile audits; Trivy scans the built image | Keep only to satisfy local Phase 1 parity with the TRD; do not use for staging/production without an explicit, current licence and support decision (G-28) |
 
 PyMuPDF is absent from both lockfiles. No package in Phase 1 uses SQLite. The API image uses Python 3.12 slim on Debian Trixie; the web build uses Node 24 and Nginx Alpine. Syft inventories the source and built application images in CI so operating-system and Go dependencies are included in supply-chain evidence.

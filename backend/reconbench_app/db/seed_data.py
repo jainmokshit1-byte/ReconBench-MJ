@@ -308,7 +308,13 @@ DEFAULT_CONFIG = json.loads(r"""
     },
     "security": {
       "session_idle_minutes": 30,
-      "session_absolute_hours": 12
+      "session_absolute_hours": 12,
+      "login_email_max_failures": 10,
+      "login_email_window_minutes": 15,
+      "login_email_lockout_minutes": 15,
+      "login_ip_max_failures": 30,
+      "login_ip_window_minutes": 15,
+      "login_ip_throttle_minutes": 15
     }
   }
 }

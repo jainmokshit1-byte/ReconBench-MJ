@@ -13,6 +13,7 @@ dependencies = [
   "opentelemetry-api>=1.37",
   "opentelemetry-sdk>=1.37",
   "opentelemetry-exporter-otlp-proto-http>=1.37",
+  "ocrmypdf>=17.13,<18",
   "pdfplumber>=0.11",
   "prometheus-client>=0.23",
   "procrastinate>=3.0",
@@ -28,7 +29,11 @@ dependencies = [
   "structlog>=25.4",
   "uvicorn[standard]>=0.38",
   "xlsxwriter>=3.2",
+  "argon2-cffi>=23.1,<26",
 ]
+
+[project.scripts]
+reconbench = "reconbench_app.cli:main"
 
 [dependency-groups]
 dev = [
@@ -42,6 +47,7 @@ dev = [
   "pyyaml>=6.0",
   "reportlab>=4.4",
   "ruff>=0.16",
+  "openpyxl>=3.1",
 ]
 
 [build-system]

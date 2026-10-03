@@ -53,6 +53,7 @@ services:
       RB_SECRET_MASTER_KEY: ${RB_SECRET_MASTER_KEY:-}
       RB_SECRET_MASTER_KEY_ID: ${RB_SECRET_MASTER_KEY_ID:-local-dev-only}
       RB_PUBLIC_BASE_URL: ${RB_PUBLIC_BASE_URL:-http://localhost:5173}
+      RB_PDF_OCR_LANGUAGES: ${RB_PDF_OCR_LANGUAGES:-eng}
       RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
       RB_OTEL_EXPORTER_OTLP_ENDPOINT: ${RB_OTEL_EXPORTER_OTLP_ENDPOINT:-}
       RB_SENTRY_DSN: ${RB_SENTRY_DSN:-}
@@ -75,8 +76,56 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    command: ["/app/backend/.venv/bin/python", "-m", "reconbench_app.worker"]
+    environment:
+      RB_ENV: ${RB_ENV:-local}
+      RB_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Run make up to generate local configuration}:${POSTGRES_PASSWORD:?Run make up to generate local credentials}@postgres:5432/${POSTGRES_DB:-reconbench}
+      RB_S3_ENDPOINT_URL: http://minio:9000
+      RB_S3_REGION: ${RB_S3_REGION:-us-east-1}
+      RB_S3_BUCKET: ${RB_S3_BUCKET:-reconbench-local}
+      RB_S3_API_ACCESS_KEY: ${MINIO_ROOT_USER:?Run make up to generate local configuration}
+      RB_S3_API_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Run make up to generate local credentials}
+      RB_SECRET_MASTER_KEY: ${RB_SECRET_MASTER_KEY:-}
+      RB_SECRET_MASTER_KEY_ID: ${RB_SECRET_MASTER_KEY_ID:-local-dev-only}
+      RB_PUBLIC_BASE_URL: ${RB_PUBLIC_BASE_URL:-http://localhost:5173}
+      RB_PDF_OCR_LANGUAGES: ${RB_PDF_OCR_LANGUAGES:-eng}
+      RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
+      RB_OTEL_EXPORTER_OTLP_ENDPOINT: ${RB_OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      RB_SENTRY_DSN: ${RB_SENTRY_DSN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  phase4-test-db:
+    profiles: ["phase4-test"]
+    image: postgres:16.15
+    environment:
+      POSTGRES_DB: ${PHASE4_TEST_POSTGRES_DB:-reconbench_phase4}
+      POSTGRES_USER: ${PHASE4_TEST_POSTGRES_USER:-reconbench_test}
+      POSTGRES_PASSWORD: ${PHASE4_TEST_POSTGRES_PASSWORD:-}
+    ports:
+      - "127.0.0.1:${PHASE4_TEST_POSTGRES_PORT:-15433}:5432"
+    volumes:
+      - phase4_test_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PHASE4_TEST_POSTGRES_USER:-reconbench_test} -d ${PHASE4_TEST_POSTGRES_DB:-reconbench_phase4}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
     name: reconbench_phase1_postgres_data
   minio_data:
     name: reconbench_phase1_minio_data
+  phase4_test_postgres_data:
+    name: reconbench_phase4_test_data

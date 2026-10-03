@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from collections import Counter
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,9 @@ from sqlalchemy.engine import Connection, make_url
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from reconbench_app.db.metadata import metadata  # noqa: E402
+metadata = import_module("reconbench_app.db.metadata").metadata
 
-_WORKSPACE_ROOT = "workspace"
+_GLOBAL_TABLES = {"workspace", "worker_control"}
 _EXPECTED_DOMAINS = {
     "d_amount": "numeric(18,2)",
     "d_hash": "text",
@@ -130,7 +131,7 @@ _INDEX_CATALOG = text(
 
 def _check_columns(connection: Connection, errors: list[str]) -> int:
     app_tables = set(metadata.tables)
-    workspace_owned_tables = app_tables - {_WORKSPACE_ROOT}
+    workspace_owned_tables = app_tables - _GLOBAL_TABLES
     rows = connection.execute(
         _COLUMN_CATALOG, {"table_names": sorted(app_tables)}
     ).mappings()
@@ -157,11 +158,19 @@ def _check_columns(connection: Connection, errors: list[str]) -> int:
         and columns[(table_name, "workspace_id")]["is_nullable"] != "NO"
     )
     if missing_workspace:
-        errors.append(f"workspace-owned tables missing workspace_id: {missing_workspace}")
+        errors.append(
+            f"workspace-owned tables missing workspace_id: {missing_workspace}"
+        )
     if nullable_workspace:
         errors.append(f"workspace_id must be NOT NULL on: {nullable_workspace}")
-    if (_WORKSPACE_ROOT, "workspace_id") in columns:
-        errors.append("global workspace root must not have workspace_id")
+    global_tables_with_workspace_id = sorted(
+        table_name for table_name in _GLOBAL_TABLES if (table_name, "workspace_id") in columns
+    )
+    if global_tables_with_workspace_id:
+        errors.append(
+            "global tables must not have workspace_id: "
+            f"{global_tables_with_workspace_id}"
+        )
 
     float_columns = sorted(
         f"{table}.{column} ({row['data_type']})"
@@ -180,12 +189,15 @@ def _check_columns(connection: Connection, errors: list[str]) -> int:
     invalid_numeric = sorted(
         (table, column, row["numeric_precision"], row["numeric_scale"])
         for (table, column), row in numeric_columns.items()
-        if (row["numeric_precision"], row["numeric_scale"]) not in _ALLOWED_NATIVE_NUMERIC
+        if (row["numeric_precision"], row["numeric_scale"])
+        not in _ALLOWED_NATIVE_NUMERIC
         and _EXPECTED_SPECIAL_NUMERIC.get((table, column))
         != (row["numeric_precision"], row["numeric_scale"])
     )
     if invalid_numeric:
-        errors.append(f"native numeric columns use an unplanned precision: {invalid_numeric}")
+        errors.append(
+            f"native numeric columns use an unplanned precision: {invalid_numeric}"
+        )
     invalid_special_numeric = []
     for (table, column), expected in _EXPECTED_SPECIAL_NUMERIC.items():
         actual_row = numeric_columns.get((table, column))
@@ -206,7 +218,9 @@ def _check_columns(connection: Connection, errors: list[str]) -> int:
     for table, column in _REQUIRED_TEXT_COLUMNS:
         actual = columns.get((table, column))
         if actual is None or actual["data_type"] != "text":
-            invalid_text.append((table, column, actual["data_type"] if actual else "missing"))
+            invalid_text.append(
+                (table, column, actual["data_type"] if actual else "missing")
+            )
     if invalid_text:
         errors.append(f"business identifiers/codes must remain text: {invalid_text}")
 
@@ -221,11 +235,15 @@ def _check_columns(connection: Connection, errors: list[str]) -> int:
     ).mappings()
     domains = {row["typname"]: row["base_type"] for row in domain_rows}
     if domains != _EXPECTED_DOMAINS:
-        errors.append(f"numeric/hash domains mismatch: expected {_EXPECTED_DOMAINS}, got {domains}")
+        errors.append(
+            f"numeric/hash domains mismatch: expected {_EXPECTED_DOMAINS}, got {domains}"
+        )
     return len(workspace_owned_tables)
 
 
-def _check_unique_indexes(connection: Connection, errors: list[str]) -> tuple[int, Counter[str]]:
+def _check_unique_indexes(
+    connection: Connection, errors: list[str]
+) -> tuple[int, Counter[str]]:
     rows = connection.execute(
         _INDEX_CATALOG, {"table_names": sorted(metadata.tables)}
     ).mappings()
@@ -237,7 +255,10 @@ def _check_unique_indexes(connection: Connection, errors: list[str]) -> tuple[in
         if actual is None:
             errors.append(f"reviewed unique-index exception is missing: {name}")
             continue
-        if actual["table_name"] != table_name or tuple(actual["columns"]) != expected_columns:
+        if (
+            actual["table_name"] != table_name
+            or tuple(actual["columns"]) != expected_columns
+        ):
             errors.append(
                 f"reviewed exception {name} changed: expected {table_name}{expected_columns}, "
                 f"got {actual['table_name']}{tuple(actual['columns'])}"
@@ -274,7 +295,9 @@ def main() -> int:
         with engine.connect() as connection:
             server_version = int(connection.scalar(text("SHOW server_version_num")))
             workspace_owned_count = _check_columns(connection, errors)
-            tenant_unique_count, exception_categories = _check_unique_indexes(connection, errors)
+            tenant_unique_count, exception_categories = _check_unique_indexes(
+                connection, errors
+            )
     finally:
         engine.dispose()
 
@@ -289,7 +312,8 @@ def main() -> int:
     print(
         f"Phase 2 catalog check passed: {len(metadata.tables)} ReconBench tables; "
         f"{workspace_owned_count} workspace-owned tables have NOT NULL workspace_id; "
-        "global workspace root is excluded; no float/double columns; text identifiers "
+        "global workspace and worker-control tables are excluded; no float/double columns; "
+        "text identifiers "
         "and numeric domains match; four documented schema-specific NUMERIC columns "
         "retain their exact precision; "
         f"{tenant_unique_count} tenant-scoped unique indexes are workspace-first; "

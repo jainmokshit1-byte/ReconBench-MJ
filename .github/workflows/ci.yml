@@ -51,6 +51,12 @@ jobs:
       - name: Run Python and web smoke tests
         run: make test
 
+      - name: Install Playwright Chromium
+        run: npm exec --prefix web -- playwright install --with-deps chromium
+
+      - name: Run browser acceptance workflows
+        run: npm run test:e2e --prefix web
+
       # 3. PostgreSQL and object-store integration checks
       - name: Start PostgreSQL and MinIO
         run: docker compose --env-file .env.example up -d postgres minio
@@ -90,9 +96,26 @@ jobs:
       - name: Run golden-set harness and false-Matched self-check
         run: make golden
 
+      - name: Save golden-set report
+        run: |
+          mkdir -p artifacts
+          uv run --project backend python scripts/golden_run.py --output artifacts/golden-set-report.json
+
+      - name: Upload golden-set report
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: reconbench-golden-set-report
+          path: artifacts/golden-set-report.json
+          if-no-files-found: error
+
       # 5. Pure-engine rules hash
       - name: Verify rules hash
         run: uv run --project backend python scripts/check_rules_hash.py
+
+      - name: Require engine version bump for changed core rules
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: uv run --project backend python scripts/check_engine_version.py --base-ref "$BASE_REF"
 
       # 6. Lockfile advisories, image build, and SBOM
       - name: Audit locked dependencies
@@ -141,6 +164,61 @@ jobs:
           name: reconbench-phase-1-sboms
           path: artifacts/*.cdx.json
           if-no-files-found: error
+
+  engine-reproducibility:
+    name: Reconciliation CLI reproducibility (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: 0.12.19
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --project backend --all-groups --locked
+
+      - name: Run synthetic CLI bundle
+        run: uv run --project backend python -m reconbench_core.cli run fixtures/cli-smoke --config fixtures/cli-smoke/config.json --run-date 2026-04-10 --out artifacts/reconciliation.json
+
+      - name: Upload reconciliation result
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: engine-output-${{ matrix.os }}
+          path: artifacts/reconciliation.json
+          if-no-files-found: error
+
+  compare-engine-reproducibility:
+    name: Compare Linux and Windows reconciliation outputs
+    needs: engine-reproducibility
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Download Linux engine output
+        uses: actions/download-artifact@v7.0.1
+        with:
+          name: engine-output-ubuntu-24.04
+          path: artifacts/linux
+
+      - name: Download Windows engine output
+        uses: actions/download-artifact@v7.0.1
+        with:
+          name: engine-output-windows-2025
+          path: artifacts/windows
+
+      - name: Compare exact result bytes
+        run: python scripts/compare_engine_outputs.py artifacts/linux/reconciliation.json artifacts/windows/reconciliation.json
 
   secret-scan:
     name: Secret scan
@@ -221,11 +299,17 @@ jobs:
           uv run --project backend python scripts/seed_database.py > seed-second.txt
           diff -u seed-first.txt seed-second.txt
 
-      - name: Run Phase 2 PostgreSQL integration checks
-        run: uv run --project backend pytest backend/tests/integration/test_phase2_database.py backend/tests/integration/test_phase2_readyz.py -q
-
       - name: Apply the pinned Procrastinate schema separately
         run: uv run --project backend procrastinate --app reconbench_app.db.procrastinate_schema.app schema --apply
+
+      - name: Run Phase 2 PostgreSQL integration checks
+        run: >-
+          uv run --project backend pytest
+          backend/tests/integration/test_phase2_database.py
+          backend/tests/integration/test_phase2_readyz.py
+          backend/tests/integration/test_configuration.py
+          backend/tests/integration/test_ingestion.py
+          backend/tests/integration/test_phase4_task_411_413.py -q
 
       - name: Count ReconBench and queue tables
         run: uv run --project backend python scripts/check_phase2_table_count.py

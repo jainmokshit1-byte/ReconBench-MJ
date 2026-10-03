@@ -1,0 +1,7 @@
+{
+  "engine": {
+    "payable_rate_mode": "pay_at_po_rate",
+    "tax_rates": ["5", "12", "18", "28"]
+  },
+  "parser_hints": {}
+}

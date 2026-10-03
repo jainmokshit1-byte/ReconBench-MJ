@@ -7,9 +7,10 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "lint": "eslint .",
+    "lint": "eslint . && node scripts/check-money-math.mjs",
     "typecheck": "tsc -b --pretty false",
     "test": "vitest",
+    "test:e2e": "playwright test --config=playwright.config.mjs",
     "api:generate": "openapi-typescript ../backend/openapi.json -o src/api/generated.ts"
   },
   "dependencies": {

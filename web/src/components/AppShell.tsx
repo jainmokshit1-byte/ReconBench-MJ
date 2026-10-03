@@ -8,7 +8,15 @@ import {
   House,
   Settings,
 } from "lucide-react";
-import { NavLink, Outlet } from "react-router";
+import { useEffect, useState } from "react";
+import { NavLink, Outlet, useNavigate } from "react-router";
+
+import { listRecentReconciliationRuns } from "../api/reconciliation";
+import { useAuth } from "../auth/useAuth";
+import { PeriodProvider } from "../contexts/PeriodContext";
+import { usePeriod } from "../contexts/usePeriod";
+import { CapabilityNavLink } from "./CapabilityNavLink";
+import type { Capability } from "../auth/session";
 
 const mainNavigation = [
   { to: "/home", label: "Home", icon: House },
@@ -18,6 +26,39 @@ const mainNavigation = [
 ];
 
 export function AppShell() {
+  return <PeriodProvider><AppShellContent /></PeriodProvider>;
+}
+
+function AppShellContent() {
+  const { user, signOut } = useAuth();
+  const navigate = useNavigate();
+  const { period, setPeriod } = usePeriod();
+  const [activeRuns, setActiveRuns] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      void listRecentReconciliationRuns().then((runs) => {
+        if (!cancelled) setActiveRuns(runs.filter((run) => run.status === "queued" || run.status === "running").map((run) => run.id));
+      }).catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 5000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  if (!user) return null;
+
+  const handleSignOut = async () => {
+    try {
+      await signOut();
+    } catch {
+      // Session state is cleared even when the server cannot be reached.
+    } finally {
+      navigate("/login", { replace: true });
+    }
+  };
+
   return (
     <div className="app-frame">
       <aside className="sidebar" aria-label="Workspace sidebar">
@@ -42,10 +83,13 @@ export function AppShell() {
         <div className="sidebar-spacer" />
         <div className="sidebar-footer">
           <div className="environment-pill"><span className="environment-dot" /> Local workspace</div>
-          <NavLink className={({ isActive }) => `nav-link settings-link${isActive ? " is-active" : ""}`} to="/settings">
-            <Settings size={18} strokeWidth={1.8} aria-hidden="true" />
-            <span>Settings</span>
-          </NavLink>
+          <CapabilityNavLink
+            to="/settings"
+            label="Settings"
+            capability="settings.change"
+            capabilities={user.capabilities as Capability[]}
+            icon={Settings}
+          />
           <button className="help-link" type="button">
             <CircleHelp size={17} strokeWidth={1.8} aria-hidden="true" />
             <span>Help and guidance</span>
@@ -57,13 +101,32 @@ export function AppShell() {
         <header className="topbar">
           <div className="period-picker" aria-label="Current reconciliation period">
             <span className="period-label">Period</span>
-            <button className="period-button" type="button" aria-label="Select period">
-              Select a period <ChevronDown size={15} aria-hidden="true" />
-            </button>
+            <input className="period-button" type="month" aria-label="Select invoice date period" value={period} onChange={(event) => setPeriod(event.currentTarget.value)} />
           </div>
           <div className="topbar-right">
-            <div className="job-status"><Activity size={15} aria-hidden="true" /> All systems idle</div>
-            <div className="avatar" aria-label="Signed in user">RB</div>
+            <details className="job-status-menu">
+              <summary className="job-status"><Activity size={15} aria-hidden="true" /> {activeRuns.length ? `${activeRuns.length} run${activeRuns.length === 1 ? "" : "s"} active` : "No active runs"}</summary>
+              <div className="job-status-popover">
+                {activeRuns.length ? activeRuns.map((runId) => <NavLink key={runId} to={`/reconciliation?run_id=${encodeURIComponent(runId)}`}>Reconciliation run {runId.slice(0, 8)}</NavLink>) : <span>No queued or running reconciliation jobs.</span>}
+              </div>
+            </details>
+            <details className="user-menu">
+              <summary aria-label={`${user.name}, ${user.role}`}>
+                <span className="avatar" aria-hidden="true">{user.name.trim().slice(0, 2).toUpperCase()}</span>
+                <span className="user-menu-label">
+                  <strong>{user.name}</strong>
+                  <small>{user.role.replaceAll("_", " ")}</small>
+                </span>
+                <ChevronDown size={14} aria-hidden="true" />
+              </summary>
+              <div className="user-menu-popover">
+                <strong>{user.name}</strong>
+                <span>{user.role.replaceAll("_", " ")}</span>
+                <button className="button user-menu-signout" type="button" onClick={() => void handleSignOut()}>
+                  Sign out
+                </button>
+              </div>
+            </details>
           </div>
         </header>
         <main className="page-content"><Outlet /></main>

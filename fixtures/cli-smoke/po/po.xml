@@ -1,0 +1,7 @@
+<PurchaseOrder>
+  <OrderNo>PO-SYN-1</OrderNo><OrderDate>2026-04-01</OrderDate>
+  <Supplier>Example Components</Supplier><SupplierGSTIN>27AAPFU0939F1ZV</SupplierGSTIN>
+  <Status>Open</Status>
+  <Line><Description>Steel Washer M8</Description><ItemCode>W-M8</ItemCode>
+    <Qty>10</Qty><Rate>100</Rate><Amount>1000</Amount><Unit>NOS</Unit></Line>
+</PurchaseOrder>

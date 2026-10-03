@@ -715,6 +715,11 @@
       "is_partition": false,
       "owner": "reconbench_migrator"
     },
+    "worker_control": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
     "workspace": {
       "kind": "r",
       "is_partition": false,
@@ -4506,6 +4511,41 @@
     },
     {
       "kind": "table",
+      "object": "worker_control",
+      "grantee": "reconbench_app",
+      "privilege_type": "DELETE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "worker_control",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "worker_control",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "worker_control",
+      "grantee": "reconbench_app",
+      "privilege_type": "UPDATE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "worker_control",
+      "grantee": "reconbench_report",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
       "object": "workspace",
       "grantee": "reconbench_app",
       "privilege_type": "DELETE",
@@ -4739,7 +4779,7 @@
     }
   ],
   "object_counts": {
-    "application_tables": 41,
+    "application_tables": 42,
     "extensions": 2,
     "views": 4,
     "materialized_views": 0,
@@ -4749,7 +4789,7 @@
     "domains": 5,
     "sequences": 1,
     "foreign_keys": 138,
-    "explicit_acls": 230,
+    "explicit_acls": 235,
     "default_privileges": 7
   }
 }

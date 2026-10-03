@@ -1,7 +1,8 @@
 """Static SQLAlchemy 2.0 metadata for the validated ReconBench schema.
 
 This is a checked-in schema declaration, not runtime database reflection. It covers
-the 41 application tables from Backend Schema sections 3–8. Alembic's own
+the 41 validated application tables from Backend Schema sections 3–8 plus the
+Phase 4 global worker-control table (42 tables and 660 columns total). Alembic's own
 alembic_version table and the separately installed Procrastinate schema are not
 application metadata. Catalog-only objects are checked by check_schema_contract.py.
 """
@@ -123,6 +124,18 @@ _tables["workspace"] = sa.Table(
         "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
     ),
     sa.PrimaryKeyConstraint("id", name="workspace_pkey"),
+)
+
+_tables["worker_control"] = sa.Table(
+    "worker_control",
+    metadata,
+    sa.Column("control_id", sa.SmallInteger(), server_default=sa.text("1"), nullable=False),
+    sa.Column("paused", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+    sa.Column(
+        "updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.PrimaryKeyConstraint("control_id", name="worker_control_pkey"),
+    sa.CheckConstraint("control_id = 1", name="worker_control_singleton_ck"),
 )
 
 _tables["vendor_alias"] = sa.Table(
