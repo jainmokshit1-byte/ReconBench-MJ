@@ -206,13 +206,13 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Download Linux engine output
-        uses: actions/download-artifact@v7.0.1
+        uses: actions/download-artifact@v8
         with:
           name: engine-output-ubuntu-24.04
           path: artifacts/linux
 
       - name: Download Windows engine output
-        uses: actions/download-artifact@v7.0.1
+        uses: actions/download-artifact@v8
         with:
           name: engine-output-windows-2025
           path: artifacts/windows
@@ -232,7 +232,7 @@ jobs:
         run: >-
           docker run --rm --volume "$PWD:/repo"
           ghcr.io/gitleaks/gitleaks:v8.29.1@sha256:aa036a2f4bdfe3cc3c55fa4326308efabb4a6be498c883c864fd1d0d5585438a
-          git --redact --no-banner /repo
+          git --redact --no-banner --gitleaks-ignore-path /repo/.gitleaksignore /repo
 
   phase2-database:
     name: Phase 2 PostgreSQL schema gates
@@ -276,7 +276,7 @@ jobs:
         run: uv sync --project backend --all-groups --locked
 
       - name: Build the previous schema
-        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0014
+        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0015
 
       - name: Test the migration on a copy of the previous schema
         run: uv run --project backend python scripts/check_migration_safety.py
@@ -308,7 +308,11 @@ jobs:
           backend/tests/integration/test_phase2_database.py
           backend/tests/integration/test_phase2_readyz.py
           backend/tests/integration/test_configuration.py
-          backend/tests/integration/test_ingestion.py
+          backend/tests/integration/test_ingestion.py -q
+
+      - name: Run Phase 4 database acceptance checks
+        run: >-
+          uv run --project backend pytest
           backend/tests/integration/test_phase4_task_411_413.py -q
 
       - name: Count ReconBench and queue tables

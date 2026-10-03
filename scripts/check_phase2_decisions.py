@@ -1,4 +1,4 @@
-"""Ensure the four Plan-required open Schema §13 items remain recorded once."""
+"""Ensure Phase 2 decisions remain recorded once with their current status."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DECISION_LOG = ROOT / "docs" / "decision-log.md"
 SECTION = "## 3. Remaining Backend Schema §13 decisions"
-EXPECTED_ROWS = {
+EXPECTED_OPEN_ROWS = {
     12: "| 12 | Ledger completeness detection remains a proposed rule. | G-15 |",
-    14: "| 14 | Whether `rules_hash` excludes `body.app` remains unconfirmed. | G-25 |",
     16: (
         "| 16 | KPI/list treatment of approved, held, and rejected cases needs confirmation; "
         "the effective-status interpretation is still a proposal. | G-14 |"
@@ -17,6 +16,12 @@ EXPECTED_ROWS = {
     24: (
         "| 24 | Reason-code titles, messages, and suggested actions await the missing copy deck "
         "and Finance review. | G-06 |"
+    ),
+}
+EXPECTED_RESOLVED_ROWS = {
+    14: (
+        "| 14 | **Resolved in Task 4.6:** `rules_hash` includes the check registry and "
+        "`body.engine`; `body.app` is excluded. | G-25 |"
     ),
 }
 
@@ -27,7 +32,7 @@ def main() -> int:
         raise SystemExit(f"Missing decision-log section: {SECTION}")
     section = content.split(SECTION, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     errors: list[str] = []
-    for item, expected_row in EXPECTED_ROWS.items():
+    for item, expected_row in {**EXPECTED_OPEN_ROWS, **EXPECTED_RESOLVED_ROWS}.items():
         matching_rows = [
             line.strip()
             for line in section.splitlines()
@@ -35,7 +40,8 @@ def main() -> int:
         ]
         if matching_rows != [expected_row]:
             errors.append(
-                f"Schema §13 #{item}: expected exactly one unchanged open row; "
+                f"Schema §13 #{item}: expected exactly one row with the current "
+                "documented status; "
                 f"found {matching_rows!r}"
             )
     if errors:
@@ -43,7 +49,10 @@ def main() -> int:
         for error in errors:
             print(f"- {error}")
         return 1
-    print("Phase 2 decision-log check passed: #12, #14, #16, and #24 remain open once each")
+    print(
+        "Phase 2 decision-log check passed: #12, #16, and #24 remain open; "
+        "#14 has its documented Task 4.6 resolution; each appears once"
+    )
     return 0
 
 

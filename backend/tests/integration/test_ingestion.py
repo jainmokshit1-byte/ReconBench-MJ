@@ -726,7 +726,7 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             "/api/v1/runs",
             json={"run_date": "2026-04-30"},
             headers={
-                "Idempotency-Key": "phase4-initial-reconciliation",
+                "Idempotency-Key": "replay-test-run-create",
                 "X-CSRF-Token": "synthetic-csrf",
             },
         )
@@ -1633,7 +1633,7 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             "/api/v1/runs",
             json={"run_date": "2026-04-30"},
             headers={
-                "Idempotency-Key": "phase4-ingestion-order-parity",
+                "Idempotency-Key": "replay-test-run-order-check",
                 "X-CSRF-Token": "synthetic-csrf",
             },
         )

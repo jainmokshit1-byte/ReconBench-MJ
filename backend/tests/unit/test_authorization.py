@@ -33,8 +33,11 @@ def _service_classes() -> tuple[type[object], ...]:
     package = importlib.import_module("reconbench_app")
     classes: set[type[object]] = set()
     for module_info in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
-        if module_info.name == "reconbench_app.api.main":
-            # Importing this module starts the production app and requires deployment settings.
+        if module_info.name in {
+            "reconbench_app.api.main",
+            "reconbench_app.db.procrastinate_schema",
+        }:
+            # These CLI entrypoints build runtime apps and require deployment settings.
             continue
         module = importlib.import_module(module_info.name)
         for member in vars(module).values():

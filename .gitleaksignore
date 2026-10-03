@@ -1,0 +1,5 @@
+# Exact historical findings reviewed as synthetic fixtures or a retired disposable DB credential.
+03d07ea0b5cbf27fe32b76e12a2e775d65ce5884:backend/tests/integration/test_ingestion.py:generic-api-key:729
+03d07ea0b5cbf27fe32b76e12a2e775d65ce5884:backend/tests/integration/test_ingestion.py:generic-api-key:1636
+03d07ea0b5cbf27fe32b76e12a2e775d65ce5884:docs/gates/phase-3.md:generic-api-key:74
+03d07ea0b5cbf27fe32b76e12a2e775d65ce5884:docs/gates/phase-4.md:generic-api-key:113
