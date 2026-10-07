@@ -27,3 +27,4 @@ golden/**/documents/
 .DS_Store
 Thumbs.db
 /work/
+deploy/secrets/

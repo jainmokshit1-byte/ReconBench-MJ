@@ -172,6 +172,38 @@ def test_configuration_versions_stale_writes_audit_and_reason_catalogue(
         assert engine_change.json()["seq"] == 3
         assert engine_change.json()["rules_hash"] != app_only.json()["rules_hash"]
         assert engine_change.json()["engine_hash"] != app_only.json()["engine_hash"]
+        assert baseline.json()["defaults"] == DEFAULT_CONFIG
+
+        unknown_check = engine_change.json()["body"]
+        unknown_check["engine"]["overrides"]["items"] = [
+            {
+                "item_code": "SKU-1",
+                "vendor_id": None,
+                "tolerances": {"bogus": {"pct": "1", "abs": "0"}},
+            }
+        ]
+        rejected_override = client.put(
+            "/api/v1/config",
+            json=unknown_check,
+            headers={"If-Match": '"3"', "X-CSRF-Token": "synthetic-csrf"},
+        )
+        bad_buyer = engine_change.json()["body"]
+        bad_buyer["engine"]["buyer_entities"] = [{"gstin": "27AAPFU0939F1ZW", "name": "Bad"}]
+        rejected_buyer = client.put(
+            "/api/v1/config",
+            json=bad_buyer,
+            headers={"If-Match": '"3"', "X-CSRF-Token": "synthetic-csrf"},
+        )
+        assert rejected_override.status_code == 422
+        assert any(
+            error["location"][:3] == ["engine", "overrides", "items"]
+            for error in rejected_override.json()["errors"]
+        )
+        assert rejected_buyer.status_code == 422
+        assert any(
+            error["location"][:2] == ["engine", "buyer_entities"]
+            for error in rejected_buyer.json()["errors"]
+        )
 
         stale = client.put(
             "/api/v1/config",

@@ -1,0 +1,101 @@
+# Synthetic demo month for `make demo`.
+#
+# Every vendor, GSTIN, item, number, and date below is invented; no real
+# supplier, buyer, or sample document was used. GSTINs carry valid checksums so
+# the parsers treat them as well-formed. Expected outcomes for each invoice live
+# in expected.yaml and come from the matching SCN fixture.
+month: '2026-09'
+run_date: '2026-09-30'
+buyer:
+  name: Demo Buyer Manufacturing Pvt Ltd
+  gstin: 27AAACD7777M1Z0
+vendors:
+  SF:
+    name: Shakti Fasteners Pvt Ltd
+    gstin: 27AAACS1234A1Z2
+  LP:
+    name: Lotus Packaging Industries
+    gstin: 27AABCL5678B1ZI
+  BE:
+    name: Bharat Electricals Co
+    gstin: 27AAACB9999C1ZB
+  VE:
+    name: Vardhan Engineering Works
+    gstin: 29AAAPV4321D1ZW
+
+purchase_orders:
+- number: DM-PO-101          # SCN-01 clean three-way match
+  vendor: SF
+  date: '2026-09-01'
+  lines:
+  - {code: HB-M10-50, description: Hex Bolt M10x50 Zinc Plated, hsn: '7318', uom: NOS, qty: '10', rate: '1250.00', gst: '18'}
+- number: DM-PO-102          # SCN-02 partial deliveries against one PO
+  vendor: LP
+  date: '2026-09-02'
+  lines:
+  - {code: CB-5P-450, description: Corrugated Box 5 Ply 450x300x300, hsn: '4819', uom: NOS, qty: '100', rate: '480.00', gst: '18'}
+- number: DM-PO-104          # SCN-04 second invoice exceeds the cumulative PO cap
+  vendor: BE
+  date: '2026-09-02'
+  lines:
+  - {code: CC-4SQ-90, description: Copper Cable 4 sq mm 90m Coil, hsn: '8544', uom: NOS, qty: '100', rate: '500.00', gst: '18'}
+- number: DM-PO-106          # SCN-06 invoice bills rejected quantity
+  vendor: SF
+  date: '2026-09-03'
+  lines:
+  - {code: SW-M10, description: Spring Washer M10 Box of 500, hsn: '7318', uom: NOS, qty: '10', rate: '1000.00', gst: '18'}
+- number: DM-PO-107          # SCN-07 rate within tolerance and rate too high
+  vendor: VE
+  date: '2026-09-03'
+  lines:
+  - {code: GP-20, description: Gear Pump GP-20 Cast Iron, hsn: '8413', uom: NOS, qty: '20', rate: '1000.00', gst: '18'}
+- number: DM-PO-111          # SCN-11 duplicate invoice uploaded again as a scan
+  vendor: LP
+  date: '2026-09-04'
+  lines:
+  - {code: SF-500, description: Stretch Film Roll 500mm, hsn: '3920', uom: NOS, qty: '10', rate: '350.00', gst: '18'}
+- number: DM-PO-116          # SCN-16 extra freight line
+  vendor: BE
+  date: '2026-09-05'
+  lines:
+  - {code: DB-12, description: Distribution Panel DB 12 Way, hsn: '8537', uom: NOS, qty: '2', rate: '15000.00', gst: '18'}
+
+grns:
+- {number: DM-GRN-101, po: DM-PO-101, date: '2026-09-04', lines: [{code: HB-M10-50, received: '10', accepted: '10'}]}
+- {number: DM-GRN-102A, po: DM-PO-102, date: '2026-09-12', lines: [{code: CB-5P-450, received: '90', accepted: '90'}]}
+- {number: DM-GRN-102B, po: DM-PO-102, date: '2026-09-26', lines: [{code: CB-5P-450, received: '10', accepted: '10'}]}
+- {number: DM-GRN-104A, po: DM-PO-104, date: '2026-09-08', lines: [{code: CC-4SQ-90, received: '60', accepted: '60'}]}
+- {number: DM-GRN-104B, po: DM-PO-104, date: '2026-09-18', lines: [{code: CC-4SQ-90, received: '45', accepted: '45'}]}
+- {number: DM-GRN-106, po: DM-PO-106, date: '2026-09-09', lines: [{code: SW-M10, received: '10', accepted: '8', rejected: '2'}]}
+- {number: DM-GRN-107, po: DM-PO-107, date: '2026-09-10', lines: [{code: GP-20, received: '20', accepted: '20'}]}
+- {number: DM-GRN-111, po: DM-PO-111, date: '2026-09-07', lines: [{code: SF-500, received: '10', accepted: '10'}]}
+- {number: DM-GRN-116, po: DM-PO-116, date: '2026-09-11', lines: [{code: DB-12, received: '2', accepted: '2'}]}
+
+invoices:
+- {number: SF/26-27/0451, vendor: SF, po: DM-PO-101, date: '2026-09-05', lines: [{code: HB-M10-50, qty: '10', rate: '1250.00'}]}
+- {number: LP/26-27/2201, vendor: LP, po: DM-PO-102, date: '2026-09-14', lines: [{code: CB-5P-450, qty: '90', rate: '480.00'}]}
+- {number: LP/26-27/2260, vendor: LP, po: DM-PO-102, date: '2026-09-28', lines: [{code: CB-5P-450, qty: '10', rate: '480.00'}]}
+- {number: BE/1004A, vendor: BE, po: DM-PO-104, date: '2026-09-15', lines: [{code: CC-4SQ-90, qty: '90', rate: '500.00'}]}
+- {number: BE/1004B, vendor: BE, po: DM-PO-104, date: '2026-09-22', lines: [{code: CC-4SQ-90, qty: '15', rate: '500.00'}]}
+- {number: SF/26-27/0478, vendor: SF, po: DM-PO-106, date: '2026-09-11', lines: [{code: SW-M10, qty: '10', rate: '1000.00'}]}
+- {number: VE/1007A, vendor: VE, po: DM-PO-107, date: '2026-09-12', lines: [{code: GP-20, qty: '10', rate: '1003.00'}]}
+- {number: VE/1007B, vendor: VE, po: DM-PO-107, date: '2026-09-19', lines: [{code: GP-20, qty: '10', rate: '1020.00'}]}
+- {number: LP/26-27/1011, vendor: LP, po: DM-PO-111, date: '2026-09-08', lines: [{code: SF-500, qty: '4', rate: '350.00'}]}
+- number: BE/1016
+  vendor: BE
+  po: DM-PO-116
+  date: '2026-09-13'
+  lines: [{code: DB-12, qty: '2', rate: '15000.00'}]
+  charges: [{description: Freight Charges, hsn: '9965', amount: '250.00', gst: '18'}]
+
+# How the month arrives: the same mix of exports, registers, PDFs, and scans a
+# finance team uploads. `render` picks the generator; `documents` lists numbers.
+files:
+- {name: purchase-orders-sep.xml, zone: po, render: tally_xml, documents: [DM-PO-101, DM-PO-102, DM-PO-104, DM-PO-106, DM-PO-107, DM-PO-111, DM-PO-116]}
+- {name: grn-register-sep.csv, zone: grn, render: csv, documents: [DM-GRN-101, DM-GRN-102A, DM-GRN-102B, DM-GRN-104A, DM-GRN-104B, DM-GRN-106, DM-GRN-107, DM-GRN-111, DM-GRN-116]}
+- {name: purchase-register-sep.csv, zone: invoice, render: csv, documents: [LP/26-27/2201, LP/26-27/2260, BE/1004A, BE/1004B, LP/26-27/1011]}
+- {name: tally-purchase-vouchers.xml, zone: invoice, render: tally_xml, documents: [VE/1007A, VE/1007B, BE/1016]}
+- {name: SF-26-27-0451.pdf, zone: invoice, render: pdf_text, documents: [SF/26-27/0451]}
+- {name: SF-26-27-0478-scan.pdf, zone: invoice, render: pdf_scan, documents: [SF/26-27/0478]}
+- {name: LP-26-27-1011-rescan.pdf, zone: invoice, render: pdf_scan, documents: [LP/26-27/1011]}
+- {name: courier-scans.zip, zone: invoice, render: zip, members: [{name: unreadable-scan.pdf, render: pdf_unreadable}]}

@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 import sqlalchemy as sa
 from reconbench_core.align import AlignmentConfig, AlignmentWeights
 from reconbench_core.mapping.links import (
+    MANUAL_SELECTION_EVIDENCE,
     LinkResolution,
     MappingConfig,
     MappingDocument,
@@ -48,6 +51,22 @@ from reconbench_app.authorization import ActorContext, requires
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.db.repository import VersionConflict
+
+if TYPE_CHECKING:
+    from reconbench_app.ai.enqueue import AiHookEnqueuer
+
+_LOGGER = logging.getLogger(__name__)
+_PAN_PATTERN = re.compile(r"[A-Z]{5}[0-9]{4}[A-Z]")
+
+
+@dataclass(frozen=True, slots=True)
+class MappingSnapshot:
+    """Current sources, governing POs and config exactly as one resolution sees them."""
+
+    sources: tuple[MappingDocument, ...]
+    purchase_orders: tuple[MappingPO, ...]
+    config: MappingConfig
+    input_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +127,49 @@ def _decimal(value: object, default: str) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return Decimal(default)
+
+
+def mapping_config_from_body(body: object) -> MappingConfig:
+    """Build link thresholds from an active config body (missing values use defaults)."""
+
+    engine = body.get("engine", {}) if isinstance(body, Mapping) else {}
+    if not isinstance(engine, Mapping):
+        engine = {}
+    thresholds = engine.get("thresholds", {})
+    thresholds = thresholds if isinstance(thresholds, Mapping) else {}
+    ladder = engine.get("ladder_confidence", {})
+    ladder = ladder if isinstance(ladder, Mapping) else {}
+    policies = engine.get("policies", {})
+    policies = policies if isinstance(policies, Mapping) else {}
+    reverse = policies.get("reverse_lookup", {})
+    reverse = reverse if isinstance(reverse, Mapping) else {}
+    weights = engine.get("weights", {})
+    weights = weights if isinstance(weights, Mapping) else {}
+    align_weights = weights.get("align", {})
+    align_weights = align_weights if isinstance(align_weights, Mapping) else {}
+    alignment = AlignmentConfig(
+        weights=AlignmentWeights(
+            desc=_decimal(align_weights.get("desc"), "0.55"),
+            code=_decimal(align_weights.get("code"), "0.20"),
+            hsn=_decimal(align_weights.get("hsn"), "0.15"),
+            uom=_decimal(align_weights.get("uom"), "0.10"),
+        ),
+        item_aligned=_decimal(thresholds.get("item_aligned"), "0.80"),
+        item_review=_decimal(thresholds.get("item_review"), "0.60"),
+        item_single_line_explicit=_decimal(thresholds.get("item_single_line_explicit"), "0.50"),
+        spec_conflict_cap=_decimal(thresholds.get("spec_conflict_cap"), "0.60"),
+    )
+    return MappingConfig(
+        link_auto_accept=_decimal(thresholds.get("link_auto_accept"), "0.95"),
+        confidence_labeled=_decimal(ladder.get("labeled"), "0.99"),
+        confidence_reverse=_decimal(ladder.get("reverse"), "0.97"),
+        confidence_via_grn=_decimal(ladder.get("via_grn"), "0.95"),
+        confidence_manual=_decimal(ladder.get("manual"), "1.00"),
+        reverse_lookup_window_runs=int(reverse.get("window_runs", 6)),
+        step3_min_score=_decimal(thresholds.get("step3_min_score"), "0.80"),
+        step3_min_lead=_decimal(thresholds.get("step3_min_lead"), "0.15"),
+        alignment=alignment,
+    )
 
 
 def _make_document(
@@ -221,9 +283,15 @@ def _make_document(
 class MappingService:
     """Resolve current invoices/GRNs to governing POs and persist append-only results."""
 
-    def __init__(self, engine: Engine, queue: Any | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        queue: Any | None = None,
+        ai_hooks: AiHookEnqueuer | None = None,
+    ) -> None:
         self.engine = engine
         self.queue = queue
+        self.ai_hooks = ai_hooks
 
     def _enqueue_pending_recomputes(self, workspace_id: UUID, connection: Connection) -> None:
         if self.queue is not None:
@@ -239,53 +307,12 @@ class MappingService:
                 sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_name, 0))"),
                 {"lock_name": f"reconbench.mapping:{workspace_id}"},
             )
-            rows, line_rows, text_by_version, header_evidence, line_evidence = self._load_current(
-                connection, workspace_id
-            )
-            if not rows:
+            snapshot = self.load_snapshot(connection, workspace_id)
+            if snapshot is None:
                 return MappingSummary(0, 0, 0, 0, 0, 0, 0)
-            link_context = self._current_link_context(connection, workspace_id)
-            source_documents: list[MappingDocument] = []
-            po_candidates: list[tuple[RowMapping, Document, UUID | None]] = []
-            versions: dict[UUID, UUID] = {}
-            for row in rows:
-                document_id = cast(UUID, row["document_id"])
-                version_id = cast(UUID, row["version_id"])
-                versions[document_id] = version_id
-                document = _make_document(
-                    row,
-                    line_rows.get(version_id, ()),
-                    text_by_version.get(version_id, ""),
-                    header_evidence.get(version_id, {}),
-                    line_evidence,
-                )
-                vendor_id = cast(UUID | None, row["vendor_id"])
-                if document.header.doc_type is DocType.PO:
-                    po_candidates.append((row, document, vendor_id))
-                else:
-                    manual_ids, rejected_ids = link_context.get(document_id, (set(), set()))
-                    source_documents.append(
-                        MappingDocument(
-                            document_id=document_id,
-                            natural_key=str(row["natural_key"]),
-                            vendor_id=vendor_id,
-                            document=document,
-                            source_text=document.raw_text,
-                            manual_po_ids=tuple(sorted(manual_ids, key=str)),
-                            rejected_po_ids=tuple(sorted(rejected_ids, key=str)),
-                        )
-                    )
-
-            purchase_orders = self._governing_pos(connection, workspace_id, po_candidates)
-            config = self._mapping_config(connection, workspace_id)
-            resolutions = resolve_links(source_documents, purchase_orders, config)
-            input_hash = _json_hash(
-                {
-                    "sources": [item.model_dump(mode="json") for item in source_documents],
-                    "purchase_orders": [item.model_dump(mode="json") for item in purchase_orders],
-                    "config": config.model_dump(mode="json"),
-                }
-            )
+            source_documents = snapshot.sources
+            input_hash = snapshot.input_hash
+            resolutions = resolve_links(snapshot.sources, snapshot.purchase_orders, snapshot.config)
             result_by_id = {item.document_id: item for item in resolutions}
             current = self._current_links(connection, workspace_id)
             inserted = resolution_count = 0
@@ -312,6 +339,7 @@ class MappingService:
                 workspace_id=workspace_id,
                 document_ids=affected_documents,
             )
+            self._queue_po_reranks(connection, workspace_id, snapshot)
             return MappingSummary(
                 documents_seen=len(source_documents),
                 linked=linked,
@@ -343,6 +371,8 @@ class MappingService:
                         vendor.c.id,
                         vendor.c.canonical_name,
                         vendor.c.normalized_name,
+                        vendor.c.name_status,
+                        vendor.c.version,
                         vendor.c.pan,
                         vendor.c.anchor,
                         vendor.c.merged_into,
@@ -458,6 +488,8 @@ class MappingService:
                 {
                     "id": vendor_id,
                     "canonical_name": vendor_row["canonical_name"],
+                    "name_status": vendor_row["name_status"],
+                    "version": vendor_row["version"],
                     "gstins": vendor_gstins,
                     "pan": vendor_row["pan"],
                     "anchor": vendor_row["anchor"],
@@ -490,6 +522,8 @@ class MappingService:
             document.c.vendor_id,
             document.c.current_version_id,
             document.c.needs_verification,
+            version.c.vendor_name,
+            version.c.vendor_gstin,
             version.c.doc_no,
             version.c.doc_date,
             version.c.grand_total,
@@ -541,6 +575,7 @@ class MappingService:
                         link.c.method,
                         link.c.confidence,
                         link.c.state,
+                        link.c.ai_suggested,
                         link.c.evidence_snippet,
                         link.c.level,
                         link.c.from_line_no,
@@ -607,6 +642,7 @@ class MappingService:
                     "method": link_row.method,
                     "confidence": link_row.confidence,
                     "state": link_row.state,
+                    "ai_suggested": link_row.ai_suggested,
                     "evidence": link_row.evidence_snippet,
                     "level": link_row.level,
                     "line_no": link_row.from_line_no,
@@ -627,6 +663,8 @@ class MappingService:
                 "id": row["id"],
                 "doc_type": row["doc_type"],
                 "doc_no": row["doc_no"],
+                "vendor_name": row["vendor_name"],
+                "vendor_gstin": row["vendor_gstin"],
                 "doc_date": row["doc_date"],
                 "grand_total": row["grand_total"],
                 "currency": row["currency"],
@@ -744,6 +782,9 @@ class MappingService:
                 suggestion.c.state,
                 suggestion.c.version,
                 suggestion.c.created_at,
+                # Advisory H4 opinion; it never decides or merges anything.
+                suggestion.c.ai_opinion,
+                suggestion.c.ai_reason,
                 vendor_a.c.canonical_name.label("vendor_a_name"),
                 vendor_a.c.pan.label("vendor_a_pan"),
                 vendor_b.c.canonical_name.label("vendor_b_name"),
@@ -911,6 +952,253 @@ class MappingService:
                 survivor_vendor_id=survivor_vendor_id,
                 suggestion_id=None,
             )
+
+    @requires("links.edit")
+    def create_vendor(
+        self,
+        actor: ActorContext,
+        *,
+        name: str,
+        gstin: str | None = None,
+        pan: str | None = None,
+    ) -> dict[str, Any]:
+        """A person creates a vendor, e.g. an unregistered supplier without a GSTIN (AC-4)."""
+
+        from reconbench_core.normalize import normalize_vendor_name, validate_gstin
+        from reconbench_core.parsers.parties import buyer_gstins
+
+        vendor = metadata.tables["vendor"]
+        registration = metadata.tables["vendor_gstin"]
+        with self.engine.begin() as connection:
+            buyers = self._buyer_entities(connection, actor.workspace_id)
+            display = self._checked_vendor_name(name, buyers)
+            facts = validate_gstin(gstin) if gstin and gstin.strip() else None
+            if facts is not None and (
+                not facts.is_valid or facts.state_code is None or facts.pan is None
+            ):
+                raise ValueError("the GSTIN is not valid (format or checksum)")
+            if facts is not None and facts.normalized in buyer_gstins(buyers):
+                raise ValueError("the GSTIN is one of your own registrations, not a supplier")
+            pan_value = pan.strip().upper() if pan and pan.strip() else None
+            if pan_value is not None and not _PAN_PATTERN.fullmatch(pan_value):
+                raise ValueError("the PAN must look like AAAAA9999A")
+            if facts is not None and pan_value is not None and facts.pan != pan_value:
+                raise ValueError("the PAN does not match the GSTIN")
+            pan_value = facts.pan if facts is not None else pan_value
+            connection.execute(
+                sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_name, 0))"),
+                {"lock_name": f"reconbench.vendor-resolution:{actor.workspace_id}"},
+            )
+            if facts is not None:
+                owner = connection.scalar(
+                    sa.select(registration.c.vendor_id).where(
+                        registration.c.workspace_id == actor.workspace_id,
+                        registration.c.gstin == facts.normalized,
+                    )
+                )
+                if owner is not None:
+                    raise ValueError("this GSTIN already belongs to a vendor")
+            if pan_value is not None:
+                pan_owner = connection.scalar(
+                    sa.select(vendor.c.id).where(
+                        vendor.c.workspace_id == actor.workspace_id,
+                        vendor.c.merged_into.is_(None),
+                        vendor.c.pan == pan_value,
+                    )
+                )
+                if pan_owner is not None:
+                    raise ValueError("a vendor with this PAN already exists; add the GSTIN there")
+            created = (
+                connection.execute(
+                    sa.insert(vendor)
+                    .values(
+                        id=new_id(),
+                        workspace_id=actor.workspace_id,
+                        canonical_name=display,
+                        normalized_name=normalize_vendor_name(display),
+                        pan=pan_value,
+                        anchor="gstin" if facts is not None else "pan" if pan_value else "name",
+                        created_by_rule="manual",
+                        name_status="manual",
+                    )
+                    .returning(*vendor.c)
+                )
+                .mappings()
+                .one()
+            )
+            vendor_id = cast(UUID, created["id"])
+            if facts is not None:
+                connection.execute(
+                    sa.insert(registration).values(
+                        id=new_id(),
+                        workspace_id=actor.workspace_id,
+                        vendor_id=vendor_id,
+                        gstin=facts.normalized,
+                        state_code=facts.state_code,
+                        pan=facts.pan,
+                        checksum_ok=True,
+                    )
+                )
+            write_audit_event(
+                connection,
+                actor,
+                action="vendor.create",
+                target_type="vendor",
+                target_id=vendor_id,
+                after_state={
+                    "canonical_name": display,
+                    "gstin": facts.normalized if facts is not None else None,
+                    "pan": pan_value,
+                },
+            )
+            return {
+                "id": vendor_id,
+                "canonical_name": display,
+                "name_status": "manual",
+                "gstins": [facts.normalized] if facts is not None else [],
+                "pan": pan_value,
+                "anchor": created["anchor"],
+                "version": created["version"],
+            }
+
+    @requires("links.edit")
+    def rename_vendor(
+        self,
+        actor: ActorContext,
+        vendor_id: UUID,
+        *,
+        name: str,
+        expected_version: int,
+    ) -> dict[str, Any] | None:
+        """A person sets the display name; resolution never replaces it afterwards.
+
+        The previous readable name stays an alias so documents keep matching it.
+        """
+
+        from reconbench_core.normalize import normalize_vendor_name
+        from reconbench_core.parsers.parties import name_problem
+
+        vendor = metadata.tables["vendor"]
+        alias = metadata.tables["vendor_alias"]
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    sa.select(*vendor.c)
+                    .where(
+                        vendor.c.workspace_id == actor.workspace_id,
+                        vendor.c.id == vendor_id,
+                        vendor.c.merged_into.is_(None),
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            if int(row["version"]) != expected_version:
+                raise VersionConflict(dict(row))
+            display = self._checked_vendor_name(
+                name, self._buyer_entities(connection, actor.workspace_id)
+            )
+            old_name = str(row["canonical_name"])
+            old_norm = normalize_vendor_name(old_name)
+            new_norm = normalize_vendor_name(display)
+            if old_norm and old_norm != new_norm and name_problem(old_name) is None:
+                connection.execute(
+                    pg_insert(alias)
+                    .values(
+                        id=new_id(),
+                        workspace_id=actor.workspace_id,
+                        vendor_id=vendor_id,
+                        alias_raw=old_name,
+                        alias_norm=old_norm,
+                        source="manual",
+                        created_by=actor.actor_id,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[alias.c.workspace_id, alias.c.alias_norm]
+                    )
+                )
+            # The new name is the canonical name now, not an alias of it.
+            connection.execute(
+                sa.delete(alias).where(
+                    alias.c.workspace_id == actor.workspace_id,
+                    alias.c.vendor_id == vendor_id,
+                    alias.c.alias_norm == new_norm,
+                )
+            )
+            updated = (
+                connection.execute(
+                    sa.update(vendor)
+                    .where(vendor.c.workspace_id == actor.workspace_id, vendor.c.id == vendor_id)
+                    .values(
+                        canonical_name=display,
+                        normalized_name=new_norm,
+                        name_status="manual",
+                        input_seq=vendor.c.input_seq + 1,
+                        updated_at=sa.func.now(),
+                        version=vendor.c.version + 1,
+                    )
+                    .returning(*vendor.c)
+                )
+                .mappings()
+                .one()
+            )
+            self._bump_vendor_scope(
+                connection,
+                workspace_id=actor.workspace_id,
+                vendor_ids={vendor_id},
+                reason="vendor_renamed",
+            )
+            write_audit_event(
+                connection,
+                actor,
+                action="vendor.rename",
+                target_type="vendor",
+                target_id=vendor_id,
+                before_state={"canonical_name": old_name, "name_status": row["name_status"]},
+                after_state={"canonical_name": display, "name_status": "manual"},
+            )
+            return dict(updated)
+
+    @staticmethod
+    def _buyer_entities(connection: Connection, workspace_id: UUID) -> Any:
+        from reconbench_core.parsers.parties import party_hints_from_config
+
+        active = metadata.tables["config_active"]
+        version = metadata.tables["config_version"]
+        body = connection.scalar(
+            sa.select(version.c.body)
+            .select_from(
+                active.join(
+                    version,
+                    sa.and_(
+                        active.c.workspace_id == version.c.workspace_id,
+                        active.c.config_version_id == version.c.id,
+                    ),
+                )
+            )
+            .where(active.c.workspace_id == workspace_id)
+        )
+        engine = body.get("engine") if isinstance(body, Mapping) else None
+        return party_hints_from_config(engine if isinstance(engine, Mapping) else {})[
+            "buyer_entities"
+        ]
+
+    @staticmethod
+    def _checked_vendor_name(name: str, buyers: Any) -> str:
+        from reconbench_core.normalize import normalize_vendor_name
+        from reconbench_core.parsers.parties import is_buyer_name, name_problem
+
+        display = " ".join(name.split())
+        if not normalize_vendor_name(display):
+            raise ValueError("the vendor name must contain letters")
+        if name_problem(display) is not None:
+            raise ValueError("the vendor name looks like a label, a GSTIN or line text")
+        if is_buyer_name(display, buyers):
+            raise ValueError("the vendor name is one of your own company names")
+        return display
 
     @requires("data.view")
     def list_vendor_aliases(
@@ -1083,6 +1371,7 @@ class MappingService:
             .where(
                 pointer.c.workspace_id == actor.workspace_id,
                 link.c.state.in_(["auto", "suggested"]),
+                link.c.ai_suggested.is_(False),
                 link.c.confidence >= threshold,
                 source.c.vendor_id.is_not_distinct_from(target.c.vendor_id),
             )
@@ -1177,13 +1466,47 @@ class MappingService:
         pans.update(str(pan).upper() for _, pan in registrations if pan)
         if len(pans) > 1:
             raise ValueError("vendors with different PANs cannot be merged")
+        from reconbench_core.mapping.vendor import VendorNameStatus
+        from reconbench_core.parsers.parties import name_problem
+
         source_name = str(source["canonical_name"])
-        source_norm = normalize_vendor_name(source_name)
-        survivor_norm = normalize_vendor_name(str(survivor["canonical_name"]))
-        if source_norm and source_norm != survivor_norm:
+        survivor_name = str(survivor["canonical_name"])
+        name_rank = [status.value for status in VendorNameStatus]
+        # The weaker of the two names becomes the alias; a GSTIN or label "name"
+        # (pre-AC-4 junk) is never kept, and a pending survivor takes the source name.
+        alias_name = source_name
+        if name_problem(source_name) is None and normalize_vendor_name(source_name):
+            if name_rank.index(str(source["name_status"])) < name_rank.index(
+                str(survivor["name_status"])
+            ):
+                connection.execute(
+                    sa.update(vendor)
+                    .where(
+                        vendor.c.workspace_id == actor.workspace_id,
+                        vendor.c.id == survivor_vendor_id,
+                    )
+                    .values(
+                        canonical_name=source_name,
+                        normalized_name=normalize_vendor_name(source_name),
+                        name_status=source["name_status"],
+                    )
+                )
+                connection.execute(
+                    sa.delete(alias).where(
+                        alias.c.workspace_id == actor.workspace_id,
+                        alias.c.vendor_id == survivor_vendor_id,
+                        alias.c.alias_norm == normalize_vendor_name(source_name),
+                    )
+                )
+                alias_name, survivor_name = survivor_name, source_name
+        else:
+            alias_name = ""
+        alias_norm = normalize_vendor_name(alias_name) if name_problem(alias_name) is None else ""
+        survivor_norm = normalize_vendor_name(survivor_name)
+        if alias_norm and alias_norm != survivor_norm:
             existing_alias = connection.execute(
                 sa.select(alias.c.vendor_id).where(
-                    alias.c.workspace_id == actor.workspace_id, alias.c.alias_norm == source_norm
+                    alias.c.workspace_id == actor.workspace_id, alias.c.alias_norm == alias_norm
                 )
             ).scalar_one_or_none()
             if existing_alias is not None and existing_alias != survivor_vendor_id:
@@ -1194,13 +1517,14 @@ class MappingService:
                         id=new_id(),
                         workspace_id=actor.workspace_id,
                         vendor_id=survivor_vendor_id,
-                        alias_raw=source_name,
-                        alias_norm=source_norm,
+                        alias_raw=alias_name,
+                        alias_norm=alias_norm,
                         source="merge",
                         suggestion_id=suggestion_id,
                         created_by=actor.actor_id,
                     )
                 )
+
         connection.execute(
             sa.update(registration)
             .where(
@@ -1338,7 +1662,9 @@ class MappingService:
         vendor_id: UUID,
     ) -> dict[str, Any] | None:
         document = metadata.tables["document"]
+        version = metadata.tables["document_version"]
         vendor = metadata.tables["vendor"]
+        registration = metadata.tables["vendor_gstin"]
         with self.engine.begin() as connection:
             row = (
                 connection.execute(
@@ -1370,6 +1696,33 @@ class MappingService:
             )
             if selected_vendor is None:
                 raise ValueError("the selected vendor does not exist in this workspace")
+            extracted_gstin = connection.scalar(
+                sa.select(version.c.vendor_gstin).where(
+                    version.c.workspace_id == actor.workspace_id,
+                    version.c.id == row["current_version_id"],
+                )
+            )
+            vendor_gstins = set(
+                connection.execute(
+                    sa.select(registration.c.gstin).where(
+                        registration.c.workspace_id == actor.workspace_id,
+                        registration.c.vendor_id == vendor_id,
+                    )
+                ).scalars()
+            )
+            if extracted_gstin and vendor_gstins:
+                normalized_gstin = "".join(
+                    character for character in str(extracted_gstin).upper() if character.isalnum()
+                )
+                normalized_vendor_gstins = {
+                    "".join(character for character in value.upper() if character.isalnum())
+                    for value in vendor_gstins
+                }
+                if normalized_gstin not in normalized_vendor_gstins:
+                    raise ValueError(
+                        "the document GSTIN does not belong to the selected vendor; "
+                        "resolve the supplier identity before assigning it"
+                    )
             old_vendor_id = cast(UUID | None, row["vendor_id"])
             changed = old_vendor_id != vendor_id or not bool(row["vendor_locked"])
             if changed:
@@ -1416,6 +1769,195 @@ class MappingService:
                 "changed": changed,
             }
 
+    @requires("data.view")
+    def load_snapshot(self, connection: Connection, workspace_id: UUID) -> MappingSnapshot | None:
+        """Load the inputs one resolution uses; ``None`` when nothing is current."""
+
+        rows, line_rows, text_by_version, header_evidence, line_evidence = self._load_current(
+            connection, workspace_id
+        )
+        if not rows:
+            return None
+        link_context = self._current_link_context(connection, workspace_id)
+        source_documents: list[MappingDocument] = []
+        po_candidates: list[tuple[RowMapping, Document, UUID | None]] = []
+        versions: dict[UUID, UUID] = {}
+        for row in rows:
+            document_id = cast(UUID, row["document_id"])
+            version_id = cast(UUID, row["version_id"])
+            versions[document_id] = version_id
+            document = _make_document(
+                row,
+                line_rows.get(version_id, ()),
+                text_by_version.get(version_id, ""),
+                header_evidence.get(version_id, {}),
+                line_evidence,
+            )
+            vendor_id = cast(UUID | None, row["vendor_id"])
+            if document.header.doc_type is DocType.PO:
+                po_candidates.append((row, document, vendor_id))
+            else:
+                manual_ids, rejected_ids = link_context.get(document_id, (set(), set()))
+                source_documents.append(
+                    MappingDocument(
+                        document_id=document_id,
+                        natural_key=str(row["natural_key"]),
+                        vendor_id=vendor_id,
+                        document=document,
+                        source_text=document.raw_text,
+                        manual_po_ids=tuple(sorted(manual_ids, key=str)),
+                        rejected_po_ids=tuple(sorted(rejected_ids, key=str)),
+                    )
+                )
+
+        purchase_orders = self._governing_pos(connection, workspace_id, po_candidates)
+        config = self._mapping_config(connection, workspace_id)
+        input_hash = _json_hash(
+            {
+                "sources": [item.model_dump(mode="json") for item in source_documents],
+                "purchase_orders": [item.model_dump(mode="json") for item in purchase_orders],
+                "config": config.model_dump(mode="json"),
+            }
+        )
+        return MappingSnapshot(
+            sources=tuple(source_documents),
+            purchase_orders=tuple(purchase_orders),
+            config=config,
+            input_hash=input_hash,
+        )
+
+    def _queue_po_reranks(
+        self, connection: Connection, workspace_id: UUID, snapshot: MappingSnapshot
+    ) -> None:
+        """Queue advisory H3 re-ranks; a failure never blocks link resolution."""
+
+        if self.ai_hooks is None:
+            return
+        try:
+            with connection.begin_nested():
+                self.ai_hooks.po_reranks(connection, workspace_id, snapshot)
+        except Exception as exc:  # noqa: BLE001 - AI is optional; rules continue.
+            _LOGGER.warning("ai_enqueue_failed hook=h3_rerank error_type=%s", type(exc).__name__)
+
+    @requires("links.edit")
+    def record_ai_link_suggestion(
+        self,
+        connection: Connection,
+        *,
+        workspace_id: UUID,
+        invoice_id: UUID,
+        po_document_id: UUID,
+        score: Decimal,
+        reason: str,
+        ai_call_id: UUID,
+    ) -> bool:
+        """Insert one ``suggested`` AI header link, or nothing when it is no longer safe.
+
+        Never supersedes a live link, never re-suggests a PO a person rejected, and
+        never marks scopes dirty: a pending AI suggestion feeds no balance or verdict.
+        The caller holds the invoice's ``link_resolution`` row lock.
+        """
+
+        pointer = metadata.tables["link_current"]
+        link = metadata.tables["link"]
+        document = metadata.tables["document"]
+        vendor = metadata.tables["vendor"]
+        if connection.scalar(sa.select(sa.exists().where(link.c.ai_call_id == ai_call_id))):
+            return False
+        current = list(
+            connection.execute(
+                sa.select(*link.c)
+                .select_from(
+                    pointer.join(
+                        link,
+                        sa.and_(
+                            pointer.c.workspace_id == link.c.workspace_id,
+                            pointer.c.current_link_id == link.c.id,
+                        ),
+                    )
+                )
+                .where(
+                    pointer.c.workspace_id == workspace_id,
+                    pointer.c.link_type == LinkType.INV_PO.value,
+                    pointer.c.from_document_id == invoice_id,
+                )
+                .with_for_update(of=link)
+            ).mappings()
+        )
+        if any(row["state"] != LinkState.REJECTED.value for row in current):
+            return False
+        if any(
+            row["to_document_id"] == po_document_id and row["method"] == LinkMethod.MANUAL.value
+            for row in current
+        ):
+            return False
+        vendors = {
+            row.id: (row.doc_type, row.effective_vendor_id)
+            for row in connection.execute(
+                sa.select(
+                    document.c.id,
+                    document.c.doc_type,
+                    sa.func.coalesce(vendor.c.merged_into, document.c.vendor_id).label(
+                        "effective_vendor_id"
+                    ),
+                )
+                .select_from(
+                    document.outerjoin(
+                        vendor,
+                        sa.and_(
+                            vendor.c.workspace_id == document.c.workspace_id,
+                            vendor.c.id == document.c.vendor_id,
+                        ),
+                    )
+                )
+                .where(
+                    document.c.workspace_id == workspace_id,
+                    document.c.id.in_((invoice_id, po_document_id)),
+                    document.c.withdrawn_at.is_(None),
+                )
+            )
+        }
+        invoice_row, po_row = vendors.get(invoice_id), vendors.get(po_document_id)
+        if (
+            invoice_row is None
+            or po_row is None
+            or invoice_row[0] != DocType.INVOICE.value
+            or po_row[0] != DocType.PO.value
+            or invoice_row[1] is None
+            or invoice_row[1] != po_row[1]
+        ):
+            return False
+        old = next(
+            (
+                row
+                for row in current
+                if row["to_document_id"] == po_document_id and row["from_line_no"] is None
+            ),
+            None,
+        )
+        self._append_link(
+            connection,
+            workspace_id=workspace_id,
+            proposal=ProposedLink(
+                from_document_id=invoice_id,
+                to_document_id=po_document_id,
+                link_type=LinkType.INV_PO,
+                level=LinkLevel.HEADER,
+                method=LinkMethod.CONTENT,
+                confidence=min(score, Decimal("0.90")),
+                state=LinkState.SUGGESTED,
+                evidence=(
+                    "AI choice among the top content candidates; operator confirmation required."
+                ),
+            ),
+            old=old,
+            detail_code="ai_rerank",
+            ai_suggested=True,
+            ai_call_id=ai_call_id,
+            evidence={"hook": "h3_rerank", "reason": reason, "content_score": format(score, "f")},
+        )
+        return True
+
     @requires("links.edit")
     def edit_link(
         self,
@@ -1429,6 +1971,11 @@ class MappingService:
         pointer = metadata.tables["link_current"]
         link = metadata.tables["link"]
         document = metadata.tables["document"]
+        vendor = metadata.tables["vendor"]
+        source_document = document.alias("edit_source_document")
+        source_vendor = vendor.alias("edit_source_vendor")
+        old_target_document = document.alias("edit_old_target_document")
+        old_target_vendor = vendor.alias("edit_old_target_vendor")
         with self.engine.begin() as connection:
             current = (
                 connection.execute(
@@ -1457,13 +2004,45 @@ class MappingService:
             source_id = cast(UUID, current["from_document_id"])
             old_target_id = cast(UUID, current["to_document_id"])
             source_row = connection.execute(
-                sa.select(document.c.doc_type, document.c.vendor_id).where(
-                    document.c.workspace_id == actor.workspace_id, document.c.id == source_id
+                sa.select(
+                    source_document.c.doc_type,
+                    sa.func.coalesce(
+                        source_vendor.c.merged_into, source_document.c.vendor_id
+                    ).label("effective_vendor_id"),
+                )
+                .select_from(
+                    source_document.outerjoin(
+                        source_vendor,
+                        sa.and_(
+                            source_vendor.c.workspace_id == source_document.c.workspace_id,
+                            source_vendor.c.id == source_document.c.vendor_id,
+                        ),
+                    )
+                )
+                .where(
+                    source_document.c.workspace_id == actor.workspace_id,
+                    source_document.c.id == source_id,
                 )
             ).one_or_none()
             old_target = connection.execute(
-                sa.select(document.c.doc_type, document.c.vendor_id).where(
-                    document.c.workspace_id == actor.workspace_id, document.c.id == old_target_id
+                sa.select(
+                    old_target_document.c.doc_type,
+                    sa.func.coalesce(
+                        old_target_vendor.c.merged_into, old_target_document.c.vendor_id
+                    ).label("effective_vendor_id"),
+                )
+                .select_from(
+                    old_target_document.outerjoin(
+                        old_target_vendor,
+                        sa.and_(
+                            old_target_vendor.c.workspace_id == old_target_document.c.workspace_id,
+                            old_target_vendor.c.id == old_target_document.c.vendor_id,
+                        ),
+                    )
+                )
+                .where(
+                    old_target_document.c.workspace_id == actor.workspace_id,
+                    old_target_document.c.id == old_target_id,
                 )
             ).one_or_none()
             if source_row is None or old_target is None:
@@ -1472,10 +2051,41 @@ class MappingService:
                 raise ValueError("only invoice or GRN links can be edited")
             if old_target.doc_type != DocType.PO.value:
                 raise ValueError("the current link target is not a purchase order")
+            if action == "confirm" and (
+                source_row.effective_vendor_id is None
+                or old_target.effective_vendor_id is None
+                or source_row.effective_vendor_id != old_target.effective_vendor_id
+            ):
+                raise ValueError(
+                    "a link cannot be confirmed until source and PO have the same resolved vendor"
+                )
 
             affected_ids = {source_id, old_target_id}
             audit_action: str
-            if action == "confirm":
+            if action == "confirm" and bool(current["ai_suggested"]):
+                # An accepted AI suggestion becomes the operator's own selection: the
+                # same manual header link the resolver re-proposes on every later run.
+                proposal = ProposedLink(
+                    from_document_id=source_id,
+                    to_document_id=old_target_id,
+                    link_type=LinkType(str(current["link_type"])),
+                    level=LinkLevel.HEADER,
+                    method=LinkMethod.MANUAL,
+                    confidence=Decimal("1.00"),
+                    state=LinkState.CONFIRMED,
+                    evidence=MANUAL_SELECTION_EVIDENCE,
+                )
+                created_id = self._append_link(
+                    connection,
+                    workspace_id=actor.workspace_id,
+                    proposal=proposal,
+                    old=current,
+                    detail_code=cast(str | None, current["detail_code"]),
+                    actor_id=actor.actor_id,
+                    ai_suggested=True,
+                )
+                audit_action = "link.confirm"
+            elif action == "confirm":
                 proposal = ProposedLink(
                     from_document_id=source_id,
                     to_document_id=old_target_id,
@@ -1521,22 +2131,38 @@ class MappingService:
                 if to_document_id is None:
                     raise ValueError("a replacement purchase order is required")
                 target_row = connection.execute(
-                    sa.select(document.c.doc_type, document.c.vendor_id)
+                    sa.select(
+                        document.c.doc_type,
+                        sa.func.coalesce(vendor.c.merged_into, document.c.vendor_id).label(
+                            "effective_vendor_id"
+                        ),
+                    )
+                    .select_from(
+                        document.outerjoin(
+                            vendor,
+                            sa.and_(
+                                vendor.c.workspace_id == document.c.workspace_id,
+                                vendor.c.id == document.c.vendor_id,
+                            ),
+                        )
+                    )
                     .where(
                         document.c.workspace_id == actor.workspace_id,
                         document.c.id == to_document_id,
                         document.c.withdrawn_at.is_(None),
                     )
-                    .with_for_update()
+                    .with_for_update(of=document)
                 ).one_or_none()
                 if target_row is None or target_row.doc_type != DocType.PO.value:
                     raise ValueError("the replacement target must be a current workspace PO")
                 if (
-                    source_row.vendor_id is not None
-                    and target_row.vendor_id is not None
-                    and source_row.vendor_id != target_row.vendor_id
+                    source_row.effective_vendor_id is None
+                    or target_row.effective_vendor_id is None
+                    or source_row.effective_vendor_id != target_row.effective_vendor_id
                 ):
-                    raise ValueError("a link cannot cross vendor identities")
+                    raise ValueError(
+                        "a link can only point to a PO in the same resolved vendor group"
+                    )
                 rejected_old = ProposedLink(
                     from_document_id=source_id,
                     to_document_id=old_target_id,
@@ -1892,44 +2518,7 @@ class MappingService:
             )
             .where(active.c.workspace_id == workspace_id)
         )
-        engine = body.get("engine", {}) if isinstance(body, Mapping) else {}
-        if not isinstance(engine, Mapping):
-            engine = {}
-        thresholds = engine.get("thresholds", {})
-        thresholds = thresholds if isinstance(thresholds, Mapping) else {}
-        ladder = engine.get("ladder_confidence", {})
-        ladder = ladder if isinstance(ladder, Mapping) else {}
-        policies = engine.get("policies", {})
-        policies = policies if isinstance(policies, Mapping) else {}
-        reverse = policies.get("reverse_lookup", {})
-        reverse = reverse if isinstance(reverse, Mapping) else {}
-        weights = engine.get("weights", {})
-        weights = weights if isinstance(weights, Mapping) else {}
-        align_weights = weights.get("align", {})
-        align_weights = align_weights if isinstance(align_weights, Mapping) else {}
-        alignment = AlignmentConfig(
-            weights=AlignmentWeights(
-                desc=_decimal(align_weights.get("desc"), "0.55"),
-                code=_decimal(align_weights.get("code"), "0.20"),
-                hsn=_decimal(align_weights.get("hsn"), "0.15"),
-                uom=_decimal(align_weights.get("uom"), "0.10"),
-            ),
-            item_aligned=_decimal(thresholds.get("item_aligned"), "0.80"),
-            item_review=_decimal(thresholds.get("item_review"), "0.60"),
-            item_single_line_explicit=_decimal(thresholds.get("item_single_line_explicit"), "0.50"),
-            spec_conflict_cap=_decimal(thresholds.get("spec_conflict_cap"), "0.60"),
-        )
-        return MappingConfig(
-            link_auto_accept=_decimal(thresholds.get("link_auto_accept"), "0.95"),
-            confidence_labeled=_decimal(ladder.get("labeled"), "0.99"),
-            confidence_reverse=_decimal(ladder.get("reverse"), "0.97"),
-            confidence_via_grn=_decimal(ladder.get("via_grn"), "0.95"),
-            confidence_manual=_decimal(ladder.get("manual"), "1.00"),
-            reverse_lookup_window_runs=int(reverse.get("window_runs", 6)),
-            step3_min_score=_decimal(thresholds.get("step3_min_score"), "0.80"),
-            step3_min_lead=_decimal(thresholds.get("step3_min_lead"), "0.15"),
-            alignment=alignment,
-        )
+        return mapping_config_from_body(body)
 
     @staticmethod
     def _current_links(
@@ -2101,6 +2690,9 @@ class MappingService:
         old: RowMapping | None,
         detail_code: str | None,
         actor_id: UUID | None = None,
+        ai_suggested: bool = False,
+        ai_call_id: UUID | None = None,
+        evidence: Mapping[str, Any] | None = None,
     ) -> UUID:
         link = metadata.tables["link"]
         pointer = metadata.tables["link_current"]
@@ -2120,9 +2712,12 @@ class MappingService:
                 method=proposal.method.value,
                 confidence=proposal.confidence,
                 state=proposal.state.value,
-                ai_suggested=False,
+                ai_suggested=ai_suggested,
+                ai_call_id=ai_call_id,
                 evidence_snippet=proposal.evidence,
-                evidence={"via_document_id": str(proposal.via_document_id)}
+                evidence=dict(evidence)
+                if evidence is not None
+                else {"via_document_id": str(proposal.via_document_id)}
                 if proposal.via_document_id
                 else {},
                 detail_code=detail_code,

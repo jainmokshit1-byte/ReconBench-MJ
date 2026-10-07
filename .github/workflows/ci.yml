@@ -276,7 +276,7 @@ jobs:
         run: uv sync --project backend --all-groups --locked
 
       - name: Build the previous schema
-        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0015
+        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0017
 
       - name: Test the migration on a copy of the previous schema
         run: uv run --project backend python scripts/check_migration_safety.py
@@ -308,12 +308,29 @@ jobs:
           backend/tests/integration/test_phase2_database.py
           backend/tests/integration/test_phase2_readyz.py
           backend/tests/integration/test_configuration.py
-          backend/tests/integration/test_ingestion.py -q
+          backend/tests/integration/test_ingestion.py
+          backend/tests/integration/test_ai_assist_migration.py
+          backend/tests/integration/test_ai_runner.py -q
 
       - name: Run Phase 4 database acceptance checks
         run: >-
           uv run --project backend pytest
           backend/tests/integration/test_phase4_task_411_413.py -q
+
+      - name: Run AI settings API checks on a single-workspace clone
+        run: >-
+          uv run --project backend pytest
+          backend/tests/integration/test_ai_settings_api.py -q
+
+      - name: Run AI Assist hook and Home KPI checks
+        run: >-
+          uv run --project backend pytest
+          backend/tests/integration/test_ai_h1.py
+          backend/tests/integration/test_ai_h2.py
+          backend/tests/integration/test_ai_h3.py
+          backend/tests/integration/test_ai_h4.py
+          backend/tests/integration/test_ai_vision.py
+          backend/tests/integration/test_kpi_summary.py -q
 
       - name: Count ReconBench and queue tables
         run: uv run --project backend python scripts/check_phase2_table_count.py

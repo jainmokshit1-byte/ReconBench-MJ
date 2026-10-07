@@ -62,6 +62,20 @@ class VendorAliasBody(BaseModel):
     alias: str = Field(min_length=1, max_length=300)
 
 
+class VendorCreateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=300)
+    gstin: str | None = Field(default=None, max_length=20)
+    pan: str | None = Field(default=None, max_length=10)
+
+
+class VendorRenameBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=300)
+
+
 class BulkConfirmBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -152,6 +166,57 @@ def get_vendor(vendor_id: UUID, request: Request) -> Response:
     if row is None:
         return _error(request, status=404, detail="The vendor was not found.", code="not_found")
     return DecimalJSONResponse(content=to_jsonable(row))
+
+
+@router.post("/vendors", tags=["Mapping"], status_code=201)
+@requires("links.edit")
+def post_vendor(body: VendorCreateBody, request: Request) -> Response:
+    """Create a vendor by hand, e.g. an unregistered supplier without a GSTIN (AC-4)."""
+
+    try:
+        result = _service(request).create_vendor(
+            _actor(request), name=body.name, gstin=body.gstin, pan=body.pan
+        )
+    except ValueError as exc:
+        return _error(request, status=422, detail=str(exc), code="invalid_vendor")
+    return DecimalJSONResponse(
+        status_code=201,
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["version"]))},
+    )
+
+
+@router.patch("/vendors/{vendor_id}", tags=["Mapping"])
+@requires("links.edit")
+def patch_vendor(
+    vendor_id: UUID,
+    body: VendorRenameBody,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> Response:
+    """Set the vendor's display name; automatic resolution never replaces it."""
+
+    expected = require_if_match(if_match)
+    try:
+        result = _service(request).rename_vendor(
+            _actor(request), vendor_id, name=body.name, expected_version=expected
+        )
+    except VersionConflict as exc:
+        return problem_response(
+            status=409,
+            title="Resource changed",
+            detail="The vendor changed. Reload it before renaming.",
+            instance=request.url.path,
+            code="version_conflict",
+            extensions={"current": to_jsonable(exc.current)},
+        )
+    except ValueError as exc:
+        return _error(request, status=422, detail=str(exc), code="invalid_vendor_name")
+    if result is None:
+        return _error(request, status=404, detail="The vendor was not found.", code="not_found")
+    return DecimalJSONResponse(
+        content=to_jsonable(result), headers={"ETag": etag_for_version(int(result["version"]))}
+    )
 
 
 @router.get("/links", tags=["Mapping"])

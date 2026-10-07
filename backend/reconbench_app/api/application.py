@@ -19,6 +19,9 @@ from reconbench_core.schema import CaseResult, LineResult
 from sqlalchemy import create_engine, text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from reconbench_app.ai.gate import DeploymentGate
+from reconbench_app.ai.limits import load_limits
+from reconbench_app.ai.settings_service import AiServiceConfig, AiSettingsService
 from reconbench_app.api.ai import router as ai_router
 from reconbench_app.api.auth import AuthSessionMiddleware
 from reconbench_app.api.auth import router as auth_router
@@ -34,6 +37,7 @@ from reconbench_app.authentication import AuthService
 from reconbench_app.authorization import public_endpoint, requires
 from reconbench_app.configuration import ConfigurationService
 from reconbench_app.db.repository import VersionConflict
+from reconbench_app.extraction.einvoice_keys import einvoice_keys
 from reconbench_app.idempotency import IdempotencyInProgress, IdempotencyKeyConflict
 from reconbench_app.ingestion import IngestionService
 from reconbench_app.jobs import make_s3_client, register_ingestion_tasks
@@ -102,6 +106,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file_storage,
         job_queue,
         ocr_languages=tuple(resolved_settings.pdf_ocr_languages.split("+")),
+        einvoice_keys=einvoice_keys(resolved_settings.einvoice_public_key_file),
+        ai_limits=lambda: load_limits(resolved_settings.ai_limits_file),
     )
     app.state.mapping_service = MappingService(engine, job_queue)
     app.state.reconciliation_service = ReconciliationService(
@@ -110,6 +116,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.job_queue_app = queue_app
     app.state.job_queue = job_queue
+    app.state.ai_settings_service = AiSettingsService(
+        engine,
+        AiServiceConfig(
+            gate=DeploymentGate.from_values(
+                resolved_settings.ai_external_calls,
+                resolved_settings.ai_external_calls_approval_ref,
+            ),
+            public_key_file=resolved_settings.ai_seal_public_key_file,
+            limits_file=resolved_settings.ai_limits_file,
+            price_file=resolved_settings.ai_price_file,
+            vision_reader=resolved_settings.vision_reader,
+        ),
+        job_queue,
+    )
 
     @app.exception_handler(StarletteHTTPException)
     async def problem_details(request: Request, exc: StarletteHTTPException) -> DecimalJSONResponse:

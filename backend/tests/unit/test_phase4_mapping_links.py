@@ -188,6 +188,32 @@ def test_scn_09_po_number_only_on_grn_links_invoice_via_grn() -> None:
     assert invoice_result.links[0].state is LinkState.AUTO
 
 
+def test_invoice_cannot_inherit_another_vendors_po_through_a_referenced_grn() -> None:
+    other_vendor = _id(200)
+    invoice = _source(
+        12,
+        _document(_invoice_xml("INV-12", grn_ref="GRN-CROSS-VENDOR"), DocType.INVOICE),
+    )
+    other_vendor_grn = _source(
+        13,
+        _document(_grn_xml("GRN-CROSS-VENDOR", "PO-OTHER"), DocType.GRN),
+    ).model_copy(update={"vendor_id": other_vendor})
+    other_vendor_po = _po(
+        14,
+        _document(_po_xml("PO-OTHER"), DocType.PO),
+        vendor_id=other_vendor,
+    )
+
+    invoice_result = next(
+        result
+        for result in resolve_links((invoice, other_vendor_grn), (other_vendor_po,))
+        if result.document_id == invoice.document_id
+    )
+
+    assert not invoice_result.links
+    assert invoice_result.reason_code is ReasonCode.VENDOR_MISMATCH
+
+
 def test_grn_without_reference_uses_the_content_resolution_path() -> None:
     grn = _source(
         11,
@@ -403,8 +429,8 @@ def test_po_reference_resolution_handles_unanchored_prefix_tail_and_ambiguity() 
     invoice = _source(64, _document(_invoice_xml("INV-10"), DocType.INVOICE))
     no_vendor = invoice.model_copy(update={"vendor_id": None})
 
-    assert links_module._po_matches("PO-AB12345", (po,), None) == ((po,), False)
-    assert links_module._po_matches("PO-AB12345", (po, duplicate_no), None) == ((), False)
+    assert links_module._po_matches("PO-AB12345", (po,), None) == ((), True)
+    assert links_module._po_matches("PO-AB12345", (po, duplicate_no), None) == ((), True)
     assert links_module._po_matches("MISSING-100", (po,), None) == ((), False)
     assert links_module._po_matches("ORDER-AB12345", (po,), _VENDOR) == ((po,), False)
     assert links_module._po_matches("PUR-AB12345", (po, prefix_variant), _VENDOR) == ((), False)
@@ -415,6 +441,15 @@ def test_po_reference_resolution_handles_unanchored_prefix_tail_and_ambiguity() 
     assert links_module._po_matches("PO-1234", (po,), _VENDOR) == ((), False)
     assert links_module._unique_header_po_refs(invoice.document) == ()
     assert no_vendor.vendor_id is None
+
+    unassigned_with_reference = _source(
+        65,
+        _document(_invoice_xml("INV-65", po_ref="PO-AB12345"), DocType.INVOICE),
+    ).model_copy(update={"vendor_id": None})
+    resolution = resolve_links((unassigned_with_reference,), (po,))
+    assert len(resolution) == 1
+    assert not resolution[0].links
+    assert resolution[0].reason_code is ReasonCode.VENDOR_MISMATCH
 
 
 def test_mapping_source_text_prefers_supplied_text_then_raw_then_canonical_fields() -> None:
@@ -448,11 +483,20 @@ def test_reverse_and_manual_resolution_reject_cross_vendor_targets() -> None:
         _document(_invoice_xml("INV-82"), DocType.INVOICE),
         manual_po_ids=(po.document_id, _id(999)),
     )
+    unassigned_manual = _source(
+        83,
+        _document(_invoice_xml("INV-83"), DocType.INVOICE),
+        manual_po_ids=(po.document_id,),
+    ).model_copy(update={"vendor_id": None})
 
-    reverse_result, manual_result = resolve_links((narration, manual), (po,))
+    reverse_result, manual_result, unassigned_result = resolve_links(
+        (narration, manual, unassigned_manual), (po,)
+    )
 
     assert reverse_result.reason_code is ReasonCode.VENDOR_MISMATCH
     assert manual_result.reason_code is ReasonCode.VENDOR_MISMATCH
+    assert unassigned_result.reason_code is ReasonCode.VENDOR_MISMATCH
+    assert not unassigned_result.links
     assert not reverse_result.links
     assert not manual_result.links
 
@@ -485,6 +529,14 @@ def test_invoice_and_grn_can_match_by_supplier_invoice_number_or_challan() -> No
     assert links_module._grn_matches_invoice(invoice, by_supplier_invoice)
     assert links_module._grn_matches_invoice(by_challan_invoice, by_challan_grn)
     assert not links_module._grn_matches_invoice(by_challan_invoice, invoice)
+    assert not links_module._grn_matches_invoice(
+        invoice,
+        by_supplier_invoice.model_copy(update={"vendor_id": _id(999)}),
+    )
+    assert not links_module._grn_matches_invoice(
+        invoice,
+        by_supplier_invoice.model_copy(update={"vendor_id": None}),
+    )
 
 
 def test_content_score_handles_zero_value_and_missing_optional_signals() -> None:
@@ -558,3 +610,37 @@ def test_reservation_skips_missing_purchase_order_and_non_invoice_sources() -> N
 
     assert remaining_qty[po.document_id] == {1: Decimal("10")}
     assert remaining_balance[po.document_id] == Decimal("100")
+
+
+def _split(document: Document, state: str = "unconfirmed") -> Document:
+    marker = {"pages": [1], "group": 1, "groups": 2, "state": state}
+    header = document.header.model_copy(
+        update={"extras": {**document.header.extras, "page_split": marker}}
+    )
+    return document.model_copy(update={"header": header})
+
+
+def test_unconfirmed_page_split_keeps_every_link_a_suggestion() -> None:
+    invoice_doc = _document(_invoice_xml("INV-10", po_ref="PO-100"), DocType.INVOICE)
+    po_doc = _document(_po_xml("PO-100"), DocType.PO)
+
+    split_source = resolve_links([_source(10, _split(invoice_doc))], [_po(20, po_doc)])[0]
+    split_target = resolve_links([_source(10, invoice_doc)], [_po(20, _split(po_doc))])[0]
+    accepted = resolve_links([_source(10, _split(invoice_doc, "confirmed"))], [_po(20, po_doc)])[0]
+
+    assert split_source.links[0].state is LinkState.SUGGESTED
+    assert "file split not confirmed" in split_source.links[0].evidence
+    assert split_target.links[0].state is LinkState.SUGGESTED
+    assert accepted.links[0].state is LinkState.AUTO
+
+
+def test_unconfirmed_split_grn_keeps_the_via_grn_link_a_suggestion() -> None:
+    grn = _source(30, _split(_document(_grn_xml("GRN-1", "PO-100"), DocType.GRN)))
+    invoice = _source(10, _document(_invoice_xml("INV-10", grn_ref="GRN-1"), DocType.INVOICE))
+    po = _po(20, _document(_po_xml("PO-100"), DocType.PO))
+
+    results = {item.document_id: item for item in resolve_links([grn, invoice], [po])}
+
+    assert results[_id(30)].links[0].state is LinkState.SUGGESTED
+    assert results[_id(10)].links
+    assert all(link.state is LinkState.SUGGESTED for link in results[_id(10)].links)

@@ -1,0 +1,30 @@
+# Expected reconciliation outcome for month.yaml. Each entry cites the SCN
+# fixture it reproduces through the full stack. SCN fixtures name the headline
+# reason; where the engine also raises other codes the spec requires, they are
+# listed here with the rule that requires them.
+documents:
+  po: 7
+  grn: 9
+  # The rescan of LP/26-27/1011 has the same vendor and number as the register
+  # row, so ingestion stores it as the same invoice: it never becomes a second
+  # payable document (SCN-11: consumes no ledger balance).
+  invoice: 11
+cases:
+- {invoice: SF/26-27/0451, scenario: SCN-01, status: matched, reason_codes: [], po: DM-PO-101, at_risk: '0.00'}
+- {invoice: LP/26-27/2201, scenario: SCN-02, status: matched, reason_codes: [], po: DM-PO-102, at_risk: '0.00'}
+- {invoice: LP/26-27/2260, scenario: SCN-02, status: matched, reason_codes: [], po: DM-PO-102, at_risk: '0.00'}
+# Receipts total 105 against an order of 100: TR-REC-7 flags GRN_OVER_PO.
+- {invoice: BE/1004A, scenario: SCN-04, status: matched_flags, reason_codes: [GRN_OVER_PO], po: DM-PO-104, at_risk: '0.00'}
+# Billing 105 against 100 ordered also exceeds the PO value (TR-REC cumulative value check).
+- {invoice: BE/1004B, scenario: SCN-04, status: exception, reason_codes: [GRN_OVER_PO, PO_VALUE_EXCEEDED, QTY_OVER_GRN, QTY_OVER_PO], po: DM-PO-104, at_risk: '2500.00'}
+- {invoice: SF/26-27/0478, scenario: SCN-06, status: exception, reason_codes: [QTY_OVER_GRN], po: DM-PO-106, at_risk: '2000.00'}
+# Within rate tolerance, so Matched; pay_at_po_rate makes the 0.3% excess not payable (PRD §at-risk).
+- {invoice: VE/1007A, scenario: SCN-07, status: matched, reason_codes: [], po: DM-PO-107, at_risk: '30.00'}
+# Taxable 10200 vs billed qty x PO rate 10000 is beyond tolerance: TOTAL_MISMATCH by definition.
+- {invoice: VE/1007B, scenario: SCN-07, status: exception, reason_codes: [RATE_HIGH, TOTAL_MISMATCH], po: DM-PO-107, at_risk: '200.00'}
+- {invoice: LP/26-27/1011, scenario: SCN-11, status: matched, reason_codes: [], po: DM-PO-111, at_risk: '0.00'}
+# Freight is not on the PO, so it is billed but not payable.
+- {invoice: BE/1016, scenario: SCN-16, status: matched_flags, reason_codes: [EXTRA_CHARGE], po: DM-PO-116, at_risk: '250.00'}
+- {invoice: null, scenario: SCN-19, status: needs_review, reason_codes: [NO_TEXT_LAYER]}
+totals:
+  at_risk: '4980.00'

@@ -208,6 +208,13 @@ def _line_similarity(left: DocLine, right: DocLine, config: AlignmentConfig) -> 
     if total_weight == 0:
         return Decimal("0.0000")
     weighted = sum((weight * score for weight, score in active), Decimal("0")) / total_weight
+    # UOM and HSN are supporting evidence, not enough to identify a product.
+    # A shared unit such as NOS/PCS must never create a confident line match.
+    has_product_identity = components["desc"] is not None or components["code"] is not None
+    if not has_product_identity:
+        if components["hsn"] is None:
+            return Decimal("0.0000")
+        weighted = min(weighted, config.item_aligned - Decimal("0.0001"))
     return weighted.quantize(_FOUR_PLACES, rounding=ROUND_HALF_UP)
 
 

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, ArrowRight, Check, FileInput, GitMerge, ListChecks, RefreshCw, Sparkles } from "lucide-react";
+import { Activity, ArrowRight, Check, CircleCheck, FileInput, GitMerge, ListChecks, RefreshCw } from "lucide-react";
 import { Link } from "react-router";
 
-import { getReconciliationKpis, listRecentReconciliationRuns } from "../api/reconciliation";
-import type { RunSummary } from "../api/reconciliation";
+import { getReconciliationKpis, getWorkflowStatus, listRecentReconciliationRuns } from "../api/reconciliation";
+import type { RunSummary, WorkflowStatus, WorkflowStep, WorkflowStepKey } from "../api/reconciliation";
+import { AiAssistCard } from "../components/AiAssistCard";
 import { PageHeader } from "../components/PageHeader";
 import { usePeriod } from "../contexts/usePeriod";
 
@@ -29,10 +30,62 @@ function statusLabel(status: string): string {
   return status.replaceAll("_", " ");
 }
 
+function plural(count: number | undefined, noun: string): string {
+  const value = count ?? 0;
+  return `${value} ${noun}${value === 1 ? "" : "s"}`;
+}
+
+// What a step still needs; the server decides completion (decision G-12).
+function stepDetail(step: WorkflowStep | undefined): string {
+  if (!step) return "";
+  if (step.complete) return "Done";
+  switch (step.key) {
+    case "ingest":
+      return step.files_in_progress ? `${plural(step.files_in_progress, "file")} still parsing` : "No parsed documents yet";
+    case "map":
+      return step.unassigned_documents || step.suggested_links
+        ? [step.unassigned_documents ? `${step.unassigned_documents} unassigned` : "", step.suggested_links ? plural(step.suggested_links, "suggested link") : ""].filter(Boolean).join(" · ")
+        : "Waiting for documents";
+    case "reconcile":
+      return step.stale_cases ? `${plural(step.stale_cases, "stale case")} — re-run` : "No run for this period";
+    case "export":
+      return "No workbook from the latest run";
+  }
+}
+
+const STEPS: Array<{ key: WorkflowStepKey; label: string; path: string; icon: typeof FileInput }> = [
+  { key: "ingest", label: "Ingest files", path: "/ingestion", icon: FileInput },
+  { key: "map", label: "Confirm mapping", path: "/mapping", icon: GitMerge },
+  { key: "reconcile", label: "Review results", path: "/reconciliation", icon: ListChecks },
+  { key: "export", label: "Export workbook", path: "/reconciliation", icon: Check },
+];
+
+function runPath(runId: string | null): string {
+  return runId ? `/reconciliation?run_id=${encodeURIComponent(runId)}` : "/reconciliation";
+}
+
+function nextAction(workflow: WorkflowStatus | null): { path: string; label: string } {
+  if (!workflow) return { path: "/ingestion", label: "Upload documents" };
+  if (workflow.active_run_id) return { path: runPath(workflow.active_run_id), label: "View run progress" };
+  switch (workflow.next_step) {
+    case "ingest":
+      return { path: "/ingestion", label: workflow.steps[0]?.files_in_progress ? "View parsing progress" : "Upload documents" };
+    case "map":
+      return { path: "/mapping", label: "Review vendor mapping" };
+    case "reconcile":
+      return { path: "/reconciliation", label: "Run reconciliation" };
+    case "export":
+      return { path: runPath(workflow.run_id), label: "Export workbook" };
+    default:
+      return { path: runPath(workflow.run_id), label: "Review results" };
+  }
+}
+
 export function HomePage() {
   const { period } = usePeriod();
   const [kpis, setKpis] = useState<Kpis | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [workflow, setWorkflow] = useState<WorkflowStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const bounds = useMemo(() => periodBounds(period), [period]);
@@ -43,9 +96,11 @@ export function HomePage() {
     void Promise.all([
       getReconciliationKpis(bounds.from, bounds.to),
       listRecentReconciliationRuns(),
-    ]).then(([nextKpis, nextRuns]) => {
+      getWorkflowStatus(bounds.from, bounds.to),
+    ]).then(([nextKpis, nextRuns, nextWorkflow]) => {
       setKpis(nextKpis);
       setRuns(nextRuns.slice(0, 5));
+      setWorkflow(nextWorkflow);
     }).catch((cause: unknown) => {
       setError(cause instanceof Error ? cause.message : "Workspace summary could not be loaded.");
     }).finally(() => setLoading(false));
@@ -56,10 +111,9 @@ export function HomePage() {
     return () => window.clearTimeout(timer);
   }, [refresh]);
 
-  const hasInvoices = Number(kpis?.["invoice_count"] ?? 0) > 0;
-  const activeRun = runs.find((run) => run.status === "queued" || run.status === "running");
-  const nextPath = !hasInvoices ? "/ingestion" : activeRun ? `/reconciliation?run_id=${activeRun.id}` : "/mapping";
-  const nextLabel = !hasInvoices ? "Upload documents" : activeRun ? "View run progress" : "Review vendor mapping";
+  const activeRun = workflow?.active_run_id ?? null;
+  const { path: nextPath, label: nextLabel } = nextAction(workflow);
+  const stepsByKey = new Map((workflow?.steps ?? []).map((step) => [step.key, step]));
   const cards: Array<[string, unknown]> = [
     ["Invoices", kpis?.["invoice_count"]],
     ["Matched %", kpis?.["matched_pct"] === null || kpis?.["matched_pct"] === undefined ? null : `${kpis["matched_pct"]}%`],
@@ -83,23 +137,18 @@ export function HomePage() {
 
       <section className="home-grid" aria-label="Workspace setup">
         <div className="panel tracker-panel">
-          <div className="panel-heading"><div><div className="panel-kicker">YOUR WORKFLOW</div><h2>Four steps to a clear close</h2></div><span className="quiet-badge">{activeRun ? "Reconciliation running" : "Ready when you are"}</span></div>
-          <div className="workflow-steps">
-            {[
-              { label: "Ingest files", path: "/ingestion", icon: FileInput },
-              { label: "Confirm mapping", path: "/mapping", icon: GitMerge },
-              { label: "Review results", path: "/reconciliation", icon: ListChecks },
-              { label: "Export workbook", path: "/reconciliation", icon: Check },
-            ].map(({ label, path, icon: Icon }, index) => <Link className="workflow-step" key={label} to={path}><span className="step-number">{String(index + 1).padStart(2, "0")}</span><span className="step-icon"><Icon size={18} aria-hidden="true" /></span><span className="step-label">{label}</span>{index < 3 ? <span className="step-connector" aria-hidden="true" /> : null}</Link>)}
-          </div>
+          <div className="panel-heading"><div><div className="panel-kicker">YOUR WORKFLOW</div><h2>Four steps to a clear close</h2></div><span className="quiet-badge">{activeRun ? "Reconciliation running" : workflow?.next_step === null ? "All steps complete" : "Ready when you are"}</span></div>
+          <ol className="workflow-steps" aria-label="Workflow progress">
+            {STEPS.map(({ key, label, path, icon: Icon }, index) => {
+              const step = stepsByKey.get(key);
+              const state = step?.complete ? "complete" : workflow?.next_step === key ? "current" : "upcoming";
+              const to = key === "export" || key === "reconcile" ? runPath(workflow?.run_id ?? null) : path;
+              return <li className="workflow-step-item" key={key}><Link className={`workflow-step ${state}`} to={to} aria-current={state === "current" ? "step" : undefined}><span className="step-number">{String(index + 1).padStart(2, "0")}</span><span className="step-icon">{state === "complete" ? <CircleCheck size={18} aria-hidden="true" /> : <Icon size={18} aria-hidden="true" />}</span><span className="step-label">{label}</span><span className="step-detail" data-testid={`step-${key}-detail`}>{loading && !workflow ? "…" : stepDetail(step)}</span>{index < 3 ? <span className="step-connector" aria-hidden="true" /> : null}</Link></li>;
+            })}
+          </ol>
           <div className="panel-footnote">Invoice is the reconciliation case anchor. PO and GRN records provide evidence and cumulative quantity balances.</div>
         </div>
-        <div className="panel assist-panel">
-          <div className="assist-mark"><Sparkles size={17} aria-hidden="true" /></div><div className="panel-kicker">OPTIONAL ASSIST</div><h2>AI Assist</h2>
-          <p>Rules-only mode stays active by default. Provider selection and credentials remain unavailable until a provider and data-sharing policy are approved.</p>
-          <Link className="text-button" to="/settings">Review settings <ArrowRight size={15} /></Link>
-          <div className="assist-state"><span className="state-dot" /> Rules only</div>
-        </div>
+        <AiAssistCard />
       </section>
 
       <section className="home-lower-grid">

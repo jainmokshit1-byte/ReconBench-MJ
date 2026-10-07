@@ -60,6 +60,18 @@ def test_tally_xml_parse_extracts_fields_lines_extras_and_locator() -> None:
     assert not document.needs_verification
 
 
+def test_tally_xml_parser_accepts_utf16_with_bom() -> None:
+    result = parse(
+        f"<ENVELOPE><BODY>{_invoice_xml('INV-UTF16')}</BODY></ENVELOPE>".encode("utf-16"),
+        {"file_format": "xml", "doc_type": "invoice"},
+    )
+
+    assert result.success
+    assert len(result.documents) == 1
+    assert result.documents[0].header.doc_no is not None
+    assert result.documents[0].header.doc_no.value == "INV-UTF16"
+
+
 def test_flat_dbc_xml_groups_vouchers_and_keeps_missing_matching_evidence_in_review() -> None:
     source = b"""<ENVELOPE>
       <DBCFIXED><DBCDATE>01.08.2026</DBCDATE><DBCPARTY>Vendor One</DBCPARTY></DBCFIXED>
@@ -97,13 +109,12 @@ def test_flat_dbc_xml_groups_vouchers_and_keeps_missing_matching_evidence_in_rev
     assert first.lines[0].uom is not None and first.lines[0].uom.value == "NOS"
     assert first.lines[0].extras["dbc_quantity_raw"] == "1.00 PCS"
     assert first.lines[0].description is None
-    assert first.lines[0].amount is None
+    assert first.lines[0].amount is not None
+    assert first.lines[0].amount.value == Decimal("10.00")
     assert first.lines[0].extras["dbc_accounting_amount_raw"] == "-10.00"
+    assert first.lines[0].extras["dbc_amount_reconciles_to_quantity_times_rate"] is True
     assert first.header.extras["dbc_line_descriptions_present"] is False
-    assert (
-        first.header.extras["dbc_source_fields_raw"][0]["fields"]["DBCCUSTOMINFO"]
-        == ["opaque"]
-    )
+    assert first.header.extras["dbc_source_fields_raw"][0]["fields"]["DBCCUSTOMINFO"] == ["opaque"]
     assert first.needs_verification
     assert "ITEM_UNSURE" in {reason.value for reason in first.reason_codes}
     assert second.header.doc_no is not None and second.header.doc_no.value == "PO-202"
@@ -111,6 +122,29 @@ def test_flat_dbc_xml_groups_vouchers_and_keeps_missing_matching_evidence_in_rev
     assert second.header.vendor_name.value == "Vendor Two"
     assert any(warning.code == "DBC_LINE_DESCRIPTION_MISSING" for warning in result.warnings)
     assert any(warning.code == "DBC_PO_REFERENCE_MISSING" for warning in result.warnings)
+
+
+def test_flat_dbc_xml_uses_inventory_row_party_as_item_description() -> None:
+    source = b"""<ENVELOPE>
+      <DBCFIXED><DBCDATE>03-Apr-26</DBCDATE><DBCPARTY>Supplier One</DBCPARTY></DBCFIXED>
+      <DBCBUYERNAME>Buyer One</DBCBUYERNAME><DBCVCHNO>PO-101</DBCVCHNO>
+      <DBCGSTIN>27ABCDE1234F1Z5</DBCGSTIN><DBCGROSSAMT>1180</DBCGROSSAMT>
+      <DBCFIXED><DBCDATE/><DBCPARTY>500 GB SSD WD Blue</DBCPARTY></DBCFIXED>
+      <DBCVCHNO/><DBCQTY>1 PCS</DBCQTY><DBCRATE>1000/PCS</DBCRATE>
+      <DBCAMOUNT>-1000</DBCAMOUNT><DBCGROSSAMT/>
+    </ENVELOPE>"""
+
+    result = parse(source, {"file_format": "xml", "doc_type": "po"})
+
+    assert result.success
+    assert len(result.documents) == 1
+    document = result.documents[0]
+    assert document.lines[0].description is not None
+    assert document.lines[0].description.value == "500 GB SSD WD Blue"
+    assert document.lines[0].amount is not None
+    assert document.lines[0].amount.value == Decimal("1000")
+    assert document.header.extras["dbc_line_descriptions_present"] is True
+    assert not any(warning.code == "DBC_LINE_DESCRIPTION_MISSING" for warning in result.warnings)
 
 
 def test_flat_dbc_xml_requires_upload_zone_and_never_infers_invoice_po_link() -> None:
@@ -641,3 +675,23 @@ def test_arbitrary_xml_and_csv_bytes_never_escape_parser_boundary(content: bytes
 
     assert isinstance(result, ParseResult)
     assert result.file_format in {FileFormat.XML, FileFormat.CSV}
+
+
+def test_csv_type_comes_from_the_documents_own_number_not_its_po_reference() -> None:
+    grn = (
+        b"GRN No,GRN Date,Purchase Order,Vendor GSTIN,Description,Received Qty,Accepted Qty\n"
+        b"GRN-1,04/09/2026,PO-1,27AAACS1234A1Z2,Hex Bolt,10,10\n"
+    )
+    invoice = (
+        b"Invoice No,Invoice Date,Purchase Order,Vendor GSTIN,Description,Quantity,Rate,Amount\n"
+        b"INV-1,05/09/2026,PO-1,27AAACS1234A1Z2,Hex Bolt,10,100,1000\n"
+    )
+    po = (
+        b"PO No,Order Date,Vendor GSTIN,Description,Quantity,Rate,Amount\n"
+        b"PO-1,01/09/2026,27AAACS1234A1Z2,Hex Bolt,10,100,1000\n"
+    )
+
+    for content, expected in ((grn, "grn"), (invoice, "invoice"), (po, "po")):
+        result = parse(content, {"file_format": "csv"})
+        assert result.success, result.reason_code
+        assert {str(document.header.doc_type) for document in result.documents} == {expected}

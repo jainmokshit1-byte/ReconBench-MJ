@@ -38,6 +38,44 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  setup:
+    # One-shot step that runs before the app on every `docker compose up`:
+    # creates the AI keys if missing (never overwrites), migrates the database
+    # to head, and applies the pinned queue schema once.
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cd /app
+        mkdir -p /secrets/api /secrets/worker
+        if [ ! -f /secrets/worker/ai_keyring.json ] && [ -f /secrets/ai_keyring.json ]; then
+          cp /secrets/ai_keyring.json /secrets/ai_seal_public.json /secrets/worker/
+          echo "setup: copied existing AI keys to deploy/secrets/worker"
+        fi
+        if [ ! -f /secrets/worker/ai_keyring.json ]; then
+          /app/backend/.venv/bin/python -m reconbench_app.ai.worker.keytool generate --dir /secrets/worker
+          echo "setup: generated AI keys"
+        fi
+        cp /secrets/worker/ai_seal_public.json /secrets/api/ai_seal_public.json
+        /app/backend/.venv/bin/alembic -c backend/alembic.ini upgrade head
+        if [ "$$(/app/backend/.venv/bin/python -c "import os, sqlalchemy as sa; print(sa.create_engine(os.environ['RB_DATABASE_URL']).connect().scalar(sa.text(\"select to_regclass('procrastinate_jobs') is not null\")))")" != "True" ]; then
+          /app/backend/.venv/bin/procrastinate --app reconbench_app.db.procrastinate_schema.app schema --apply
+          echo "setup: applied queue schema"
+        fi
+        echo "setup: done"
+    environment:
+      RB_ENV: ${RB_ENV:-local}
+      RB_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Run make up to generate local configuration}:${POSTGRES_PASSWORD:?Run make up to generate local credentials}@postgres:5432/${POSTGRES_DB:-reconbench}
+      RB_MIGRATOR_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Run make up to generate local configuration}:${POSTGRES_PASSWORD:?Run make up to generate local credentials}@postgres:5432/${POSTGRES_DB:-reconbench}
+    volumes:
+      - ./deploy/secrets:/secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build:
       context: .
@@ -50,16 +88,23 @@ services:
       RB_S3_BUCKET: ${RB_S3_BUCKET:-reconbench-local}
       RB_S3_API_ACCESS_KEY: ${MINIO_ROOT_USER:?Run make up to generate local configuration}
       RB_S3_API_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Run make up to generate local credentials}
-      RB_SECRET_MASTER_KEY: ${RB_SECRET_MASTER_KEY:-}
-      RB_SECRET_MASTER_KEY_ID: ${RB_SECRET_MASTER_KEY_ID:-local-dev-only}
+      RB_AI_SEAL_PUBLIC_KEY_FILE: /run/ai-keys/ai_seal_public.json
+      RB_AI_EXTERNAL_CALLS: ${RB_AI_EXTERNAL_CALLS:-disabled}
+      RB_AI_EXTERNAL_CALLS_APPROVAL_REF: ${RB_AI_EXTERNAL_CALLS_APPROVAL_REF:-}
+      RB_VISION_READER: ${RB_VISION_READER:-vision_gemini}
       RB_PUBLIC_BASE_URL: ${RB_PUBLIC_BASE_URL:-http://localhost:5173}
       RB_PDF_OCR_LANGUAGES: ${RB_PDF_OCR_LANGUAGES:-eng}
       RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
       RB_OTEL_EXPORTER_OTLP_ENDPOINT: ${RB_OTEL_EXPORTER_OTLP_ENDPOINT:-}
       RB_SENTRY_DSN: ${RB_SENTRY_DSN:-}
+    volumes:
+      # Public sealing key only; the API never sees the private keyring.
+      - ./deploy/secrets/api:/run/ai-keys:ro
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
+      setup:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       minio:
@@ -89,18 +134,72 @@ services:
       RB_S3_BUCKET: ${RB_S3_BUCKET:-reconbench-local}
       RB_S3_API_ACCESS_KEY: ${MINIO_ROOT_USER:?Run make up to generate local configuration}
       RB_S3_API_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Run make up to generate local credentials}
-      RB_SECRET_MASTER_KEY: ${RB_SECRET_MASTER_KEY:-}
-      RB_SECRET_MASTER_KEY_ID: ${RB_SECRET_MASTER_KEY_ID:-local-dev-only}
       RB_PUBLIC_BASE_URL: ${RB_PUBLIC_BASE_URL:-http://localhost:5173}
       RB_PDF_OCR_LANGUAGES: ${RB_PDF_OCR_LANGUAGES:-eng}
+      # Ingestion, mapping and reconciliation jobs queue the AI hooks, so the
+      # worker must see the same deployment gate as the API and AI worker.
+      RB_AI_EXTERNAL_CALLS: ${RB_AI_EXTERNAL_CALLS:-disabled}
+      RB_AI_EXTERNAL_CALLS_APPROVAL_REF: ${RB_AI_EXTERNAL_CALLS_APPROVAL_REF:-}
+      RB_VISION_READER: ${RB_VISION_READER:-vision_gemini}
       RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
       RB_OTEL_EXPORTER_OTLP_ENDPOINT: ${RB_OTEL_EXPORTER_OTLP_ENDPOINT:-}
       RB_SENTRY_DSN: ${RB_SENTRY_DSN:-}
     depends_on:
+      setup:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       minio:
         condition: service_healthy
+    restart: unless-stopped
+
+  ai-worker:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    command: ["/app/backend/.venv/bin/python", "-m", "reconbench_app.ai.worker.main"]
+    environment:
+      RB_ENV: ${RB_ENV:-local}
+      RB_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Run make up to generate local configuration}:${POSTGRES_PASSWORD:?Run make up to generate local credentials}@postgres:5432/${POSTGRES_DB:-reconbench}
+      RB_AI_KEYRING_FILE: /run/ai-keys/ai_keyring.json
+      RB_AI_EXTERNAL_CALLS: ${RB_AI_EXTERNAL_CALLS:-disabled}
+      RB_AI_EXTERNAL_CALLS_APPROVAL_REF: ${RB_AI_EXTERNAL_CALLS_APPROVAL_REF:-}
+      RB_VISION_READER: ${RB_VISION_READER:-vision_gemini}
+      RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
+    volumes:
+      - ./deploy/secrets/worker:/run/ai-keys:ro
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/web-dev.Dockerfile
+    environment:
+      VITE_API_PROXY_TARGET: http://api:8000
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-5173}:5173"
+    volumes:
+      - ./web:/app
+      - web_node_modules:/app/node_modules
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:5173/').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
     restart: unless-stopped
 
   phase4-test-db:
@@ -129,3 +228,4 @@ volumes:
     name: reconbench_phase1_minio_data
   phase4_test_postgres_data:
     name: reconbench_phase4_test_data
+  web_node_modules:

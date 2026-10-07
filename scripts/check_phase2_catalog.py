@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 metadata = import_module("reconbench_app.db.metadata").metadata
 
-_GLOBAL_TABLES = {"workspace", "worker_control"}
+_GLOBAL_TABLES = {"workspace", "worker_control", "ai_worker_heartbeat"}
 _EXPECTED_DOMAINS = {
     "d_amount": "numeric(18,2)",
     "d_hash": "text",
@@ -30,6 +30,8 @@ _ALLOWED_NATIVE_NUMERIC = {(18, 2), (18, 4), (5, 4), (5, 2)}
 # the validated schema; they are not amount/rate/quantity/score/tax fields.
 _EXPECTED_SPECIAL_NUMERIC = {
     ("ai_call_log", "cost_usd"): (12, 6),
+    ("ai_request", "actual_usd"): (12, 6),
+    ("ai_request", "reserved_usd"): (12, 6),
     ("ai_setting", "budget_cap_usd"): (12, 4),
     ("recon_case", "variance_pct"): (9, 4),
     ("recon_line_result", "rate_var_pct"): (9, 4),
@@ -92,6 +94,7 @@ _UNIQUE_EXCEPTIONS: dict[str, tuple[str, tuple[str, ...], str]] = {
         "parent/line",
     ),
     "run_manifest_run_id_key": ("run_manifest", ("run_id",), "run"),
+    "link_ai_call_uq": ("link", ("ai_call_id",), "AI call"),
     "session_token_uq": ("session", ("token_hash",), "session token"),
 }
 
@@ -312,9 +315,10 @@ def main() -> int:
     print(
         f"Phase 2 catalog check passed: {len(metadata.tables)} ReconBench tables; "
         f"{workspace_owned_count} workspace-owned tables have NOT NULL workspace_id; "
-        "global workspace and worker-control tables are excluded; no float/double columns; "
+        "global workspace, worker-control and AI-worker heartbeat tables are excluded; "
+        "no float/double columns; "
         "text identifiers "
-        "and numeric domains match; four documented schema-specific NUMERIC columns "
+        "and numeric domains match; six documented schema-specific NUMERIC columns "
         "retain their exact precision; "
         f"{tenant_unique_count} tenant-scoped unique indexes are workspace-first; "
         f"{sum(exception_categories.values())} reviewed uniqueness exceptions "

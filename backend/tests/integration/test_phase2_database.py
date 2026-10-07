@@ -508,7 +508,11 @@ def test_repository_constraints_roles_and_audit_chain(
     with phase2_engine.connect() as connection:
         role_names = set(
             connection.scalars(
-                sa.text("SELECT rolname FROM pg_roles WHERE rolname LIKE 'reconbench_%'")
+                sa.text(
+                    "SELECT rolname FROM pg_roles WHERE rolname IN ("
+                    "'reconbench_migrator', 'reconbench_app', 'reconbench_report', "
+                    "'reconbench_retention')"
+                )
             ).all()
         )
         assert role_names == {
@@ -519,7 +523,9 @@ def test_repository_constraints_roles_and_audit_chain(
         }
         assert connection.scalar(
             sa.text(
-                "SELECT bool_and(NOT rolcanlogin) FROM pg_roles WHERE rolname LIKE 'reconbench_%'"
+                "SELECT bool_and(NOT rolcanlogin) FROM pg_roles WHERE rolname IN ("
+                "'reconbench_migrator', 'reconbench_app', 'reconbench_report', "
+                "'reconbench_retention')"
             )
         )
         owned_relations = {
@@ -646,8 +652,9 @@ def test_repository_constraints_roles_and_audit_chain(
                 connection.exec_driver_sql(statement)
             transaction.rollback()
 
-    # Seed concurrent audit rows. The workspace advisory lock must make the
-    # previous hash chain contiguous even when inserts arrive simultaneously.
+    # Seed concurrent audit rows. The workspace advisory lock must keep this
+    # workspace's hash chain ordered even though seq is allocated cluster-wide
+    # and can therefore have gaps when other workspaces write audit events.
     with phase2_engine.connect() as connection:
         previous = (
             connection.execute(
@@ -705,8 +712,8 @@ def test_repository_constraints_roles_and_audit_chain(
     expected_previous = previous_hash
     expected_seq = starting_seq
     for row in audit_rows:
-        expected_seq += 1
-        assert row["seq"] == expected_seq
+        assert row["seq"] > expected_seq
+        expected_seq = row["seq"]
         assert row["prev_hash"] == expected_previous
         when = row["occurred_at"].astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         payload = "|".join(

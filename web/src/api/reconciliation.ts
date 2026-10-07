@@ -206,6 +206,33 @@ export async function getReconciliationKpis(from: string, to: string): Promise<R
   return parseJson(await request(`/kpis?${params.toString()}`));
 }
 
+export type WorkflowStepKey = "ingest" | "map" | "reconcile" | "export";
+
+export interface WorkflowStep {
+  key: WorkflowStepKey;
+  complete: boolean;
+  parsed_documents?: number;
+  files_in_progress?: number;
+  unassigned_documents?: number;
+  suggested_links?: number;
+  current_cases?: number;
+  stale_cases?: number;
+}
+
+export interface WorkflowStatus {
+  from: string;
+  to: string;
+  steps: WorkflowStep[];
+  next_step: WorkflowStepKey | null;
+  run_id: string | null;
+  active_run_id: string | null;
+}
+
+export async function getWorkflowStatus(from: string, to: string): Promise<WorkflowStatus> {
+  const params = new URLSearchParams({ from, to });
+  return parseJson(await request(`/workflow-status?${params.toString()}`));
+}
+
 export async function addCaseAction(
   caseId: string,
   etag: string,

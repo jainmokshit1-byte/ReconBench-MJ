@@ -534,8 +534,35 @@ def test_scn_11_exact_duplicate_does_not_consume_the_po_ledger_twice() -> None:
     assert results[duplicate.document_id].blocked_value == Decimal("288000")
     assert results[second.document_id].lines[0].billed_before == Decimal("6")
     assert results[second.document_id].lines[0].eligible_qty == Decimal("4")
+    # PO and first receipt fall in the same month: no earlier activity is missing.
+    assert "s4.ledger_completeness" not in {
+        check.check_id for line in results[first.document_id].lines for check in line.checks
+    }
+
+
+def test_ledger_completeness_warns_only_for_a_po_older_than_the_pool() -> None:
+    po = _record(
+        1,
+        _document(
+            _po_xml().replace("<OrderDate>20260101</OrderDate>", "<OrderDate>20251120</OrderDate>"),
+            DocType.PO,
+        ),
+        DocType.PO,
+    )
+    grn = _record(2, _document(_grn_xml(10, accepted=10), DocType.GRN), DocType.GRN)
+    invoice = _record(3, _document(_invoice_xml("INV-2201", 6), DocType.INVOICE), DocType.INVOICE)
+    snapshot = ReconciliationSnapshot(
+        documents=(po, grn, invoice),
+        links=(
+            _link(10, grn.document_id, po.document_id),
+            _link(11, invoice.document_id, po.document_id),
+        ),
+    )
+
+    result = evaluate(snapshot, ReconciliationConfig(), date(2026, 2, 2))[0]
+
     assert "s4.ledger_completeness" in {
-        check.check_id for check in results[first.document_id].checks
+        check.check_id for line in result.lines for check in line.checks
     }
 
 
@@ -1092,6 +1119,24 @@ def test_tolerances_choose_item_then_vendor_then_global_and_zero_expected_is_saf
     assert not _tolerance_pass(Decimal("1"), Decimal("0"), zero_expected)
 
 
+def test_vendor_scoped_item_override_wins_over_item_vendor_and_global() -> None:
+    other_vendor = UUID("00000000-0000-0000-0000-0000000000ff")
+    rule = ToleranceRule(
+        pct=5,
+        abs=10,
+        by_vendor={str(_VENDOR): ToleranceValues(pct=1, abs=5)},
+        by_item={"widget model a": ToleranceValues(pct=0, abs=1)},
+        by_vendor_item={f"{_VENDOR}|widget model a": ToleranceValues(pct=2, abs=3)},
+    )
+    scoped = _effective_tolerance(rule, ToleranceMode.OR, _VENDOR, "widget model a")
+    other = _effective_tolerance(rule, ToleranceMode.OR, other_vendor, "widget model a")
+
+    assert scoped.source is ToleranceSource.ITEM
+    assert scoped.pct == Decimal("2") and scoped.abs == Decimal("3")
+    assert other.source is ToleranceSource.ITEM
+    assert other.pct == Decimal("0") and other.abs == Decimal("1")
+
+
 def test_s4_quantity_ledger_properties_never_overpay_or_recover_after_more_billing() -> None:
     @settings(max_examples=30, deadline=None)
     @given(
@@ -1223,3 +1268,24 @@ def test_duplicate_invoices_on_separate_pos_are_joined_into_one_component() -> N
 
     assert len(components) == 1
     assert results[1].status is CaseStatus.DUPLICATE
+
+
+def test_invoice_from_an_unconfirmed_page_split_is_never_matched() -> None:
+    po = _record(1, _document(_po_xml().replace("20260101", "20260115"), DocType.PO), DocType.PO)
+    grn = _record(2, _document(_grn_xml(10, accepted=10), DocType.GRN), DocType.GRN)
+    invoice_doc = _document(_invoice_xml("INV-2201", 10), DocType.INVOICE)
+    marker = {"pages": [3], "group": 3, "groups": 3, "state": "unconfirmed"}
+    header = invoice_doc.header.model_copy(update={"extras": {"page_split": marker}})
+    invoice = _record(3, invoice_doc.model_copy(update={"header": header}), DocType.INVOICE)
+    snapshot = ReconciliationSnapshot(
+        documents=(po, grn, invoice),
+        links=(
+            _link(10, grn.document_id, po.document_id),
+            _link(11, invoice.document_id, po.document_id),
+        ),
+    )
+
+    result = evaluate(snapshot, ReconciliationConfig(), date(2026, 2, 2))[0]
+
+    assert result.status not in {CaseStatus.MATCHED, CaseStatus.MATCHED_FLAGS}
+    assert ReasonCode.LOW_CONFIDENCE_DATA in result.reason_codes

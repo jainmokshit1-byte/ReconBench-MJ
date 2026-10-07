@@ -32,16 +32,33 @@ AuditAction = Literal[
     "vendor.alias_delete",
     "vendor.merge",
     "vendor.suggestion_decide",
+    "vendor.create",
+    "vendor.rename",
+    "vendor.cleanup",
     "file.remove",
+    "file.page_split.resolve",
     "config.save",
     "ai.settings_save",
     "ai.key_remove",
+    "ai.consent_change",
+    "ai.test_requested",
+    "ai.request_acknowledged",
+    "document.correct",
     "export.create",
     "export.download",
     "retention.purge",
 ]
 AuditTargetType = Literal[
-    "case", "link", "vendor", "file", "config", "ai_setting", "export", "user"
+    "case",
+    "link",
+    "vendor",
+    "file",
+    "document",
+    "config",
+    "ai_setting",
+    "ai_request",
+    "export",
+    "user",
 ]
 
 

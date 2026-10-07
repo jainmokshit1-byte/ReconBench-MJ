@@ -194,13 +194,21 @@ class ExportService:
         )
         if filters.get("vendor_id"):
             statement = statement.where(effective_vendor_id == UUID(str(filters["vendor_id"])))
+        # An invoice without a readable date (an unreadable scan) is always
+        # included, so a period filter can never hide it from the workbook.
         if filters.get("from"):
             statement = statement.where(
-                version.c.doc_date >= date.fromisoformat(str(filters["from"]))
+                sa.or_(
+                    version.c.doc_date.is_(None),
+                    version.c.doc_date >= date.fromisoformat(str(filters["from"])),
+                )
             )
         if filters.get("to"):
             statement = statement.where(
-                version.c.doc_date <= date.fromisoformat(str(filters["to"]))
+                sa.or_(
+                    version.c.doc_date.is_(None),
+                    version.c.doc_date <= date.fromisoformat(str(filters["to"])),
+                )
             )
         if filters.get("status"):
             requested_statuses = filters["status"]
@@ -739,8 +747,11 @@ class ExportService:
             ("Invoices", len(cases)),
             ("Matched", statuses.get("matched", 0) + statuses.get("matched_flags", 0)),
             ("Pending", statuses.get("pending", 0)),
-            ("Exceptions", statuses.get("exception", 0) + statuses.get("needs_review", 0)),
+            # Same split as v_run_summary and the Home KPI cards: Needs Review is not an Exception.
+            ("Exceptions", statuses.get("exception", 0)),
             ("Unlinked", statuses.get("unlinked", 0)),
+            ("Needs Review", statuses.get("needs_review", 0)),
+            ("Duplicate", statuses.get("duplicate", 0)),
             ("₹ Invoiced", None),
             ("₹ Payable", None),
             ("₹ At-risk", None),

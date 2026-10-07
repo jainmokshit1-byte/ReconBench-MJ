@@ -12,6 +12,7 @@ from uuid import UUID
 from rapidfuzz.distance import Levenshtein
 
 from reconbench_core.align import AlignmentResult, align_lines
+from reconbench_core.extraction.pages import split_unconfirmed
 from reconbench_core.normalize import (
     canonicalize_document_number,
     financial_year,
@@ -176,7 +177,11 @@ def _effective_tolerance(
 ) -> Tolerance:
     source = ToleranceSource.GLOBAL
     values = ToleranceValues(pct=rule.pct, abs=rule.abs)
-    if item_key and item_key in rule.by_item:
+    vendor_item_key = f"{vendor_id}|{item_key}" if vendor_id is not None and item_key else None
+    if vendor_item_key and vendor_item_key in rule.by_vendor_item:
+        values = rule.by_vendor_item[vendor_item_key]
+        source = ToleranceSource.ITEM
+    elif item_key and item_key in rule.by_item:
         values = rule.by_item[item_key]
         source = ToleranceSource.ITEM
     elif vendor_id is not None and str(vendor_id) in rule.by_vendor:
@@ -1144,26 +1149,39 @@ def evaluate(
             if current is None or related_date < current:
                 earliest_related[key] = related_date
 
+    pool_start = min(earliest_related.values(), default=None)
     works: list[_LineWork] = []
     case_header_checks: dict[UUID, list[CheckResult]] = {item.document_id: [] for item in invoices}
     case_reasons: dict[UUID, list[ReasonCode]] = {item.document_id: [] for item in invoices}
     for invoice in invoices:
         confidence = invoice.document.confidence
-        if confidence is None or confidence < config.extraction_gate:
+        # An unreadable scan is reported as such; its missing PO link is a symptom.
+        unreadable = ReasonCode.NO_TEXT_LAYER in invoice.document.reason_codes
+        # An invoice split out of a multi-document file waits for the split to be accepted.
+        held = split_unconfirmed(invoice.document)
+        if unreadable or held or confidence is None or confidence < config.extraction_gate:
+            gate_code = ReasonCode.NO_TEXT_LAYER if unreadable else ReasonCode.LOW_CONFIDENCE_DATA
             case_header_checks[invoice.document_id].append(
                 _make_check(
                     "s1.extraction_gate",
                     CheckOutcome.REVIEW,
-                    code=ReasonCode.LOW_CONFIDENCE_DATA,
+                    code=gate_code,
                     level=ReasonLevel.REVIEW,
                     expected=config.extraction_gate,
                     actual=confidence,
                     evidence={
-                        "message": "Invoice critical fields are missing or below confidence gate."
+                        "message": (
+                            "The scan has no readable text; enter or re-upload the invoice."
+                            if unreadable
+                            else "The file holds several documents; accept or undo the page "
+                            "split first."
+                            if held
+                            else "Invoice critical fields are missing or below confidence gate."
+                        )
                     },
                 )
             )
-            case_reasons[invoice.document_id].append(ReasonCode.LOW_CONFIDENCE_DATA)
+            case_reasons[invoice.document_id].append(gate_code)
         duplicate_id = exact_duplicates.get(invoice.document_id)
         if duplicate_id is not None:
             case_header_checks[invoice.document_id].append(
@@ -1197,7 +1215,7 @@ def evaluate(
             if link.from_document_id == invoice.document_id
             and documents[link.to_document_id].document.header.doc_type is DocType.PO
         )
-        if not invoice_links:
+        if not invoice_links and not unreadable:
             case_header_checks[invoice.document_id].append(
                 _make_check(
                     "s2.po_link",
@@ -1331,14 +1349,16 @@ def evaluate(
                 )
                 pre_reasons.append(ReasonCode.PO_NOT_OPEN)
             elif po_status is None:
+                # PRD: PO_NOT_OPEN fails only a closed or cancelled PO. Most ERP and
+                # Tally PO exports carry no status, so absence is not evidence of a
+                # closed PO; the assumption stays visible on the case (D19).
                 prechecks.append(
                     _make_check(
                         "s1.po_open",
-                        CheckOutcome.REVIEW,
-                        level=ReasonLevel.REVIEW,
+                        CheckOutcome.PASS,
                         expected=POStatus.OPEN.value,
                         evidence={
-                            "message": "PO status is missing, so it cannot be confirmed open."
+                            "message": "The PO file has no status; the PO is treated as open."
                         },
                     )
                 )
@@ -1416,10 +1436,14 @@ def evaluate(
                 )
         related_date = earliest_related.get(ledger_key)
         po_date = _doc_date(po_record.document)
+        # PRD: warn when earlier months are not in the pool, i.e. the PO predates
+        # the first month of uploaded receipts and invoices. A PO raised earlier
+        # in the same month as its first receipt is the normal case.
         if (
             related_date is not None
             and po_date is not None
-            and po_date < related_date
+            and pool_start is not None
+            and po_date < pool_start.replace(day=1)
             and ledger_key not in opening_keys
         ):
             for work in line_works:
@@ -1481,7 +1505,8 @@ def evaluate(
                 continue
             before = billed
             after = before + quantity
-            grn_cum = accepted_qty
+            # TR-REC-7: quantity received above the PO cap is not billable.
+            grn_cum = min(accepted_qty, po_cap)
             qty_tolerance = _rule(config, "cum_qty_vs_po", work.invoice.vendor_id, work.line)
             over_po = after > po_cap
             eligible = max(_ZERO, min(quantity, po_cap - before, grn_cum - before))
@@ -1634,6 +1659,8 @@ def evaluate(
             )
         if duplicate_id is not None:
             status = CaseStatus.DUPLICATE
+        elif ReasonCode.NO_TEXT_LAYER in invoice.document.reason_codes:
+            status = CaseStatus.NEEDS_REVIEW
         elif not any(link.from_document_id == invoice.document_id for link in active_links) or any(
             line.po_document_id is None for line in line_results
         ):

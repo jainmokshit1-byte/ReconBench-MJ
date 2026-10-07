@@ -30,10 +30,12 @@ import {
   processBatch,
   removeFile,
   resolveFileMismatch,
+  resolvePageSplit,
   retryFile,
   uploadFile,
 } from "../api/ingestion";
 import type { BatchSummary, IngestionFile, UploadZone } from "../api/ingestion";
+import { AiSharingBanner } from "../components/AiSharingBanner";
 import { PageHeader } from "../components/PageHeader";
 import { CsvMappingDialog } from "../components/CsvMappingDialog";
 import { IngestionPreview } from "../components/IngestionPreview";
@@ -110,8 +112,16 @@ function statusClass(status: string): string {
   return "status-chip";
 }
 
+// A PDF is never type-sniffed; its open question is how its pages split into documents.
+function isPageSplit(file: IngestionFile): boolean {
+  return file.mismatch_state === "suggested" && file.format === "pdf" && !file.sniffed_type;
+}
+
 function warningCode(file: IngestionFile): string | null {
+  if (isPageSplit(file)) return "PAGE_SPLIT_SUGGESTED";
   if (file.mismatch_state === "suggested") return "TYPE_MISMATCH";
+  if (file.retry_reason === "PARSER_VERSION_OUTDATED") return "PARSER_VERSION_OUTDATED";
+  if (file.retry_reason === "NO_TEXT_LAYER") return "NO_TEXT_LAYER";
   return file.error_code;
 }
 
@@ -200,6 +210,7 @@ function FileRow({
   onRetry,
   onRemove,
   onMismatch,
+  onPageSplit,
   onMap,
   busy,
 }: {
@@ -209,11 +220,13 @@ function FileRow({
   onRetry: (file: IngestionFile) => void;
   onRemove: (file: IngestionFile) => void;
   onMismatch: (file: IngestionFile, acceptSuggested: boolean) => void;
+  onPageSplit: (file: IngestionFile, acceptSplit: boolean) => void;
   onMap: (file: IngestionFile) => void;
   busy: boolean;
 }) {
   const mismatch = file.mismatch_state === "suggested";
-  const canRetry = file.status === "failed" || file.status === "partial";
+  const pageSplit = isPageSplit(file);
+  const canRetry = file.retry_available === true || file.status === "failed" || file.status === "partial";
   const canMap = file.format === "csv" && file.error_code === "CSV_MAPPING_REQUIRED";
   const warning = warningCode(file);
   return (
@@ -235,9 +248,14 @@ function FileRow({
       <td>
         <div className="file-action-group">
           <button className="table-action" type="button" disabled={file.format === "zip" || busy || file.status === "removed"} onClick={() => onPreview(file)}>Preview</button>
-          {canRetry ? <button className="table-action" type="button" disabled={busy} onClick={() => onRetry(file)}>Retry</button> : null}
+          {canRetry ? <button className="table-action" type="button" disabled={busy} onClick={() => onRetry(file)}>{file.retry_reason === "PARSER_VERSION_OUTDATED" ? "Reprocess" : "Retry"}</button> : null}
           {canMap ? <button className="table-action action-highlight" type="button" disabled={busy} onClick={() => onMap(file)}>Map CSV</button> : null}
-          {mismatch ? (
+          {pageSplit ? (
+            <>
+              <button className="table-action action-highlight" type="button" disabled={busy} onClick={() => onPageSplit(file, true)}>Split into documents</button>
+              <button className="table-action" type="button" disabled={busy} onClick={() => onPageSplit(file, false)}>Keep as one {file.zone_uploaded.toUpperCase()}</button>
+            </>
+          ) : mismatch ? (
             <>
               <button className="table-action action-highlight" type="button" disabled={busy} onClick={() => onMismatch(file, true)}>Use {file.sniffed_type?.toUpperCase()}</button>
               <button className="table-action" type="button" disabled={busy} onClick={() => onMismatch(file, false)}>Keep {file.zone_uploaded.toUpperCase()}</button>
@@ -557,6 +575,13 @@ export function IngestionPage() {
     }, "The type decision was saved and the file was queued again.");
   };
 
+  const resolveSplit = (file: IngestionFile, acceptSplit: boolean) => {
+    void runAction(
+      () => resolvePageSplit(file.id, acceptSplit, csrfToken),
+      acceptSplit ? "The split was accepted and the file is being read again." : "The file is being read again as one document.",
+    );
+  };
+
   const selectedBatchLabel = batchId
     ? batches.find((batch) => batch.id === batchId)?.label || "Untitled batch"
     : "New batch";
@@ -573,6 +598,7 @@ export function IngestionPage() {
       />
 
       {!canUpload ? <div className="banner-warning ingestion-permission-note"><CircleHelp size={17} /><span>Your account can view ingestion status, but uploading requires the <strong>files.upload</strong> capability.</span></div> : null}
+      <AiSharingBanner />
       {error ? <div className="banner-error ingestion-message" role="alert"><AlertCircle size={17} /><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError(null)}><X size={15} /></button></div> : null}
       {info ? <div className="banner-info ingestion-message" role="status"><CheckCircle2 size={17} /><span>{info}</span><button type="button" aria-label="Dismiss message" onClick={() => setInfo(null)}><X size={15} /></button></div> : null}
 
@@ -650,8 +676,8 @@ export function IngestionPage() {
                 <tbody>
                   {rootFiles.map((file) => (
                     <Fragment key={file.id}>
-                      <FileRow file={file} child={false} onPreview={openPreview} onRetry={(entry) => void runAction(() => retryFile(entry.id, csrfToken), `${entry.display_name} was queued for retry.`)} onRemove={removeServerFile} onMismatch={resolveMismatch} onMap={setMappingFile} busy={busy} />
-                      {(childrenByParent.get(file.id) ?? []).map((child) => <FileRow key={child.id} file={child} child onPreview={openPreview} onRetry={(entry) => void runAction(() => retryFile(entry.id, csrfToken), `${entry.display_name} was queued for retry.`)} onRemove={removeServerFile} onMismatch={resolveMismatch} onMap={setMappingFile} busy={busy} />)}
+                      <FileRow file={file} child={false} onPreview={openPreview} onRetry={(entry) => void runAction(() => retryFile(entry.id, csrfToken), `${entry.display_name} was queued for ${entry.retry_reason === "PARSER_VERSION_OUTDATED" ? "reprocessing" : "retry"}.`)} onRemove={removeServerFile} onMismatch={resolveMismatch} onPageSplit={resolveSplit} onMap={setMappingFile} busy={busy} />
+                      {(childrenByParent.get(file.id) ?? []).map((child) => <FileRow key={child.id} file={child} child onPreview={openPreview} onRetry={(entry) => void runAction(() => retryFile(entry.id, csrfToken), `${entry.display_name} was queued for ${entry.retry_reason === "PARSER_VERSION_OUTDATED" ? "reprocessing" : "retry"}.`)} onRemove={removeServerFile} onMismatch={resolveMismatch} onPageSplit={resolveSplit} onMap={setMappingFile} busy={busy} />)}
                     </Fragment>
                   ))}
                 </tbody>

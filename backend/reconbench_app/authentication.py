@@ -21,6 +21,7 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.engine import Connection, Engine
 
+from reconbench_app.ai.session_keys import delete_session_keys
 from reconbench_app.authorization import public_endpoint, requires, resolve_effective_role
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
@@ -304,15 +305,19 @@ class AuthService:
                     version=app_user.c.version + 1,
                 )
             )
-            connection.execute(
-                sa.update(session)
-                .where(
-                    session.c.workspace_id == workspace_id,
-                    session.c.user_id == user["id"],
-                    session.c.revoked_at.is_(None),
+            revoked_ids = list(
+                connection.scalars(
+                    sa.update(session)
+                    .where(
+                        session.c.workspace_id == workspace_id,
+                        session.c.user_id == user["id"],
+                        session.c.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=now)
+                    .returning(session.c.id)
                 )
-                .values(revoked_at=now)
             )
+            delete_session_keys(connection, revoked_ids, now=now)
 
             token = secrets.token_urlsafe(32)
             csrf_token = csrf_token_for_session(token)
@@ -403,6 +408,7 @@ class AuthService:
                     .where(session.c.id == row["session_id"], session.c.revoked_at.is_(None))
                     .values(revoked_at=now)
                 )
+                delete_session_keys(connection, [row["session_id"]], now=now)
                 return AuthenticationCheck(None, False)
 
             derived_csrf = csrf_token_for_session(session_token)
@@ -414,6 +420,7 @@ class AuthService:
                     .where(session.c.id == row["session_id"], session.c.revoked_at.is_(None))
                     .values(revoked_at=now)
                 )
+                delete_session_keys(connection, [row["session_id"]], now=now)
                 return AuthenticationCheck(None, False)
 
             csrf_valid = True
@@ -439,12 +446,14 @@ class AuthService:
     @requires("data.view")
     def revoke_session(self, session_id: Any) -> None:
         session = metadata.tables["session"]
+        now = self._now()
         with self.engine.begin() as connection:
             connection.execute(
                 sa.update(session)
                 .where(session.c.id == session_id, session.c.revoked_at.is_(None))
-                .values(revoked_at=self._now())
+                .values(revoked_at=now)
             )
+            delete_session_keys(connection, [session_id], now=now)
 
     def _now(self) -> datetime:
         value = self.clock()

@@ -11,6 +11,7 @@ const batchId = "batch-synthetic-1";
 const mismatchId = "file-mismatch-1";
 const failedId = "file-failed-1";
 const parsedId = "file-parsed-1";
+const outdatedId = "file-outdated-1";
 
 const sessionContext: AuthContextValue = {
   status: "authenticated",
@@ -191,11 +192,19 @@ describe("Ingestion workflow screen", () => {
     let mismatch = makeFile(mismatchId, { display_name: "misfiled-po.pdf", status: "staged", mismatch_state: "suggested", sniffed_type: "po", docs_found: 0, docs_new: 0 });
     let failed = makeFile(failedId, { display_name: "retry-invoice.pdf", status: "failed", error_code: "PDF_TEXT_EXTRACTION_FAILED", docs_found: 0, docs_new: 0 });
     let removed = makeFile(parsedId, { display_name: "remove-invoice.pdf" });
+    let outdated = makeFile(outdatedId, {
+      display_name: "outdated-parser.xml",
+      format: "xml",
+      zone: "po",
+      zone_uploaded: "po",
+      retry_available: true,
+      retry_reason: "PARSER_VERSION_OUTDATED",
+    });
     installFetch((url, init) => {
       const method = init.method ?? "GET";
       if (url.pathname === "/api/v1/config") return jsonResponse(200, configResponse);
       if (url.pathname === "/api/v1/batches" && method === "GET") return jsonResponse(200, [{ id: batchId, label: "Synthetic batch", version: 1 }]);
-      if (url.pathname === "/api/v1/files" && method === "GET") return jsonResponse(200, [mismatch, failed, removed], { ETag: `"${mismatch.version}-${failed.status}-${removed.status}"` });
+      if (url.pathname === "/api/v1/files" && method === "GET") return jsonResponse(200, [mismatch, failed, removed, outdated], { ETag: `"${mismatch.version}-${failed.status}-${removed.status}-${outdated.status}"` });
       if (url.pathname === `/api/v1/files/${mismatchId}` && method === "GET") return jsonResponse(200, mismatch, { ETag: '"file-v1"' });
       if (url.pathname === `/api/v1/files/${mismatchId}` && method === "PATCH") {
         expect(new Headers(init.headers).get("If-Match")).toBe('"file-v1"');
@@ -205,6 +214,10 @@ describe("Ingestion workflow screen", () => {
       if (url.pathname === `/api/v1/files/${failedId}/retry` && method === "POST") {
         failed = { ...failed, status: "queued", error_code: null, version: 2 };
         return jsonResponse(202, { file_id: failedId, status: "queued" });
+      }
+      if (url.pathname === `/api/v1/files/${outdatedId}/retry` && method === "POST") {
+        outdated = { ...outdated, status: "queued", retry_available: false, retry_reason: null, version: 2 };
+        return jsonResponse(202, { file_id: outdatedId, status: "queued" });
       }
       if (url.pathname === `/api/v1/files/${parsedId}` && method === "DELETE") {
         removed = { ...removed, status: "removed", version: 2 };
@@ -222,7 +235,51 @@ describe("Ingestion workflow screen", () => {
     expect(await within(row("misfiled-po.pdf")).findByText("Queued")).toBeInTheDocument();
     fireEvent.click(within(row("retry-invoice.pdf")).getByRole("button", { name: "Retry" }));
     expect(await within(row("retry-invoice.pdf")).findByText("Queued")).toBeInTheDocument();
+    expect(within(row("outdated-parser.xml")).getByText("PARSER VERSION OUTDATED")).toBeInTheDocument();
+    fireEvent.click(within(row("outdated-parser.xml")).getByRole("button", { name: "Reprocess" }));
+    expect(await within(row("outdated-parser.xml")).findByText("Queued")).toBeInTheDocument();
     fireEvent.click(within(row("remove-invoice.pdf")).getByRole("button", { name: "Remove" }));
     expect(await within(row("remove-invoice.pdf")).findByText("Removed")).toBeInTheDocument();
+  });
+
+  it("asks whether a bundle PDF is split into documents and sends the answer", async () => {
+    const message = "This file looks like 3 document(s): PO p1, GRN p2, INVOICE p3.";
+    let bundle = makeFile(mismatchId, { display_name: "bundle.pdf", mismatch_state: "suggested", docs_found: 3, docs_new: 3, error_message: message });
+    let kept = makeFile(parsedId, { display_name: "second-bundle.pdf", mismatch_state: "suggested", docs_found: 2, docs_new: 2, error_message: message });
+    const answers: Array<{ id: string; decision: string }> = [];
+    installFetch((url, init) => {
+      const method = init.method ?? "GET";
+      if (url.pathname === "/api/v1/config") return jsonResponse(200, configResponse);
+      if (url.pathname === "/api/v1/batches" && method === "GET") return jsonResponse(200, [{ id: batchId, label: "Synthetic batch", version: 1 }]);
+      if (url.pathname === "/api/v1/files" && method === "GET") return jsonResponse(200, [bundle, kept], { ETag: `"${bundle.status}-${kept.status}"` });
+      if (url.pathname === `/api/v1/files/${mismatchId}` && method === "GET") return jsonResponse(200, bundle, { ETag: '"bundle-v1"' });
+      if (url.pathname === `/api/v1/files/${parsedId}` && method === "GET") return jsonResponse(200, kept, { ETag: '"kept-v1"' });
+      const split = url.pathname.match(/^\/api\/v1\/files\/([^/]+)\/page-split$/);
+      if (split && method === "POST") {
+        const id = decodeURIComponent(split[1] ?? "");
+        expect(new Headers(init.headers).get("If-Match")).toBe(id === mismatchId ? '"bundle-v1"' : '"kept-v1"');
+        const decision = JSON.parse(String(init.body)).decision as string;
+        answers.push({ id, decision });
+        const state = decision === "accept_split" ? "accepted" : "kept";
+        if (id === mismatchId) bundle = { ...bundle, mismatch_state: state, status: "queued", error_message: null, version: 2 };
+        else kept = { ...kept, mismatch_state: state, status: "queued", error_message: null, version: 2 };
+        return jsonResponse(202, id === mismatchId ? bundle : kept);
+      }
+      throw new Error(`Unexpected request ${method} ${url.pathname}`);
+    });
+
+    renderPage();
+    const row = (name: string) => screen.getByText(name).closest("tr") as HTMLElement;
+    await screen.findByText("bundle.pdf");
+    expect(within(row("bundle.pdf")).getByText("PAGE SPLIT SUGGESTED")).toHaveAttribute("title", message);
+    expect(within(row("bundle.pdf")).queryByRole("button", { name: /^Use / })).not.toBeInTheDocument();
+    fireEvent.click(within(row("bundle.pdf")).getByRole("button", { name: "Split into documents" }));
+    expect(await within(row("bundle.pdf")).findByText("Queued")).toBeInTheDocument();
+    fireEvent.click(within(row("second-bundle.pdf")).getByRole("button", { name: "Keep as one INVOICE" }));
+    expect(await within(row("second-bundle.pdf")).findByText("Queued")).toBeInTheDocument();
+    expect(answers).toEqual([
+      { id: mismatchId, decision: "accept_split" },
+      { id: parsedId, decision: "keep_one" },
+    ]);
   });
 });

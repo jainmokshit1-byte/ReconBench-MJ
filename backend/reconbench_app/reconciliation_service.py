@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import sqlalchemy as sa
@@ -45,6 +46,11 @@ from reconbench_app.json_serialization import to_jsonable
 from reconbench_app.mapping_service import MappingService, _make_document
 from reconbench_app.reconciliation_parallel import evaluate_components_parallel
 
+if TYPE_CHECKING:
+    from reconbench_app.ai.enqueue import AiHookEnqueuer
+
+_LOGGER = logging.getLogger(__name__)
+
 
 def _decimal(value: object, default: str = "0") -> Decimal:
     try:
@@ -63,35 +69,119 @@ def _canonical_hash(value: object) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def reconciliation_config(body: Mapping[str, Any], *, effective_date: date) -> ReconciliationConfig:
-    """Convert the active canonical Schema §10 config into the pure engine model."""
+def _tolerance_values(value: object) -> ToleranceValues:
+    raw = _mapping(value)
+    return ToleranceValues(pct=_decimal(raw.get("pct")), abs=_decimal(raw.get("abs")))
+
+
+def _vendor_family(vendor_id: str, vendor_roots: Mapping[UUID, UUID]) -> list[str]:
+    """Return the other vendor ids in the override vendor's merge family."""
+
+    try:
+        own = UUID(vendor_id)
+    except ValueError:
+        return []
+    root = own
+    for _ in range(len(vendor_roots) + 1):
+        parent = vendor_roots.get(root, root)
+        if parent == root:
+            break
+        root = parent
+    family = [
+        str(member)
+        for member, member_root in vendor_roots.items()
+        if member != own and member_root == root
+    ]
+    if root != own:
+        family.append(str(root))
+    return list(dict.fromkeys(family))
+
+
+def _fold_overrides(
+    engine: Mapping[str, Any],
+    tolerances: dict[str, dict[str, dict[str, ToleranceValues]]],
+    vendor_roots: Mapping[UUID, UUID],
+) -> None:
+    """Apply Schema §5.1 ``engine.overrides`` onto the per-rule override maps.
+
+    Values reach every id in the vendor's merge family first; an override set
+    on a vendor id itself is applied last so it is never replaced by a
+    relative's override.
+    """
+
+    overrides = _mapping(engine.get("overrides"))
+    # (rule, map name, key, value, exact) in application order.
+    entries: list[tuple[str, str, str, ToleranceValues, bool]] = []
+
+    def scoped(rule: object, target: str, vendor_id: str, suffix: str, value: object) -> None:
+        if str(rule) not in tolerances:
+            return
+        values = _tolerance_values(value)
+        for member in _vendor_family(vendor_id, vendor_roots):
+            entries.append((str(rule), target, f"{member}{suffix}", values, False))
+        entries.append((str(rule), target, f"{vendor_id}{suffix}", values, True))
+
+    for vendor_override in overrides.get("vendors", []) or []:
+        item = _mapping(vendor_override)
+        if item.get("vendor_id"):
+            for rule, value in _mapping(item.get("tolerances")).items():
+                scoped(rule, "by_vendor", str(item["vendor_id"]), "", value)
+    for item_override in overrides.get("items", []) or []:
+        item = _mapping(item_override)
+        item_key = str(item.get("item_code") or "").casefold().strip()
+        if not item_key:
+            continue
+        for rule, value in _mapping(item.get("tolerances")).items():
+            if item.get("vendor_id"):
+                scoped(rule, "by_vendor_item", str(item["vendor_id"]), f"|{item_key}", value)
+            elif str(rule) in tolerances:
+                entries.append((str(rule), "by_item", item_key, _tolerance_values(value), True))
+    for rule, target, key, values, _exact in sorted(entries, key=lambda entry: entry[4]):
+        tolerances[rule][target][key] = values
+
+
+def reconciliation_config(
+    body: Mapping[str, Any],
+    *,
+    effective_date: date,
+    vendor_roots: Mapping[UUID, UUID] | None = None,
+) -> ReconciliationConfig:
+    """Convert the active canonical Schema §10 config into the pure engine model.
+
+    ``vendor_roots`` maps each vendor id to its ``merged_into`` survivor so a
+    vendor override covers documents still attached to merged vendor ids.
+    """
 
     engine = _mapping(body.get("engine"))
     raw_tolerances = _mapping(engine.get("tolerances"))
+    scoped: dict[str, dict[str, dict[str, ToleranceValues]]] = {}
+    for name, raw_value in raw_tolerances.items():
+        if name == "limit_mode":
+            continue
+        raw = _mapping(raw_value)
+        scoped[str(name)] = {
+            "by_vendor": {
+                str(key): _tolerance_values(value)
+                for key, value in _mapping(raw.get("by_vendor")).items()
+            },
+            "by_item": {
+                str(key).casefold().strip(): _tolerance_values(value)
+                for key, value in _mapping(raw.get("by_item")).items()
+            },
+            "by_vendor_item": {},
+        }
+    _fold_overrides(engine, scoped, vendor_roots or {})
     tolerances: dict[str, ToleranceRule] = {}
     for name, raw_value in raw_tolerances.items():
         if name == "limit_mode":
             continue
         raw = _mapping(raw_value)
-        by_vendor = {
-            str(key): ToleranceValues(
-                pct=_decimal(_mapping(value).get("pct")),
-                abs=_decimal(_mapping(value).get("abs")),
-            )
-            for key, value in _mapping(raw.get("by_vendor")).items()
-        }
-        by_item = {
-            str(key): ToleranceValues(
-                pct=_decimal(_mapping(value).get("pct")),
-                abs=_decimal(_mapping(value).get("abs")),
-            )
-            for key, value in _mapping(raw.get("by_item")).items()
-        }
         tolerances[str(name)] = ToleranceRule(
             pct=_decimal(raw.get("pct")),
             abs=_decimal(raw.get("abs")),
-            by_vendor=by_vendor,
-            by_item=by_item,
+            by_vendor=scoped[str(name)]["by_vendor"],
+            by_item=scoped[str(name)]["by_item"],
+            by_vendor_item=scoped[str(name)]["by_vendor_item"],
         )
 
     thresholds = _mapping(engine.get("thresholds"))
@@ -154,8 +244,15 @@ def reconciliation_config(body: Mapping[str, Any], *, effective_date: date) -> R
 class ReconciliationService:
     """Loads one immutable workspace snapshot, evaluates it, and persists append-only results."""
 
-    def __init__(self, engine: Engine, *, process_workers: int = 1) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        process_workers: int = 1,
+        ai_hooks: AiHookEnqueuer | None = None,
+    ) -> None:
         self.engine = engine
+        self.ai_hooks = ai_hooks
         self.mapping = MappingService(engine)
         if process_workers < 1 or process_workers > 8:
             raise ValueError("process_workers must be between one and eight")
@@ -395,10 +492,22 @@ class ReconciliationService:
                 line_rows=line_rows,
                 duration_ms=duration_ms,
             )
-            return selected_results
         except Exception:
             self._mark_failed(run_id)
             raise
+        self._queue_item_opinions(cast(UUID, run["workspace_id"]), run_id)
+        return selected_results
+
+    def _queue_item_opinions(self, workspace_id: UUID, run_id: UUID) -> None:
+        """Queue advisory H2 opinions once the run has succeeded; the run never waits for them."""
+
+        if self.ai_hooks is None:
+            return
+        try:
+            with self.engine.begin() as connection:
+                self.ai_hooks.item_opinions(connection, workspace_id, run_id)
+        except Exception as exc:  # noqa: BLE001 - AI is optional; the run already succeeded.
+            _LOGGER.warning("ai_enqueue_failed hook=h2_item error_type=%s", type(exc).__name__)
 
     @requires("recon.run")
     def manual_reconcile(
@@ -517,7 +626,11 @@ class ReconciliationService:
                                 ),
                             )
                         )
-                        .where(link_current.c.workspace_id == workspace_id)
+                        .where(
+                            link_current.c.workspace_id == workspace_id,
+                            # A pending AI suggestion never feeds verdicts (SCN-20).
+                            sa.not_(sa.and_(link.c.ai_suggested, link.c.state == "suggested")),
+                        )
                         .order_by(link.c.id)
                     ).mappings()
                 )
@@ -623,7 +736,9 @@ class ReconciliationService:
                 )
                 config_version_id = cast(UUID, config_row["id"])
                 body = _mapping(config_row["body"])
-                config = reconciliation_config(body, effective_date=run_date)
+                config = reconciliation_config(
+                    body, effective_date=run_date, vendor_roots=effective_vendor_ids
+                )
                 snapshot = ReconciliationSnapshot(
                     documents=tuple(records),
                     links=links,
@@ -754,6 +869,7 @@ class ReconciliationService:
         line_values: list[dict[str, Any]] = []
         counts: Counter[str] = Counter()
         case_records: list[tuple[UUID, CaseResult, UUID, UUID | None]] = []
+        manifest_hash = manifest.manifest_hash
         for result in results:
             if result.invoice_id is None or result.invoice_version_id is None:
                 continue
@@ -774,7 +890,7 @@ class ReconciliationService:
                 case_link_ids.update(link.link_id for link in links_by_target.get(po_id, ()))
             case_id = new_id()
             case_input = {
-                "manifest_hash": manifest.manifest_hash,
+                "manifest_hash": manifest_hash,
                 "invoice_version_id": str(result.invoice_version_id),
                 "document_versions": {
                     str(document_id): str(snapshot_by_document[document_id].version_id)

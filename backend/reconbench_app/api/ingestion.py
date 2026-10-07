@@ -7,7 +7,8 @@ import json
 import tempfile
 from collections.abc import Iterator
 from datetime import date
-from typing import Any
+from decimal import Decimal
+from typing import Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -26,6 +27,7 @@ from reconbench_app.api.conventions import (
 )
 from reconbench_app.authorization import ActorContext, requires
 from reconbench_app.ingestion import (
+    AiSuggestionRef,
     BatchVersionConflict,
     IngestionFailure,
     IngestionService,
@@ -59,10 +61,90 @@ class MismatchDecision(BaseModel):
     decision: str = Field(pattern=r"^(accept_suggested|keep_zone)$")
 
 
+class PageSplitDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(pattern=r"^(accept_split|keep_one)$")
+
+
 class ColumnMappingBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     column_mapping: dict[str, str] = Field(min_length=3, max_length=128)
+
+
+class InvoiceLineCorrection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID | None = None
+    line_no: int = Field(ge=1, le=10_000)
+    description: str | None = Field(default=None, max_length=2_000)
+    item_code: str | None = Field(default=None, max_length=256)
+    hsn_sac: str | None = Field(default=None, max_length=64)
+    uom: str | None = Field(default=None, max_length=64)
+    quantity: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    rate: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    amount: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+
+    @model_validator(mode="after")
+    def validate_new_line(self) -> InvoiceLineCorrection:
+        if self.id is None and not any(
+            value not in (None, "")
+            for value in (
+                self.description,
+                self.item_code,
+                self.hsn_sac,
+                self.quantity,
+                self.rate,
+                self.amount,
+            )
+        ):
+            raise ValueError("A new line needs at least one value.")
+        return self
+
+
+class AiSuggestionRefBody(BaseModel):
+    """Marks a corrected value as taken from an H1 suggestion (it must still match)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ai_call_id: UUID
+    scope: Literal["header", "line"]
+    line_no: int | None = Field(default=None, ge=1, le=10_000)
+    field: str = Field(min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> AiSuggestionRefBody:
+        if (self.scope == "header") != (self.line_no is None):
+            raise ValueError("Header references have no line_no; line references need one.")
+        return self
+
+
+class InvoiceCorrectionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    doc_no: str | None = Field(default=None, max_length=256)
+    doc_date: date | None = None
+    vendor_name: str | None = Field(default=None, max_length=1_000)
+    vendor_gstin: str | None = Field(default=None, max_length=32)
+    buyer_gstin: str | None = Field(default=None, max_length=32)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    taxable_total: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    cgst: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    sgst: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    igst: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    round_off: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    grand_total: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    po_refs: list[str] | None = Field(default=None, max_length=50)
+    grn_refs: list[str] | None = Field(default=None, max_length=50)
+    challan_no: str | None = Field(default=None, max_length=256)
+    e_way_bill_no: str | None = Field(default=None, max_length=256)
+    irn: str | None = Field(default=None, max_length=256)
+    place_of_supply: str | None = Field(default=None, max_length=256)
+    lines: list[InvoiceLineCorrection] | None = Field(default=None, max_length=500)
+    verified: bool = False
+    reason: str | None = Field(default=None, max_length=500)
+    ai_suggestion_refs: list[AiSuggestionRefBody] = Field(default_factory=list, max_length=200)
 
 
 def _actor(request: Request) -> ActorContext:
@@ -164,6 +246,8 @@ def _public_file(row: dict[str, Any]) -> dict[str, Any]:
         "docs_updated",
         "docs_skipped",
         "reupload_skips",
+        "retry_available",
+        "retry_reason",
         "uploaded_at",
         "queued_at",
         "parse_started_at",
@@ -414,6 +498,38 @@ def resolve_file_type(
     )
 
 
+@router.post(
+    "/files/{file_id}/page-split",
+    status_code=202,
+    tags=["Ingestion"],
+    responses={409: {"model": ProblemDetails}, 428: {"model": ProblemDetails}},
+)
+@requires("files.upload")
+def resolve_page_split(
+    file_id: UUID,
+    body: PageSplitDecision,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> Response:
+    """Accept a PDF's proposed split into documents, or keep it as one document."""
+
+    expected = require_if_match(if_match)
+    try:
+        row = _service(request).resolve_page_split(
+            _actor(request),
+            file_id,
+            accept=body.decision == "accept_split",
+            expected_version=expected,
+        )
+    except (BatchVersionConflict, IngestionFailure, ObjectStoreUnavailable) as exc:
+        return _handle_ingestion_error(exc, request)
+    return DecimalJSONResponse(
+        status_code=202,
+        content=_public_file(row),
+        headers={"ETag": etag_for_version(int(row["version"]))},
+    )
+
+
 @router.post("/files/{file_id}/retry", status_code=202, tags=["Ingestion"])
 @requires("files.upload")
 def retry_file(file_id: UUID, request: Request) -> Response:
@@ -609,7 +725,128 @@ def get_document(document_id: UUID, request: Request) -> Response:
             code="not_found",
         )
     return DecimalJSONResponse(
-        content=to_jsonable(result), headers={"ETag": _etag_for_payload(result)}
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["document"]["version"]))},
+    )
+
+
+@router.post("/files/{source_file_id}/manual-invoice", tags=["Documents"])
+@requires("files.upload")
+def create_manual_invoice(
+    source_file_id: UUID,
+    body: InvoiceCorrectionBody,
+    request: Request,
+) -> Response:
+    if body.ai_suggestion_refs:
+        return _problem(
+            request,
+            status=422,
+            title="Ingestion request failed",
+            detail="AI suggestion references apply only to corrections of a parsed PDF.",
+            code="ai_suggestion_ref_invalid",
+        )
+    try:
+        result = _service(request).create_manual_invoice(
+            _actor(request),
+            source_file_id,
+            header_patch=body.model_dump(
+                exclude_unset=True,
+                exclude={"lines", "verified", "reason", "ai_suggestion_refs"},
+                mode="python",
+            ),
+            lines_patch=(
+                [line.model_dump(exclude_unset=True, mode="python") for line in body.lines]
+                if body.lines is not None
+                else []
+            ),
+            verified=body.verified,
+            reason=body.reason,
+        )
+    except (BatchVersionConflict, IngestionFailure, ObjectStoreUnavailable) as exc:
+        return _handle_ingestion_error(exc, request)
+    if result is None:
+        return _problem(
+            request,
+            status=404,
+            title="Not found",
+            detail="The invoice source file was not found.",
+            code="not_found",
+        )
+    return DecimalJSONResponse(
+        status_code=201,
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["document"]["version"]))},
+    )
+
+
+@router.put("/documents/{document_id}/correction", tags=["Documents"])
+@requires("files.upload")
+def correct_invoice_document(
+    document_id: UUID,
+    body: InvoiceCorrectionBody,
+    request: Request,
+) -> Response:
+    expected_version = require_if_match(request.headers.get("if-match"))
+    try:
+        result = _service(request).correct_invoice_document(
+            _actor(request),
+            document_id,
+            expected_version=expected_version,
+            header_patch=body.model_dump(
+                exclude_unset=True,
+                exclude={"lines", "verified", "reason", "ai_suggestion_refs"},
+                mode="python",
+            ),
+            lines_patch=(
+                [line.model_dump(exclude_unset=True, mode="python") for line in body.lines]
+                if "lines" in body.model_fields_set and body.lines is not None
+                else None
+            ),
+            verified=body.verified,
+            reason=body.reason,
+            ai_suggestion_refs=[
+                AiSuggestionRef(
+                    ai_call_id=ref.ai_call_id,
+                    scope=ref.scope,
+                    line_no=ref.line_no,
+                    field=ref.field,
+                )
+                for ref in body.ai_suggestion_refs
+            ],
+        )
+    except (BatchVersionConflict, IngestionFailure, ObjectStoreUnavailable) as exc:
+        return _handle_ingestion_error(exc, request)
+    if result is None:
+        return _problem(
+            request,
+            status=404,
+            title="Not found",
+            detail="The invoice was not found.",
+            code="not_found",
+        )
+    return DecimalJSONResponse(
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["document"]["version"]))},
+    )
+
+
+@router.get("/documents/{document_id}/ai-suggestions", tags=["Documents"])
+@requires("data.view")
+def get_document_ai_suggestions(document_id: UUID, request: Request) -> Response:
+    """Advisory H1 or vision (page-image) suggestions, checked again; never applied here."""
+
+    result = _service(request).ai_suggestions(_actor(request).workspace_id, document_id)
+    if result is None:
+        return _problem(
+            request,
+            status=404,
+            title="Not found",
+            detail="The document was not found.",
+            code="not_found",
+        )
+    return DecimalJSONResponse(
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["document_version"]))},
     )
 
 

@@ -1,6 +1,6 @@
 # Phase 1 dependency and licence review
 
-Reviewed against the checked-in Python and npm lockfiles on 2026-10-01. “Active” means the package resolved from its registry and its upstream project was accepting releases or maintenance at review time; it is not a support guarantee. Python's `pip-audit --skip-editable` reported no known vulnerabilities in locked third-party packages. `npm audit --audit-level=high` reported zero vulnerabilities. The Python audit intentionally skips this repository's editable `reconbench-app` distribution; there is no released application package to audit yet. Re-run both audits in CI and before release.
+Python runtime dependencies were re-reviewed against the refreshed lockfile on 2026-10-04; `pip-audit --skip-editable` reported no known vulnerabilities in locked third-party packages. The web lockfile review and `npm audit --audit-level=high` result are from 2026-10-01 (zero vulnerabilities). “Active” means the package resolved from its registry and its upstream project was accepting releases or maintenance at review time; it is not a support guarantee. The Python audit intentionally skips this repository's editable `reconbench-app` distribution; there is no released application package to audit yet. Re-run both audits in CI and before release.
 
 ## Python runtime
 
@@ -9,7 +9,9 @@ Reviewed against the checked-in Python and npm lockfiles on 2026-10-01. “Activ
 | Alembic | 1.20.0 | MIT | Active | None reported by `pip-audit` | Keep |
 | boto3, botocore | 1.43.106 | Apache-2.0 | Active | None reported by `pip-audit` | Keep |
 | charset-normalizer | 3.5.2 | MIT | Active | None reported by `pip-audit` | Keep |
+| cryptography | 50.0.2 | Apache-2.0 OR BSD-3-Clause | Active | None reported by `pip-audit` | Add as a direct dependency for the planned AI key-sealing protocol; see `docs/ai-gemini-protocol.md` |
 | FastAPI | 0.142.2 | MIT | Active | None reported by `pip-audit` | Keep |
+| google-genai | 2.28.0 | Apache-2.0 | Active; v2.28.0 released 2026-10-02 | None reported by `pip-audit` | Keep pinned for Gemini Interactions. The public retry setting alone is insufficient; the one-shot public HTTPX transport guard and locked-version regression tests now pass (see `docs/ai-gemini-protocol.md`). |
 | lxml | 6.1.3 | BSD-3-Clause | Active | None reported by `pip-audit` | Keep |
 | OpenTelemetry API, SDK, OTLP HTTP exporter | 1.45.0 | Apache-2.0 | Active | None reported by `pip-audit` | Keep; exporter remains optional at runtime |
 | OCRmyPDF | 17.13.0 | MPL-2.0 | Active upstream on 2026-10-02 | Not re-audited after addition | Add for scanned-PDF text layers; no OCRmyPDF source modifications |
@@ -26,6 +28,7 @@ Reviewed against the checked-in Python and npm lockfiles on 2026-10-01. “Activ
 | SQLAlchemy | 2.0.54 | MIT | Active | None reported by `pip-audit` | Keep; pinned below 2.1 per TRD |
 | structlog | 26.1.0 | MIT OR Apache-2.0 | Active | None reported by `pip-audit` | Keep |
 | Uvicorn | 0.54.0 | BSD-3-Clause | Active | None reported by `pip-audit` | Keep |
+| zxing-cpp | 3.1.1 | Apache-2.0 (bundled zxing-cpp C++ library, Apache-2.0) | Active; v3.1.1 released 2026-07-29 | Not re-audited after addition | Add (AC-2, 6 Oct 2026) to decode e-invoice QR codes from rendered PDF pages inside the PDF sandbox; prebuilt abi3 wheels for Linux x86_64/aarch64 and Windows, no system library. Alternatives rejected: pyzbar needs the system `libzbar`; OpenCV is a much larger dependency for one decoder |
 | XlsxWriter | 3.2.9 | BSD-2-Clause | Active | None reported by `pip-audit` | Keep |
 
 ## Python development tools
@@ -89,6 +92,7 @@ CI scans full Git history with the official Gitleaks CLI container pinned to v8.
 ## Review evidence and limits
 
 - `uv run --project backend --group dev pip-audit --skip-editable` → no known vulnerabilities.
+- Python audit of the updated environment on 2026-10-04: `backend/.venv/Scripts/python.exe -m pip_audit --skip-editable` → no known vulnerabilities; editable `reconbench-app` skipped.
 - `npm audit --prefix web --audit-level=high` → zero vulnerabilities.
 - `deploy/minio.Dockerfile` builds the last documented MinIO Community source release because the selected Docker Hub image could not be pulled. This archived source build is a local development dependency only.
 - `scripts/spikes/` uses synthetic fixtures only. SP-3 does not estimate real vendor PDF accuracy, and SP-4 does not validate real Tally/CSV variants; both remain gated by G-07.

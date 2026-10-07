@@ -12,6 +12,8 @@ _SENSITIVE_NAME = re.compile(
     r"(?:pass(?:word)?|secret|token|authorization|api.?key|access.?key|dsn)", re.I
 )
 _REDACTED = "[REDACTED]"
+# Google API keys and key-bearing query strings, wherever they appear in a value.
+_SENSITIVE_VALUE = re.compile(r"AIza[0-9A-Za-z_\-]{30,}|(?<=[?&]key=)[^&\s\"']+")
 
 
 def redact_sensitive_fields(
@@ -29,6 +31,8 @@ def redact_sensitive_fields(
             }
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             return [redact(item) for item in value]
+        if isinstance(value, str):
+            return _SENSITIVE_VALUE.sub(_REDACTED, value)
         return value
 
     return redact(event_dict)

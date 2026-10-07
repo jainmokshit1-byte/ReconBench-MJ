@@ -11,6 +11,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -19,6 +20,7 @@ from pydantic import (
     StrictInt,
     model_validator,
 )
+from reconbench_core.normalize.gstin import validate_gstin
 from reconbench_core.recon.registry import rules_hash_for_engine
 from sqlalchemy.engine import Engine
 
@@ -27,6 +29,7 @@ from reconbench_app.authorization import ActorContext, requires
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.db.repository import VersionConflict
+from reconbench_app.db.seed_data import DEFAULT_CONFIG
 
 
 def _decimal_string(value: object) -> Decimal:
@@ -163,6 +166,12 @@ class BuyerEntityBody(_ConfigModel):
     gstin: str
     name: str
 
+    @model_validator(mode="after")
+    def validate_gstin_value(self) -> BuyerEntityBody:
+        if not validate_gstin(self.gstin).is_valid:
+            raise ValueError(f"buyer GSTIN {self.gstin!r} has an invalid format or check digit")
+        return self
+
 
 class GstSlabBody(_ConfigModel):
     rate: NonNegativeDecimal
@@ -175,20 +184,55 @@ class PaymentTermBody(_ConfigModel):
     days: int = Field(ge=0)
 
 
+TOLERANCE_CHECKS = frozenset(
+    {
+        "qty_vs_grn",
+        "cum_qty_vs_po",
+        "unit_rate",
+        "total_vs_expected",
+        "arithmetic",
+        "cum_value_vs_po",
+    }
+)
+
+
+def _known_override_checks(
+    tolerances: dict[str, ToleranceValuesBody],
+) -> dict[str, ToleranceValuesBody]:
+    if not tolerances:
+        raise ValueError("an override must set at least one tolerance check")
+    unknown = sorted(set(tolerances) - TOLERANCE_CHECKS)
+    if unknown:
+        raise ValueError(f"unknown tolerance checks in override: {', '.join(unknown)}")
+    return tolerances
+
+
 class VendorOverrideBody(_ConfigModel):
     vendor_id: UUID
-    tolerances: dict[str, ToleranceValuesBody]
+    tolerances: Annotated[dict[str, ToleranceValuesBody], AfterValidator(_known_override_checks)]
 
 
 class ItemOverrideBody(_ConfigModel):
-    item_code: str
+    item_code: Annotated[str, Field(min_length=1, pattern=r"\S")]
     vendor_id: UUID | None
-    tolerances: dict[str, ToleranceValuesBody]
+    tolerances: Annotated[dict[str, ToleranceValuesBody], AfterValidator(_known_override_checks)]
 
 
 class OverridesBody(_ConfigModel):
     vendors: list[VendorOverrideBody]
     items: list[ItemOverrideBody]
+
+    @model_validator(mode="after")
+    def validate_unique_scopes(self) -> OverridesBody:
+        vendor_ids = [str(item.vendor_id) for item in self.vendors]
+        if len(vendor_ids) != len(set(vendor_ids)):
+            raise ValueError("each vendor may have only one tolerance override")
+        item_scopes = [
+            (item.item_code.casefold().strip(), str(item.vendor_id)) for item in self.items
+        ]
+        if len(item_scopes) != len(set(item_scopes)):
+            raise ValueError("each item code and vendor scope may have only one override")
+        return self
 
 
 class EngineBody(_ConfigModel):
@@ -277,6 +321,10 @@ class ConfigurationResponse(_ConfigModel):
     body_hash: str
     created_at: datetime
     change_note: str | None
+    defaults: dict[str, Any] = Field(
+        default_factory=lambda: cast(dict[str, Any], DEFAULT_CONFIG),
+        description="Selected P0 default body (Schema §10.2) for comparison and reset in Settings.",
+    )
 
 
 class ReasonCodeItem(_ConfigModel):

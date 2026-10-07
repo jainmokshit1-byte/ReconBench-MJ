@@ -221,6 +221,10 @@ def _context_hash(context: Mapping[str, Any]) -> str:
 def _context_value(value: Any) -> Any:
     if isinstance(value, UUID):
         return str(value)
+    # Filter scopes such as a status list only feed the hash, never the seek.
+    if isinstance(value, list | tuple | set | frozenset):
+        items = [_context_value(item) for item in value]
+        return sorted(items, key=str) if isinstance(value, set | frozenset) else items
     return _cursor_value(value)
 
 

@@ -31,7 +31,12 @@ from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.db.seed_data import DEFAULT_CONFIG, REASON_CODES
 from reconbench_app.export_service import ExportService
-from reconbench_app.ingestion import IngestionService, sniff_document_type, sniff_format
+from reconbench_app.ingestion import (
+    PARSER_VERSION,
+    IngestionService,
+    sniff_document_type,
+    sniff_format,
+)
 from reconbench_app.ledger_service import LedgerRebuildService
 from reconbench_app.mapping_service import MappingService
 from reconbench_app.settings import Settings
@@ -314,6 +319,11 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
     with TestClient(app, base_url="https://testserver") as client:
         app.state.file_storage = storage
         client.cookies.set(COOKIE_NAME, "synthetic-session", path="/api/v1")
+        # G-12 tracker: an empty workspace starts at Ingest.
+        empty_workflow = client.get("/api/v1/workflow-status?from=2026-04-01&to=2026-04-30")
+        assert empty_workflow.status_code == 200, empty_workflow.text
+        assert empty_workflow.json()["next_step"] == "ingest"
+        assert not any(step["complete"] for step in empty_workflow.json()["steps"])
         batch_response = client.post(
             "/api/v1/batches",
             json={"label": "Synthetic April 2026"},
@@ -365,6 +375,28 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         assert file_response.status_code == 200
         assert file_response.json()["status"] == "parsed"
         assert file_response.json()["docs_new"] == 1
+
+        with ingestion_engine.begin() as connection:
+            connection.execute(
+                sa.update(metadata.tables["source_file"])
+                .where(metadata.tables["source_file"].c.id == file_id)
+                .values(parser_version="phase4-parser-2")
+            )
+        outdated_file = client.get(f"/api/v1/files/{file_id}")
+        assert outdated_file.json()["retry_available"] is True
+        assert outdated_file.json()["retry_reason"] == "PARSER_VERSION_OUTDATED"
+        reprocess = client.post(
+            f"/api/v1/files/{file_id}/retry",
+            headers={"X-CSRF-Token": "synthetic-csrf"},
+        )
+        assert reprocess.status_code == 202, reprocess.text
+        assert queue.jobs[-1] == ("ingest_file", file_id)
+        service.ingest_file(file_id, job_id=3)
+        service.parse_file(file_id, job_id=4)
+        refreshed_file = client.get(f"/api/v1/files/{file_id}")
+        assert refreshed_file.json()["status"] == "parsed"
+        assert refreshed_file.json()["parser_version"] == PARSER_VERSION
+        assert refreshed_file.json()["retry_available"] is False
 
         documents = client.get(f"/api/v1/documents?batch_id={batch_id}")
         assert documents.status_code == 200
@@ -781,7 +813,11 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             True,
         ]
         assert all(result["lines"] == 1 for result in concurrent_beta_rebuilds)
-        monkeypatch.setattr(job_module, "ProcrastinateJobQueue", lambda _tasks: queue)
+        monkeypatch.setattr(
+            job_module,
+            "ProcrastinateJobQueue",
+            lambda _tasks, **_kwargs: queue,
+        )
         worker_app, _worker_queue = job_module.register_ingestion_tasks(
             settings, ingestion_engine, test_s3_client
         )
@@ -851,7 +887,8 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                              WHERE workspace_id = :workspace_id) AS grni_total
                       FROM v_case_current
                      WHERE workspace_id = :workspace_id
-                       AND invoice_date BETWEEN DATE '2026-04-01' AND DATE '2026-04-30'
+                       AND (invoice_date IS NULL
+                            OR invoice_date BETWEEN DATE '2026-04-01' AND DATE '2026-04-30')
                     """
                     ),
                     {"workspace_id": workspace_id},
@@ -1228,6 +1265,31 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         export_state = client.get(f"/api/v1/exports/{export_id}")
         assert export_state.status_code == 200, export_state.text
         assert export_state.json()["status"] == "ready"
+        workflow_response = client.get("/api/v1/workflow-status?from=2026-04-01&to=2026-04-30")
+        assert workflow_response.status_code == 200, workflow_response.text
+        workflow = workflow_response.json()
+        steps = {step["key"]: step for step in workflow["steps"]}
+        document_table = metadata.tables["document"]
+        with ingestion_engine.connect() as connection:
+            unassigned_documents = connection.scalar(
+                sa.select(sa.func.count())
+                .select_from(document_table)
+                .where(
+                    document_table.c.workspace_id == workspace_id,
+                    document_table.c.withdrawn_at.is_(None),
+                    document_table.c.vendor_id.is_(None),
+                )
+            )
+        assert workflow["run_id"] == str(full_run_id)
+        assert steps["ingest"]["complete"] is True
+        assert steps["map"]["unassigned_documents"] == unassigned_documents
+        assert steps["map"]["complete"] is (unassigned_documents == 0)
+        assert steps["reconcile"]["complete"] is True
+        assert steps["export"]["complete"] is True
+        assert workflow["next_step"] == (None if unassigned_documents == 0 else "map")
+        assert (
+            client.get("/api/v1/workflow-status?from=2026-04-30&to=2026-04-01").status_code == 422
+        )
         with ingestion_engine.connect() as connection:
             export_totals = (
                 connection.execute(
@@ -1239,7 +1301,8 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                            COALESCE(sum(at_risk), 0) AS at_risk_total
                       FROM v_case_current
                      WHERE workspace_id = :workspace_id
-                       AND invoice_date BETWEEN DATE '2026-04-01' AND DATE '2026-04-30'
+                       AND (invoice_date IS NULL
+                            OR invoice_date BETWEEN DATE '2026-04-01' AND DATE '2026-04-30')
                     """
                     ),
                     {"workspace_id": workspace_id},
@@ -1265,10 +1328,14 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                 "Vendor Summary",
             ]
             assert workbook["Summary"]["B4"].value == api_kpis["invoice_count"]
-            assert workbook["Summary"]["B9"].value.startswith("=SUM(")
-            assert cached_workbook["Summary"]["B9"].value == float(export_totals["invoiced_total"])
-            assert cached_workbook["Summary"]["B10"].value == float(export_totals["payable_total"])
-            assert cached_workbook["Summary"]["B11"].value == float(export_totals["at_risk_total"])
+            # Home KPI cards equal the Excel Summary (App Flow, Home).
+            assert workbook["Summary"]["B6"].value == api_kpis["pending_count"]
+            assert workbook["Summary"]["B7"].value == api_kpis["exception_count"]
+            assert workbook["Summary"]["B8"].value == api_kpis["unlinked_count"]
+            assert workbook["Summary"]["B11"].value.startswith("=SUM(")
+            assert cached_workbook["Summary"]["B11"].value == float(export_totals["invoiced_total"])
+            assert cached_workbook["Summary"]["B12"].value == float(export_totals["payable_total"])
+            assert cached_workbook["Summary"]["B13"].value == float(export_totals["at_risk_total"])
             invoice_row = next(
                 row
                 for row in workbook["Invoice Recon"].iter_rows(min_row=2, values_only=True)
@@ -1987,6 +2054,61 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         assert "SYN-PDF-001" in text_row["content"]
         assert text_row["char_count"] == len(text_row["content"])
 
+        source_pdf_details = client.get(f"/api/v1/documents/{pdf_document_id}")
+        original_pdf_version = UUID(source_pdf_details.json()["version"]["id"])
+        corrected_pdf = client.put(
+            f"/api/v1/documents/{pdf_document_id}/correction",
+            json={
+                "doc_no": "SYN-PDF-001-REVIEWED",
+                "lines": [
+                    {
+                        "line_no": 1,
+                        "description": "Reviewer-entered synthetic line",
+                        "quantity": "1",
+                        "rate": "100",
+                        "amount": "100",
+                    }
+                ],
+                "verified": True,
+                "reason": "Synthetic integration check of human review.",
+            },
+            headers={
+                "If-Match": source_pdf_details.headers["etag"],
+                "X-CSRF-Token": "synthetic-csrf",
+            },
+        )
+        assert corrected_pdf.status_code == 200, corrected_pdf.text
+        corrected_details = corrected_pdf.json()
+        corrected_version_id = UUID(corrected_details["version"]["id"])
+        assert corrected_version_id != original_pdf_version
+        assert corrected_details["version"]["extraction_method"] == "manual"
+        assert corrected_details["version"]["needs_verification"] is False
+        assert corrected_details["document"]["doc_no"] == "SYN-PDF-001-REVIEWED"
+        assert corrected_details["lines"][0]["description"] == "Reviewer-entered synthetic line"
+        assert any(
+            item["field_name"] == "description" and item["source"] == "manual"
+            for item in corrected_details["field_evidence"]
+        )
+        with ingestion_engine.connect() as connection:
+            copied_page = connection.execute(
+                sa.select(metadata.tables["document_text"].c.content).where(
+                    metadata.tables["document_text"].c.workspace_id == workspace_id,
+                    metadata.tables["document_text"].c.document_version_id == corrected_version_id,
+                    metadata.tables["document_text"].c.page == 1,
+                )
+            ).scalar_one()
+        assert "SYN-PDF-001" in copied_page
+
+        stale_review = client.put(
+            f"/api/v1/documents/{pdf_document_id}/correction",
+            json={"verified": True},
+            headers={
+                "If-Match": source_pdf_details.headers["etag"],
+                "X-CSRF-Token": "synthetic-csrf",
+            },
+        )
+        assert stale_review.status_code == 409
+
         shell_content = _scanned_pdf_bytes()
         shell_upload = client.post(
             f"/api/v1/files?batch_id={pdf_batch_id}&zone=invoice",
@@ -2006,7 +2128,19 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         assert queued_shell.status_code == 202, queued_shell.text
         service.ingest_file(shell_file_id, job_id=17)
         service.parse_file(shell_file_id, job_id=18)
-        assert client.get(f"/api/v1/files/{shell_file_id}").json()["status"] == "parsed"
+        shell_file = client.get(f"/api/v1/files/{shell_file_id}")
+        assert shell_file.json()["status"] == "partial"
+        assert shell_file.json()["retry_available"] is True
+        shell_errors = client.get(f"/api/v1/files/{shell_file_id}/errors")
+        assert shell_errors.status_code == 200
+        shell_warning_rows = [json.loads(line) for line in shell_errors.text.splitlines()]
+        assert any(row["error_code"] == "NO_TEXT_LAYER" for row in shell_warning_rows)
+        retry_shell = client.post(
+            f"/api/v1/files/{shell_file_id}/retry",
+            headers={"X-CSRF-Token": "synthetic-csrf"},
+        )
+        assert retry_shell.status_code == 202, retry_shell.text
+        assert retry_shell.json()["status"] == "queued"
         with ingestion_engine.connect() as connection:
             shell_document = (
                 connection.execute(
@@ -2031,6 +2165,60 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             )
         assert shell_version["needs_verification"] is True
         assert "NO_TEXT_LAYER" in shell_version["verification_reasons"]
+
+        unreadable_pdf = b"%PDF-1.4\nThis is not a readable PDF body."
+        unreadable_upload = client.post(
+            f"/api/v1/files?batch_id={pdf_batch_id}&zone=invoice",
+            content=unreadable_pdf,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-File-Name": "unreadable-invoice.pdf",
+                "X-CSRF-Token": "synthetic-csrf",
+            },
+        )
+        assert unreadable_upload.status_code == 201, unreadable_upload.text
+        unreadable_file_id = UUID(unreadable_upload.json()["file_id"])
+        queued_unreadable = client.post(
+            f"/api/v1/batches/{pdf_batch_id}/process",
+            headers={"X-CSRF-Token": "synthetic-csrf"},
+        )
+        assert queued_unreadable.status_code == 202, queued_unreadable.text
+        service.ingest_file(unreadable_file_id, job_id=31)
+        service.parse_file(unreadable_file_id, job_id=32)
+        source_documents = client.get(
+            f"/api/v1/documents?batch_id={pdf_batch_id}&source_file_id={unreadable_file_id}"
+        )
+        assert source_documents.json() == []
+        manual_entry = client.post(
+            f"/api/v1/files/{unreadable_file_id}/manual-invoice",
+            json={
+                "doc_no": "MANUAL-SYN-001",
+                "vendor_name": "Synthetic Manual Vendor",
+                "grand_total": "118.00",
+                "lines": [
+                    {
+                        "line_no": 1,
+                        "description": "Manual entry test item",
+                        "quantity": "1",
+                        "rate": "100.00",
+                        "amount": "100.00",
+                    }
+                ],
+                "verified": True,
+                "reason": "Synthetic manual-entry integration test.",
+            },
+            headers={"X-CSRF-Token": "synthetic-csrf"},
+        )
+        assert manual_entry.status_code == 201, manual_entry.text
+        manual_details = manual_entry.json()
+        assert manual_details["version"]["extraction_method"] == "manual"
+        assert manual_details["version"]["needs_verification"] is False
+        assert manual_details["version"]["doc_no"] == "MANUAL-SYN-001"
+        assert manual_details["lines"][0]["description"] == "Manual entry test item"
+        assert all(item["source"] == "manual" for item in manual_details["field_evidence"])
+        updated_unreadable = client.get(f"/api/v1/files/{unreadable_file_id}").json()
+        assert updated_unreadable["status"] == "parsed"
+        assert updated_unreadable["docs_found"] == 1
 
         mapping_batch_response = client.post(
             "/api/v1/batches",
@@ -2098,5 +2286,8 @@ def test_content_sniffing_and_zip_path_guards_use_bytes_and_archive_names() -> N
     assert sniff_format(b"%PDF-1.7\n").value == "pdf"
     assert sniff_format(b"PK\x03\x04\x00").value == "zip"
     assert sniff_format(b"\xef\xbb\xbf<root/>").value == "xml"
+    assert sniff_format("<root/>".encode("utf-16")).value == "xml"
+    assert sniff_format(b"\xfe\xff" + "<root/>".encode("utf-16-be")).value == "xml"
+    assert sniff_format("<root/>".encode("utf-16-le")).value == "xml"
     assert sniff_format(b"Invoice No,Date\nA-1,2026-04-01\n").value == "csv"
     assert sniff_document_type(_CSV, FileFormat.CSV).value == "invoice"

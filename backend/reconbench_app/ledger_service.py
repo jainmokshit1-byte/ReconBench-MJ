@@ -22,6 +22,14 @@ from reconbench_app.db.metadata import metadata
 from reconbench_app.mapping_service import MappingService, _make_document
 
 _ACTIVE_LINK_STATES = ("auto", "suggested", "confirmed")
+
+
+def _deterministic_link(link: sa.Table) -> sa.ColumnElement[bool]:
+    """An AI suggestion awaiting a person never feeds balances or verdicts (SCN-20)."""
+
+    return sa.not_(sa.and_(link.c.ai_suggested, link.c.state == "suggested"))
+
+
 _SCOPE_PRIORITY = sa.case(
     (metadata.tables["dirty_scope"].c.scope_kind == "vendor", 0),
     (metadata.tables["dirty_scope"].c.scope_kind == "po", 1),
@@ -350,6 +358,7 @@ class LedgerRebuildService:
                     pointer.c.to_document_id == po_document_id,
                     pointer.c.link_type.in_(("inv_po", "grn_po")),
                     link.c.state.in_(_ACTIVE_LINK_STATES),
+                    _deterministic_link(link),
                 )
                 .order_by(link.c.from_document_id, link.c.from_line_no, link.c.id)
             ).mappings()
@@ -642,6 +651,7 @@ class LedgerRebuildService:
                 pointer.c.from_document_id == invoice_id,
                 pointer.c.link_type == "inv_po",
                 link.c.state.in_(_ACTIVE_LINK_STATES),
+                _deterministic_link(link),
             )
         ).all()
         return {cast(UUID, item) for item in rows}

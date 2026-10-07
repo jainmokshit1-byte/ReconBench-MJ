@@ -1,6 +1,191 @@
 {
   "components": {
     "schemas": {
+      "AiSettingsUpdate": {
+        "additionalProperties": false,
+        "description": "Every field is optional; the key is write-only and never echoed.",
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "format": "password",
+                "type": "string",
+                "writeOnly": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "auto_accept_ai_links": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Accept Ai Links"
+          },
+          "budget_cap_usd": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,8}|(?=[\\d.]{1,13}0*$)\\d{0,8}\\.\\d{0,4}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Cap Usd"
+          },
+          "consent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConsentAcceptance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key_storage": {
+            "anyOf": [
+              {
+                "enum": [
+                  "session",
+                  "saved"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Storage"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "rules_only",
+                  "ai_assisted",
+                  "ai_first"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "const": "gemini",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "redaction_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redaction Enabled"
+          },
+          "vision": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vision"
+          },
+          "withdraw_consent": {
+            "default": false,
+            "title": "Withdraw Consent",
+            "type": "boolean"
+          }
+        },
+        "title": "AiSettingsUpdate",
+        "type": "object"
+      },
+      "AiSuggestionRefBody": {
+        "additionalProperties": false,
+        "description": "Marks a corrected value as taken from an H1 suggestion (it must still match).",
+        "properties": {
+          "ai_call_id": {
+            "format": "uuid",
+            "title": "Ai Call Id",
+            "type": "string"
+          },
+          "field": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Field",
+            "type": "string"
+          },
+          "line_no": {
+            "anyOf": [
+              {
+                "maximum": 10000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line No"
+          },
+          "scope": {
+            "enum": [
+              "header",
+              "line"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ai_call_id",
+          "scope",
+          "field"
+        ],
+        "title": "AiSuggestionRefBody",
+        "type": "object"
+      },
       "AlignWeightsBody": {
         "additionalProperties": false,
         "properties": {
@@ -783,6 +968,12 @@
             "title": "Created At",
             "type": "string"
           },
+          "defaults": {
+            "additionalProperties": true,
+            "description": "Selected P0 default body (Schema \u00a710.2) for comparison and reset in Settings.",
+            "title": "Defaults",
+            "type": "object"
+          },
           "engine_hash": {
             "title": "Engine Hash",
             "type": "string"
@@ -807,6 +998,27 @@
           "change_note"
         ],
         "title": "ConfigurationResponse",
+        "type": "object"
+      },
+      "ConsentAcceptance": {
+        "additionalProperties": false,
+        "properties": {
+          "accept": {
+            "const": true,
+            "title": "Accept",
+            "type": "boolean"
+          },
+          "fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "accept",
+          "fingerprint"
+        ],
+        "title": "ConsentAcceptance",
         "type": "object"
       },
       "CreateExportBody": {
@@ -1047,10 +1259,421 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "InvoiceCorrectionBody": {
+        "additionalProperties": false,
+        "properties": {
+          "ai_suggestion_refs": {
+            "items": {
+              "$ref": "#/components/schemas/AiSuggestionRefBody"
+            },
+            "maxItems": 200,
+            "title": "Ai Suggestion Refs",
+            "type": "array"
+          },
+          "buyer_gstin": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Buyer Gstin"
+          },
+          "cgst": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,16}|(?=[\\d.]{1,19}0*$)\\d{0,16}\\.\\d{0,2}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgst"
+          },
+          "challan_no": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Challan No"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "maxLength": 3,
+                "minLength": 3,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "doc_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Date"
+          },
+          "doc_no": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc No"
+          },
+          "e_way_bill_no": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "E Way Bill No"
+          },
+          "grand_total": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,16}|(?=[\\d.]{1,19}0*$)\\d{0,16}\\.\\d{0,2}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grand Total"
+          },
+          "grn_refs": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grn Refs"
+          },
+          "igst": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,16}|(?=[\\d.]{1,19}0*$)\\d{0,16}\\.\\d{0,2}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Igst"
+          },
+          "irn": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Irn"
+          },
+          "lines": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/InvoiceLineCorrection"
+                },
+                "maxItems": 500,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lines"
+          },
+          "place_of_supply": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Place Of Supply"
+          },
+          "po_refs": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Po Refs"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "round_off": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,16}|(?=[\\d.]{1,19}0*$)\\d{0,16}\\.\\d{0,2}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round Off"
+          },
+          "sgst": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,16}|(?=[\\d.]{1,19}0*$)\\d{0,16}\\.\\d{0,2}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sgst"
+          },
+          "taxable_total": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,16}|(?=[\\d.]{1,19}0*$)\\d{0,16}\\.\\d{0,2}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taxable Total"
+          },
+          "vendor_gstin": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vendor Gstin"
+          },
+          "vendor_name": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vendor Name"
+          },
+          "verified": {
+            "default": false,
+            "title": "Verified",
+            "type": "boolean"
+          }
+        },
+        "title": "InvoiceCorrectionBody",
+        "type": "object"
+      },
+      "InvoiceLineCorrection": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,16}|(?=[\\d.]{1,19}0*$)\\d{0,16}\\.\\d{0,2}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "hsn_sac": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hsn Sac"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "item_code": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Code"
+          },
+          "line_no": {
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Line No",
+            "type": "integer"
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,14}|(?=[\\d.]{1,19}0*$)\\d{0,14}\\.\\d{0,4}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quantity"
+          },
+          "rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,14}|(?=[\\d.]{1,19}0*$)\\d{0,14}\\.\\d{0,4}0*$)",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate"
+          },
+          "uom": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uom"
+          }
+        },
+        "required": [
+          "line_no"
+        ],
+        "title": "InvoiceLineCorrection",
+        "type": "object"
+      },
       "ItemOverrideBody": {
         "additionalProperties": false,
         "properties": {
           "item_code": {
+            "minLength": 1,
+            "pattern": "\\S",
             "title": "Item Code",
             "type": "string"
           },
@@ -1732,6 +2355,21 @@
           "items"
         ],
         "title": "OverridesBody",
+        "type": "object"
+      },
+      "PageSplitDecision": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "pattern": "^(accept_split|keep_one)$",
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "PageSplitDecision",
         "type": "object"
       },
       "PaymentTermBody": {
@@ -2704,6 +3342,46 @@
         "title": "VendorAliasBody",
         "type": "object"
       },
+      "VendorCreateBody": {
+        "additionalProperties": false,
+        "properties": {
+          "gstin": {
+            "anyOf": [
+              {
+                "maxLength": 20,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gstin"
+          },
+          "name": {
+            "maxLength": 300,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "pan": {
+            "anyOf": [
+              {
+                "maxLength": 10,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pan"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "VendorCreateBody",
+        "type": "object"
+      },
       "VendorMergeBody": {
         "additionalProperties": false,
         "properties": {
@@ -2740,6 +3418,22 @@
           "tolerances"
         ],
         "title": "VendorOverrideBody",
+        "type": "object"
+      },
+      "VendorRenameBody": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 300,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "VendorRenameBody",
         "type": "object"
       },
       "WeightsBody": {
@@ -2788,6 +3482,236 @@
         ]
       }
     },
+    "/api/v1/ai/consent-preview": {
+      "get": {
+        "description": "Consent text, per-hook data list and fingerprint for settings not yet saved.\n\n``vision=true`` previews the consent with page images on (the vision reader\nreplaces PDF text suggestions).",
+        "operationId": "get_ai_consent_preview_api_v1_ai_consent_preview_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "mode",
+            "required": true,
+            "schema": {
+              "enum": [
+                "ai_assisted",
+                "ai_first"
+              ],
+              "title": "Mode",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "title": "Model",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "vision",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Vision",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Ai Consent Preview",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      }
+    },
+    "/api/v1/ai/key": {
+      "delete": {
+        "operationId": "delete_ai_key_api_v1_ai_key_delete",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Delete Ai Key",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      }
+    },
+    "/api/v1/ai/requests/{request_id}": {
+      "get": {
+        "operationId": "get_ai_request_api_v1_ai_requests__request_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Ai Request",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      }
+    },
+    "/api/v1/ai/requests/{request_id}/acknowledge": {
+      "post": {
+        "description": "Accept an uncertain (possibly billed) call; this allows exactly one new attempt.",
+        "operationId": "acknowledge_ai_request_api_v1_ai_requests__request_id__acknowledge_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acknowledge Ai Request",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      }
+    },
+    "/api/v1/ai/settings": {
+      "get": {
+        "description": "Masked settings: the key itself is never returned, only a four-character hint.",
+        "operationId": "get_ai_settings_api_v1_ai_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Ai Settings",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      },
+      "put": {
+        "operationId": "put_ai_settings_api_v1_ai_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AiSettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Ai Settings",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      }
+    },
     "/api/v1/ai/test": {
       "post": {
         "description": "Run bounded local fixtures; this endpoint never calls an external provider.",
@@ -2803,6 +3727,47 @@
           }
         },
         "summary": "Test Ai Guardrails",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      }
+    },
+    "/api/v1/ai/test/provider": {
+      "post": {
+        "description": "Queue one synthetic-fixture call; the AI worker sends it if the gate allows.",
+        "operationId": "test_ai_provider_api_v1_ai_test_provider_post",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Test Ai Provider",
+        "tags": [
+          "API v1",
+          "AI"
+        ]
+      }
+    },
+    "/api/v1/ai/usage": {
+      "get": {
+        "operationId": "get_ai_usage_api_v1_ai_usage_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Ai Usage",
         "tags": [
           "API v1",
           "AI"
@@ -3899,6 +4864,49 @@
         ]
       }
     },
+    "/api/v1/documents/{document_id}/ai-suggestions": {
+      "get": {
+        "description": "Advisory H1 or vision (page-image) suggestions, checked again; never applied here.",
+        "operationId": "get_document_ai_suggestions_api_v1_documents__document_id__ai_suggestions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Document Ai Suggestions",
+        "tags": [
+          "API v1",
+          "Documents"
+        ]
+      }
+    },
     "/api/v1/documents/{document_id}/assign-vendor": {
       "post": {
         "operationId": "assign_vendor_api_v1_documents__document_id__assign_vendor_post",
@@ -3948,6 +4956,58 @@
         "tags": [
           "API v1",
           "Mapping"
+        ]
+      }
+    },
+    "/api/v1/documents/{document_id}/correction": {
+      "put": {
+        "operationId": "correct_invoice_document_api_v1_documents__document_id__correction_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvoiceCorrectionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Correct Invoice Document",
+        "tags": [
+          "API v1",
+          "Documents"
         ]
       }
     },
@@ -4709,6 +5769,95 @@
         ]
       }
     },
+    "/api/v1/files/{file_id}/page-split": {
+      "post": {
+        "description": "Accept a PDF's proposed split into documents, or keep it as one document.",
+        "operationId": "resolve_page_split_api_v1_files__file_id__page_split_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "File Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PageSplitDecision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Precondition Required"
+          }
+        },
+        "summary": "Resolve Page Split",
+        "tags": [
+          "API v1",
+          "Ingestion"
+        ]
+      }
+    },
     "/api/v1/files/{file_id}/retry": {
       "post": {
         "operationId": "retry_file_api_v1_files__file_id__retry_post",
@@ -4748,6 +5897,58 @@
         "tags": [
           "API v1",
           "Ingestion"
+        ]
+      }
+    },
+    "/api/v1/files/{source_file_id}/manual-invoice": {
+      "post": {
+        "operationId": "create_manual_invoice_api_v1_files__source_file_id__manual_invoice_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_file_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Source File Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvoiceCorrectionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Manual Invoice",
+        "tags": [
+          "API v1",
+          "Documents"
         ]
       }
     },
@@ -5474,6 +6675,45 @@
           "API v1",
           "Mapping"
         ]
+      },
+      "post": {
+        "description": "Create a vendor by hand, e.g. an unregistered supplier without a GSTIN (AC-4).",
+        "operationId": "post_vendor_api_v1_vendors_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VendorCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Vendor",
+        "tags": [
+          "API v1",
+          "Mapping"
+        ]
       }
     },
     "/api/v1/vendors/unassigned/documents": {
@@ -5561,6 +6801,73 @@
           }
         },
         "summary": "Get Vendor",
+        "tags": [
+          "API v1",
+          "Mapping"
+        ]
+      },
+      "patch": {
+        "description": "Set the vendor's display name; automatic resolution never replaces it.",
+        "operationId": "patch_vendor_api_v1_vendors__vendor_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vendor_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Vendor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VendorRenameBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Vendor",
         "tags": [
           "API v1",
           "Mapping"
@@ -5675,6 +6982,58 @@
         "tags": [
           "API v1",
           "Mapping"
+        ]
+      }
+    },
+    "/api/v1/workflow-status": {
+      "get": {
+        "operationId": "get_workflow_status_api_v1_workflow_status_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "from",
+            "required": true,
+            "schema": {
+              "format": "date",
+              "title": "From",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": true,
+            "schema": {
+              "format": "date",
+              "title": "To",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Workflow Status",
+        "tags": [
+          "API v1",
+          "Reconciliation"
         ]
       }
     },

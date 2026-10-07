@@ -97,9 +97,9 @@ def test_workbook_readback_checks_formulas_cached_values_and_text_safety(tmp_pat
         assert formulas["Invoice Recon"].freeze_panes == "A2"
         assert values["Invoice Recon"]["K2"].value == 210
         assert values["Invoice Recon"]["P2"].value == 20
-        assert values["Summary"]["B9"].value == 210
-        assert values["Summary"]["B10"].value == 180
-        assert values["Summary"]["B11"].value == 20
+        assert values["Summary"]["B11"].value == 210
+        assert values["Summary"]["B12"].value == 180
+        assert values["Summary"]["B13"].value == 20
     finally:
         formulas.close()
         values.close()
@@ -137,13 +137,37 @@ def test_workbook_splits_rows_and_summary_formulas_cover_each_invoice_sheet(
             "Vendor Summary 2",
             "Vendor Summary 3",
         ]
-        summary_formula = formulas["Summary"]["B9"].value
+        summary_formula = formulas["Summary"]["B11"].value
         assert "'Invoice Recon'!K2:K2" in summary_formula
         assert "'Invoice Recon 2'!K2:K2" in summary_formula
         assert "'Invoice Recon 3'!K2:K2" in summary_formula
-        assert values["Summary"]["B9"].value == 630
-        assert values["Summary"]["B10"].value == 540
-        assert values["Summary"]["B11"].value == 60
+        assert values["Summary"]["B11"].value == 630
+        assert values["Summary"]["B12"].value == 540
+        assert values["Summary"]["B13"].value == 60
     finally:
         formulas.close()
+        values.close()
+
+
+def test_summary_counts_needs_review_apart_from_exceptions(tmp_path: Path) -> None:
+    vendor_id = uuid4()
+    needs_review = _case(vendor_id=vendor_id, invoice_no="SCAN-1") | {
+        "effective_status": "needs_review",
+        "status": "needs_review",
+        "reason_codes": ["NO_TEXT_LAYER"],
+    }
+    path = tmp_path / "statuses.xlsx"
+    _write(path, [_case(vendor_id=vendor_id), needs_review], [vendor_id])
+
+    values = load_workbook(path, data_only=True)
+    try:
+        summary = {
+            row[0]: row[1]
+            for row in values["Summary"].iter_rows(min_row=2, max_col=2, values_only=True)
+        }
+        assert summary["Invoices"] == 2
+        assert summary["Exceptions"] == 1
+        assert summary["Needs Review"] == 1
+        assert summary["Duplicate"] == 0
+    finally:
         values.close()

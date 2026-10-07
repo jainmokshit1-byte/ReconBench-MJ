@@ -148,6 +148,28 @@ def test_no_po_candidates_are_marked_unlinked() -> None:
     )
 
 
+def test_common_uom_and_matching_quantity_rate_are_not_product_identity() -> None:
+    invoice = _line(1, "", uom="NOS", quantity="1", rate="500")
+    po = _line(7, "", uom="PCS", quantity="1", rate="500")
+
+    result = align_lines((invoice,), (po,), _config())[0]
+
+    assert result.po_line_no is None
+    assert result.score == Decimal("0.0000")
+    assert result.state is AlignmentState.NOT_ON_PO
+
+
+def test_hsn_and_uom_without_description_or_item_code_remain_review_only() -> None:
+    invoice = _line(1, "", hsn="84717090", uom="NOS")
+    po = _line(7, "", hsn="84717090", uom="PCS")
+
+    result = align_lines((invoice,), (po,), _config())[0]
+
+    assert result.po_line_no == 7
+    assert result.score == Decimal("0.7999")
+    assert result.state is AlignmentState.UNSURE
+
+
 def test_alignment_config_rejects_invalid_weight_and_threshold_order() -> None:
     with pytest.raises(ValueError, match="sum to 1"):
         AlignmentWeights(desc="0.4", code="0.2", hsn="0.2", uom="0.1")

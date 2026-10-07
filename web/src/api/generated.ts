@@ -21,6 +21,104 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/ai/consent-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Ai Consent Preview
+         * @description Consent text, per-hook data list and fingerprint for settings not yet saved.
+         *
+         *     ``vision=true`` previews the consent with page images on (the vision reader
+         *     replaces PDF text suggestions).
+         */
+        get: operations["get_ai_consent_preview_api_v1_ai_consent_preview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Ai Key */
+        delete: operations["delete_ai_key_api_v1_ai_key_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/requests/{request_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Ai Request */
+        get: operations["get_ai_request_api_v1_ai_requests__request_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/requests/{request_id}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Ai Request
+         * @description Accept an uncertain (possibly billed) call; this allows exactly one new attempt.
+         */
+        post: operations["acknowledge_ai_request_api_v1_ai_requests__request_id__acknowledge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Ai Settings
+         * @description Masked settings: the key itself is never returned, only a four-character hint.
+         */
+        get: operations["get_ai_settings_api_v1_ai_settings_get"];
+        /** Put Ai Settings */
+        put: operations["put_ai_settings_api_v1_ai_settings_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/ai/test": {
         parameters: {
             query?: never;
@@ -35,6 +133,43 @@ export interface paths {
          * @description Run bounded local fixtures; this endpoint never calls an external provider.
          */
         post: operations["test_ai_guardrails_api_v1_ai_test_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/test/provider": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test Ai Provider
+         * @description Queue one synthetic-fixture call; the AI worker sends it if the gate allows.
+         */
+        post: operations["test_ai_provider_api_v1_ai_test_provider_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Ai Usage */
+        get: operations["get_ai_usage_api_v1_ai_usage_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -304,6 +439,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/documents/{document_id}/ai-suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Document Ai Suggestions
+         * @description Advisory H1 or vision (page-image) suggestions, checked again; never applied here.
+         */
+        get: operations["get_document_ai_suggestions_api_v1_documents__document_id__ai_suggestions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/documents/{document_id}/assign-vendor": {
         parameters: {
             query?: never;
@@ -315,6 +470,23 @@ export interface paths {
         put?: never;
         /** Assign Vendor */
         post: operations["assign_vendor_api_v1_documents__document_id__assign_vendor_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/documents/{document_id}/correction": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Correct Invoice Document */
+        put: operations["correct_invoice_document_api_v1_documents__document_id__correction_put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -511,6 +683,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/files/{file_id}/page-split": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve Page Split
+         * @description Accept a PDF's proposed split into documents, or keep it as one document.
+         */
+        post: operations["resolve_page_split_api_v1_files__file_id__page_split_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/files/{file_id}/retry": {
         parameters: {
             query?: never;
@@ -522,6 +714,23 @@ export interface paths {
         put?: never;
         /** Retry File */
         post: operations["retry_file_api_v1_files__file_id__retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/files/{source_file_id}/manual-invoice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Manual Invoice */
+        post: operations["create_manual_invoice_api_v1_files__source_file_id__manual_invoice_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -747,7 +956,11 @@ export interface paths {
         /** Get Vendors */
         get: operations["get_vendors_api_v1_vendors_get"];
         put?: never;
-        post?: never;
+        /**
+         * Post Vendor
+         * @description Create a vendor by hand, e.g. an unregistered supplier without a GSTIN (AC-4).
+         */
+        post: operations["post_vendor_api_v1_vendors_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -785,7 +998,11 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Patch Vendor
+         * @description Set the vendor's display name; automatic resolution never replaces it.
+         */
+        patch: operations["patch_vendor_api_v1_vendors__vendor_id__patch"];
         trace?: never;
     };
     "/api/v1/vendors/{vendor_id}/documents": {
@@ -816,6 +1033,23 @@ export interface paths {
         put?: never;
         /** Merge Vendor */
         post: operations["merge_vendor_api_v1_vendors__vendor_id__merge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workflow-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Workflow Status */
+        get: operations["get_workflow_status_api_v1_workflow_status_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -866,6 +1100,56 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AiSettingsUpdate
+         * @description Every field is optional; the key is write-only and never echoed.
+         */
+        AiSettingsUpdate: {
+            /** Api Key */
+            api_key?: string | null;
+            /** Auto Accept Ai Links */
+            auto_accept_ai_links?: boolean | null;
+            /** Budget Cap Usd */
+            budget_cap_usd?: number | string | null;
+            consent?: components["schemas"]["ConsentAcceptance"] | null;
+            /** Key Storage */
+            key_storage?: ("session" | "saved") | null;
+            /** Mode */
+            mode?: ("rules_only" | "ai_assisted" | "ai_first") | null;
+            /** Model */
+            model?: string | null;
+            /** Provider */
+            provider?: "gemini" | null;
+            /** Redaction Enabled */
+            redaction_enabled?: boolean | null;
+            /** Vision */
+            vision?: boolean | null;
+            /**
+             * Withdraw Consent
+             * @default false
+             */
+            withdraw_consent: boolean;
+        };
+        /**
+         * AiSuggestionRefBody
+         * @description Marks a corrected value as taken from an H1 suggestion (it must still match).
+         */
+        AiSuggestionRefBody: {
+            /**
+             * Ai Call Id
+             * Format: uuid
+             */
+            ai_call_id: string;
+            /** Field */
+            field: string;
+            /** Line No */
+            line_no?: number | null;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "header" | "line";
+        };
         /** AlignWeightsBody */
         AlignWeightsBody: {
             /** Code */
@@ -1169,12 +1453,29 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /**
+             * Defaults
+             * @description Selected P0 default body (Schema §10.2) for comparison and reset in Settings.
+             */
+            defaults?: {
+                [key: string]: unknown;
+            };
             /** Engine Hash */
             engine_hash: string;
             /** Rules Hash */
             rules_hash: string;
             /** Seq */
             seq: number;
+        };
+        /** ConsentAcceptance */
+        ConsentAcceptance: {
+            /**
+             * Accept
+             * @constant
+             */
+            accept: true;
+            /** Fingerprint */
+            fingerprint: string;
         };
         /** CreateExportBody */
         CreateExportBody: {
@@ -1249,6 +1550,77 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** InvoiceCorrectionBody */
+        InvoiceCorrectionBody: {
+            /** Ai Suggestion Refs */
+            ai_suggestion_refs?: components["schemas"]["AiSuggestionRefBody"][];
+            /** Buyer Gstin */
+            buyer_gstin?: string | null;
+            /** Cgst */
+            cgst?: number | string | null;
+            /** Challan No */
+            challan_no?: string | null;
+            /** Currency */
+            currency?: string | null;
+            /** Doc Date */
+            doc_date?: string | null;
+            /** Doc No */
+            doc_no?: string | null;
+            /** E Way Bill No */
+            e_way_bill_no?: string | null;
+            /** Grand Total */
+            grand_total?: number | string | null;
+            /** Grn Refs */
+            grn_refs?: string[] | null;
+            /** Igst */
+            igst?: number | string | null;
+            /** Irn */
+            irn?: string | null;
+            /** Lines */
+            lines?: components["schemas"]["InvoiceLineCorrection"][] | null;
+            /** Place Of Supply */
+            place_of_supply?: string | null;
+            /** Po Refs */
+            po_refs?: string[] | null;
+            /** Reason */
+            reason?: string | null;
+            /** Round Off */
+            round_off?: number | string | null;
+            /** Sgst */
+            sgst?: number | string | null;
+            /** Taxable Total */
+            taxable_total?: number | string | null;
+            /** Vendor Gstin */
+            vendor_gstin?: string | null;
+            /** Vendor Name */
+            vendor_name?: string | null;
+            /**
+             * Verified
+             * @default false
+             */
+            verified: boolean;
+        };
+        /** InvoiceLineCorrection */
+        InvoiceLineCorrection: {
+            /** Amount */
+            amount?: number | string | null;
+            /** Description */
+            description?: string | null;
+            /** Hsn Sac */
+            hsn_sac?: string | null;
+            /** Id */
+            id?: string | null;
+            /** Item Code */
+            item_code?: string | null;
+            /** Line No */
+            line_no: number;
+            /** Quantity */
+            quantity?: number | string | null;
+            /** Rate */
+            rate?: number | string | null;
+            /** Uom */
+            uom?: string | null;
         };
         /** ItemOverrideBody */
         ItemOverrideBody: {
@@ -1512,6 +1884,11 @@ export interface components {
             items: components["schemas"]["ItemOverrideBody"][];
             /** Vendors */
             vendors: components["schemas"]["VendorOverrideBody"][];
+        };
+        /** PageSplitDecision */
+        PageSplitDecision: {
+            /** Decision */
+            decision: string;
         };
         /** PaymentTermBody */
         PaymentTermBody: {
@@ -1842,6 +2219,15 @@ export interface components {
              */
             vendor_id: string;
         };
+        /** VendorCreateBody */
+        VendorCreateBody: {
+            /** Gstin */
+            gstin?: string | null;
+            /** Name */
+            name: string;
+            /** Pan */
+            pan?: string | null;
+        };
         /** VendorMergeBody */
         VendorMergeBody: {
             /**
@@ -1861,6 +2247,11 @@ export interface components {
              * Format: uuid
              */
             vendor_id: string;
+        };
+        /** VendorRenameBody */
+        VendorRenameBody: {
+            /** Name */
+            name: string;
         };
         /** WeightsBody */
         WeightsBody: {
@@ -1896,7 +2287,215 @@ export interface operations {
             };
         };
     };
+    get_ai_consent_preview_api_v1_ai_consent_preview_get: {
+        parameters: {
+            query: {
+                mode: "ai_assisted" | "ai_first";
+                model: string;
+                vision?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_ai_key_api_v1_ai_key_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_ai_request_api_v1_ai_requests__request_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acknowledge_ai_request_api_v1_ai_requests__request_id__acknowledge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_ai_settings_api_v1_ai_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    put_ai_settings_api_v1_ai_settings_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AiSettingsUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     test_ai_guardrails_api_v1_ai_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    test_ai_provider_api_v1_ai_test_provider_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_ai_usage_api_v1_ai_usage_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -2616,6 +3215,37 @@ export interface operations {
             };
         };
     };
+    get_document_ai_suggestions_api_v1_documents__document_id__ai_suggestions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     assign_vendor_api_v1_documents__document_id__assign_vendor_post: {
         parameters: {
             query?: never;
@@ -2628,6 +3258,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["AssignVendorBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    correct_invoice_document_api_v1_documents__document_id__correction_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InvoiceCorrectionBody"];
             };
         };
         responses: {
@@ -3154,6 +3819,61 @@ export interface operations {
             };
         };
     };
+    resolve_page_split_api_v1_files__file_id__page_split_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                file_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PageSplitDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Precondition Required */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     retry_file_api_v1_files__file_id__retry_post: {
         parameters: {
             query?: never;
@@ -3167,6 +3887,41 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_manual_invoice_api_v1_files__source_file_id__manual_invoice_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_file_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InvoiceCorrectionBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3655,6 +4410,39 @@ export interface operations {
             };
         };
     };
+    post_vendor_api_v1_vendors_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VendorCreateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_unassigned_documents_api_v1_vendors_unassigned_documents_get: {
         parameters: {
             query?: {
@@ -3696,6 +4484,43 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    patch_vendor_api_v1_vendors__vendor_id__patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string | null;
+            };
+            path: {
+                vendor_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VendorRenameBody"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -3764,6 +4589,38 @@ export interface operations {
                 "application/json": components["schemas"]["VendorMergeBody"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_workflow_status_api_v1_workflow_status_get: {
+        parameters: {
+            query: {
+                from: string;
+                to: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

@@ -94,6 +94,8 @@ describe("Mapping workflow", () => {
       id: invoiceId,
       doc_type: "invoice",
       doc_no: "INV-2026-002",
+      vendor_name: "Acme Components",
+      vendor_gstin: "27AAPFU0939F1ZV",
       doc_date: "2026-04-02",
       grand_total: "236.00",
       currency: "INR",
@@ -113,6 +115,8 @@ describe("Mapping workflow", () => {
           id: poId,
           doc_type: "po",
           doc_no: "PO-2026-001",
+          vendor_name: "Acme Components",
+          vendor_gstin: "27AAPFU0939F1ZV",
           links: [],
         }]) : response(200, [invoice]);
       }
@@ -127,6 +131,9 @@ describe("Mapping workflow", () => {
 
     renderMapping();
     const row = await screen.findByRole("row", { name: /INV-2026-002/ });
+    expect(within(row).getByText("Acme Components")).toBeInTheDocument();
+    expect(within(row).getByText("GSTIN 27AAPFU0939F1ZV")).toBeInTheDocument();
+    expect(within(row).queryByRole("alert")).not.toBeInTheDocument();
     expect(within(row).getByText("Auto")).toBeInTheDocument();
     expect(within(row).getByText(/labeled · 99%/)).toBeInTheDocument();
     fireEvent.click(within(row).getByText("Evidence"));
@@ -188,5 +195,117 @@ describe("Mapping workflow", () => {
       expect.objectContaining({ method: "POST" }),
     ));
     expect(await screen.findByRole("status")).toHaveTextContent(/Vendor assignment saved/);
+  });
+
+  it("shows a warning if a vendor document response contains another supplier identity", async () => {
+    const mismatchedInvoice = {
+      id: invoiceId,
+      doc_type: "invoice",
+      doc_no: "INV-WRONG-VENDOR",
+      vendor_name: "Different Supplier",
+      vendor_gstin: "29AABCU9603R1ZM",
+      doc_date: "2026-04-02",
+      grand_total: "236.00",
+      currency: "INR",
+      source_file_id: "file-mismatched-vendor",
+      vendor_id: vendorId,
+      needs_verification: true,
+      links: [],
+      resolution: { outcome: "unlinked", resolved_step: null, detail_code: null, cited_refs: [], candidates: [] },
+    };
+    installFetch((url, init) => {
+      if (url.pathname === "/api/v1/vendors" && (init.method ?? "GET") === "GET") {
+        return response(200, [vendor]);
+      }
+      if (url.pathname === "/api/v1/vendor-merge-suggestions") return response(200, []);
+      if (url.pathname === `/api/v1/vendors/${vendorId}/documents`) {
+        return response(200, url.searchParams.get("doc_type") === "po" ? [] : [mismatchedInvoice]);
+      }
+      throw new Error(`Unexpected request: ${url.pathname}${url.search}`);
+    });
+
+    renderMapping();
+    const row = await screen.findByRole("row", { name: /INV-WRONG-VENDOR/ });
+    expect(within(row).getByRole("alert")).toHaveTextContent(
+      /supplier identity differs from this vendor group/i,
+    );
+  });
+
+  it("labels AI proposals as advisory and rejects one through the existing unlink", async () => {
+    const aiLink = {
+      id: linkId,
+      version_no: 1,
+      po_document_id: poId,
+      po_no: "PO-2026-001",
+      method: "content",
+      confidence: "0.80",
+      state: "suggested",
+      ai_suggested: true,
+      evidence: "Same laptop model and quantity.",
+      level: "header",
+      line_no: null,
+    };
+    const invoice = {
+      id: invoiceId,
+      doc_type: "invoice",
+      doc_no: "INV-AI-1",
+      vendor_name: "Acme Components",
+      vendor_gstin: "27AAPFU0939F1ZV",
+      doc_date: "2026-04-02",
+      grand_total: "236.00",
+      currency: "INR",
+      source_file_id: "file-synthetic-ai",
+      vendor_id: vendorId,
+      needs_verification: false,
+      links: [aiLink],
+      resolution: { outcome: "unlinked", resolved_step: null, detail_code: "ai_rerank", cited_refs: [], candidates: [] },
+    };
+    const merge = {
+      id: "merge-1",
+      vendor_a_id: vendorId,
+      vendor_b_id: "vendor-synthetic-2",
+      score: "0.91",
+      version: 1,
+      vendor_a_name: "Acme Components",
+      vendor_a_pan: null,
+      vendor_a_gstins: [],
+      vendor_b_name: "Acme Components Pvt Ltd",
+      vendor_b_pan: null,
+      vendor_b_gstins: [],
+      pan_conflict: false,
+      ai_opinion: "same",
+      ai_reason: "Both names share the same registered trade name.",
+    };
+    const patches: Array<Record<string, unknown>> = [];
+    installFetch((url, init) => {
+      const method = init.method ?? "GET";
+      if (url.pathname === "/api/v1/ai/settings") {
+        return response(200, { mode: "ai_assisted", mode_label: "AI-assisted", provider: "gemini", model: "synthetic-model", external_calls: "enabled", status: { code: "NOT_TESTED", label: "Not tested since last change" } });
+      }
+      if (url.pathname === "/api/v1/vendors" && method === "GET") return response(200, [vendor]);
+      if (url.pathname === "/api/v1/vendor-merge-suggestions") return response(200, [merge]);
+      if (url.pathname === `/api/v1/vendors/${vendorId}/documents`) {
+        return response(200, url.searchParams.get("doc_type") === "po" ? [] : [invoice]);
+      }
+      if (url.pathname === `/api/v1/links/${linkId}` && method === "PATCH") {
+        patches.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return response(200, { ...aiLink, state: "rejected" });
+      }
+      throw new Error(`Unexpected request: ${method} ${url.pathname}${url.search}`);
+    });
+
+    renderMapping();
+    expect(await screen.findByRole("note", { name: "AI external sharing notice" })).toHaveTextContent("AI Assist is on: AI-assisted");
+    const row = await screen.findByRole("row", { name: /INV-AI-1/ });
+    expect(within(row).getByText("AI-suggested")).toBeInTheDocument();
+    expect(within(row).getByText(/Not used in reconciliation until a person confirms it/)).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: /Confirm/ })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(screen.getByText(/Likely the same supplier: Both names share the same registered trade name/)).toBeInTheDocument();
+    expect(screen.getByText("AI opinion · advisory")).toBeInTheDocument();
+
+    fireEvent.click(within(row).getByRole("button", { name: /Reject/ }));
+    await waitFor(() => expect(patches).toEqual([{ action: "unlink", to_document_id: null }]));
   });
 });

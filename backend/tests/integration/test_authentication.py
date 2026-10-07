@@ -617,6 +617,10 @@ def test_audit_helper_uses_database_hash_chain_and_append_only_permissions(
 
 
 def test_readyz_is_public_and_has_security_headers(auth_harness: AuthHarness) -> None:
+    with auth_harness.engine.begin() as connection:
+        connection.execute(
+            sa.text("INSERT INTO procrastinate_workers (last_heartbeat) VALUES (now())")
+        )
     response = auth_harness.client.get("/readyz")
     assert response.status_code == 200
     assert response.headers["content-security-policy"] == (

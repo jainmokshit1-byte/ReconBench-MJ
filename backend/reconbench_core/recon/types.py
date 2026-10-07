@@ -44,12 +44,17 @@ class ToleranceValues(FrozenModel):
 
 
 class ToleranceRule(FrozenModel):
-    """Global tolerance with optional vendor and item overrides."""
+    """Global tolerance with optional vendor and item overrides.
+
+    ``by_vendor_item`` keys are ``"<vendor uuid>|<item key>"``; resolution is
+    vendor-scoped item, then item, then vendor, then global (TR-REC-11).
+    """
 
     pct: DecimalValue = Field(ge=0)
     abs: DecimalValue = Field(ge=0)
     by_vendor: dict[str, ToleranceValues] = Field(default_factory=dict)
     by_item: dict[str, ToleranceValues] = Field(default_factory=dict)
+    by_vendor_item: dict[str, ToleranceValues] = Field(default_factory=dict)
 
 
 def _default_tolerances() -> dict[str, ToleranceRule]:

@@ -340,7 +340,14 @@ test("reconciliation runs, filters, loads a single case bundle, shows the ledger
 });
 
 test("Settings changes are versioned, AI stays offline, and reconciliation marks old cases stale", async ({ page }) => {
-  let config = { seq: 1, body: { engine: { tolerances: { limit_mode: "or", unit_rate: { pct: "0.005", abs: "0" } }, synonyms: { po_refs: ["PO No"] }, uom: { aliases: {}, conversions: [] }, buyer_entities: [], gst_slabs: [], payment_terms: [], overrides: { vendors: [], items: [] } } }, engine_hash: "engine-1", rules_hash: "rules-1" };
+  const engineBody = () => ({
+    tolerances: { limit_mode: "or", qty_vs_grn: { pct: "0", abs: "0" }, cum_qty_vs_po: { pct: "0", abs: "0" }, unit_rate: { pct: "0.5", abs: "1" }, total_vs_expected: { pct: "1", abs: "10" }, arithmetic: { pct: "0", abs: "1" }, cum_value_vs_po: { pct: "0", abs: "0" } },
+    thresholds: { extraction_gate: "0.70", link_auto_accept: "0.95", vendor_fuzzy_merge: "0.92", vendor_fuzzy_suggest: "0.80", item_aligned: "0.80", item_review: "0.60", item_single_line_explicit: "0.50", spec_conflict_cap: "0.60", step3_min_score: "0.70", step3_min_lead: "0.10" },
+    policies: { payable_rate_mode: "pay_at_po_rate", date_order_level: "fail", pending_ageing_days: 30, duplicate: { suspect_days: 3, suspect_edit_distance: 2 }, reverse_lookup: { min_canonical_len: 4, window_runs: 6 }, nonexact_tail_min_digits: 4 },
+    synonyms: { po_refs: ["PO No"], grn_refs: [], supplier_invoice_no: [], invoice_no: [], vendor_name: [], buyer: [], quantity: [], rate_amount: [], totals: [], dates: [], tax: [] },
+    uom: { aliases: { PCS: "NOS" }, conversions: [] }, charge_keywords: ["freight"], buyer_entities: [], gst_slabs: [{ rate: "18", from: null, to: null }], payment_terms: [{ label: "Net 30", days: 30 }], overrides: { vendors: [], items: [] },
+  });
+  let config = { seq: 1, body: { engine: engineBody() }, defaults: { engine: engineBody() }, engine_hash: "engine-1", rules_hash: "rules-1" };
   let savedEtag;
   let savedBody;
   let aiResponse;
@@ -385,15 +392,20 @@ test("Settings changes are versioned, AI stays offline, and reconciliation marks
   await page.goto("/settings");
   const tolerance = page.getByLabel("Invoice unit rate vs PO rate percentage tolerance");
   await tolerance.fill("0.01");
-  await page.getByText("Payment terms", { exact: true }).click();
-  const paymentTerms = page.getByLabel("Payment terms JSON");
-  await paymentTerms.fill("invalid json");
+  await expect(page.getByText("Default 0.5")).toBeVisible();
+  await page.getByRole("button", { name: "Add buyer entity" }).click();
+  await page.getByLabel("Buyer entity 1 name").fill("Synthetic Buyer");
+  await page.getByLabel("Buyer entity 1 GSTIN").fill("27AAPFU0939F1ZW");
+  await expect(page.getByText(/check character does not match/).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Save settings" })).toBeDisabled();
-  await paymentTerms.fill('[{"label":"Net 30","days":30}]');
+  await page.getByLabel("Buyer entity 1 GSTIN").fill("27AAPFU0939F1ZV");
+  await page.getByLabel("Payment term 1 days").fill("45");
   await page.getByRole("button", { name: "Save settings" }).click();
-  await expect(page.getByText(/Configuration saved as a new version/)).toBeVisible();
+  await expect(page.getByText(/Configuration saved as version 2/)).toBeVisible();
   expect(savedEtag).toBe('"1"');
-  expect(savedBody.engine.payment_terms).toEqual([{ label: "Net 30", days: 30 }]);
+  expect(savedBody.engine.tolerances.unit_rate).toEqual({ pct: "0.01", abs: "1" });
+  expect(savedBody.engine.buyer_entities).toEqual([{ name: "Synthetic Buyer", gstin: "27AAPFU0939F1ZV" }]);
+  expect(savedBody.engine.payment_terms).toEqual([{ label: "Net 30", days: 45 }]);
 
   await page.getByLabel("Printed vendor alias").fill("Acer Computer Systems");
   await page.getByRole("button", { name: "Add alias" }).click();
@@ -421,6 +433,9 @@ test("Home Next step routes a new workspace to ingestion and the period is expli
       requestedKpis.push(url.searchParams.toString());
       return json(route, { invoice_count: 0, matched_pct: null, pending_count: 0, exception_count: 0, unlinked_count: 0, at_risk_total: "0.00", grni_total: "0.00" });
     }
+    if (path === "/workflow-status") {
+      return json(route, { from: "2026-09-01", to: "2026-09-30", steps: [{ key: "ingest", complete: false, parsed_documents: 0, files_in_progress: 0 }, { key: "map", complete: false, unassigned_documents: 0, suggested_links: 0 }, { key: "reconcile", complete: false, current_cases: 0, stale_cases: 0 }, { key: "export", complete: false }], next_step: "ingest", run_id: null, active_run_id: null });
+    }
     if (path === "/batches") return json(route, []);
     if (path === "/ingestion/client-config") return json(route, { max_file_bytes: 10485760, accepted_extensions: [".pdf", ".xml", ".csv", ".zip"] });
     return json(route, { detail: `Unexpected API request ${request.method()} ${path}` }, 500);
@@ -433,6 +448,39 @@ test("Home Next step routes a new workspace to ingestion and the period is expli
   await page.getByRole("link", { name: /Upload documents/ }).click();
   await expect(page.getByRole("heading", { name: "Ingestion" })).toBeVisible();
   expect(requestedKpis.some((query) => query.includes("from=2026-09-01") && query.includes("to=2026-09-30"))).toBe(true);
+});
+
+test("Home tracker shows G-12 step completion and Next step follows the first incomplete step", async ({ page }) => {
+  const requestedWorkflow = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname.replace("/api/v1", "");
+    if (path === "/auth/me") return json(route, manager);
+    if (path === "/runs?limit=10" || path === "/runs") return json(route, []);
+    if (path === "/kpis") return json(route, { invoice_count: 3, matched_pct: "66.67", pending_count: 0, exception_count: 1, unlinked_count: 0, at_risk_total: "180.00", grni_total: "0.00" });
+    if (path === "/workflow-status") {
+      requestedWorkflow.push(url.searchParams.toString());
+      return json(route, { from: "2026-09-01", to: "2026-09-30", steps: [{ key: "ingest", complete: true, parsed_documents: 7, files_in_progress: 0 }, { key: "map", complete: false, unassigned_documents: 2, suggested_links: 1 }, { key: "reconcile", complete: true, current_cases: 3, stale_cases: 0 }, { key: "export", complete: false }], next_step: "map", run_id: "run-1", active_run_id: null });
+    }
+    if (path.startsWith("/vendors")) return json(route, []);
+    if (path.startsWith("/links")) return json(route, []);
+    if (path === "/ingestion/client-config") return json(route, { max_file_bytes: 10485760, accepted_extensions: [".pdf", ".xml", ".csv", ".zip"] });
+    return json(route, { detail: `Unexpected API request ${request.method()} ${path}` }, 500);
+  });
+
+  await setPeriod(page);
+  await page.goto("/home");
+  const tracker = page.getByRole("list", { name: "Workflow progress" });
+  await expect(page.getByTestId("step-ingest-detail")).toHaveText("Done");
+  await expect(page.getByTestId("step-map-detail")).toHaveText("2 unassigned · 1 suggested link");
+  await expect(page.getByTestId("step-reconcile-detail")).toHaveText("Done");
+  await expect(page.getByTestId("step-export-detail")).toHaveText("No workbook from the latest run");
+  await expect(tracker.locator('[aria-current="step"]')).toContainText("Confirm mapping");
+  await expect(tracker.getByRole("link", { name: /Export workbook/ })).toHaveAttribute("href", "/reconciliation?run_id=run-1");
+  expect(requestedWorkflow.some((query) => query.includes("from=2026-09-01") && query.includes("to=2026-09-30"))).toBe(true);
+  await page.getByRole("link", { name: /Review vendor mapping/ }).click();
+  await expect(page).toHaveURL(/\/mapping$/);
 });
 
 test("a 10,000-row result set stays virtualized while scrolling", async ({ page }) => {

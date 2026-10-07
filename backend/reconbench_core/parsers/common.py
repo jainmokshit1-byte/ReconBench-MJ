@@ -57,6 +57,7 @@ BASE_SYNONYMS: dict[str, tuple[str, ...]] = {
         "DOC DATE",
         "DOCUMENT DATE",
         "INVOICE DATE",
+        "DATED",
         "BILL DATE",
         "VOUCHER DATE",
         "ORDER DATE",
@@ -704,38 +705,68 @@ def build_document(
     return document, tuple(warnings)
 
 
+ArithmeticLine = tuple[int, Decimal | None, Decimal | None, Decimal | None, Decimal | None]
+"""``(line_no, quantity, rate, discount, amount)`` with plain values."""
+
+
+def arithmetic_failures(
+    lines: Sequence[ArithmeticLine],
+    *,
+    taxable_total: Decimal | None,
+    taxes: Sequence[Decimal | None],
+    round_off: Decimal | None,
+    grand_total: Decimal | None,
+) -> tuple[bool, tuple[str, ...]]:
+    """TR-PAR-5 checks on plain values (±₹1): ``(checks_run, failures)``."""
+
+    failures: list[str] = []
+    checks_run = False
+    for line_no, quantity, rate, discount, amount in lines:
+        if quantity is not None and rate is not None and amount is not None:
+            checks_run = True
+            expected = quantity * rate - (discount or Decimal("0"))
+            if abs(expected - amount) > Decimal("1"):
+                failures.append(f"line {line_no} amount")
+
+    amounts = [amount for *_rest, amount in lines if amount is not None]
+    if amounts and taxable_total is not None:
+        checks_run = True
+        if abs(sum(amounts, Decimal("0")) - taxable_total) > Decimal("1"):
+            failures.append("taxable total")
+
+    if grand_total is not None and taxable_total is not None:
+        checks_run = True
+        tax = sum((value for value in taxes if value is not None), Decimal("0"))
+        expected_total = taxable_total + tax + (round_off or Decimal("0"))
+        if abs(expected_total - grand_total) > Decimal("1"):
+            failures.append("grand total")
+    return checks_run, tuple(failures)
+
+
 def _check_extraction_arithmetic(
     header: POHeader | GRNHeader | InvoiceHeader,
     lines: Sequence[DocLine],
     locator: str,
 ) -> tuple[bool, bool, int, tuple[ParseWarning, ...]]:
-    failures: list[str] = []
-    checks_run = False
-    for line in lines:
-        if line.quantity is not None and line.rate is not None and line.amount is not None:
-            checks_run = True
-            discount = line.discount.value if line.discount is not None else Decimal("0")
-            expected = line.quantity.value * line.rate.value - discount
-            if abs(expected - line.amount.value) > Decimal("1"):
-                failures.append(f"line {line.line_no} amount")
+    def plain(field: FieldValue[Decimal] | None) -> Decimal | None:
+        return field.value if field is not None else None
 
-    amounts = [line.amount.value for line in lines if line.amount is not None]
-    if amounts and header.taxable_total is not None:
-        checks_run = True
-        if abs(sum(amounts, Decimal("0")) - header.taxable_total.value) > Decimal("1"):
-            failures.append("taxable total")
-
-    if header.grand_total is not None and header.taxable_total is not None:
-        checks_run = True
-        tax = sum(
-            (field.value for field in (header.cgst, header.sgst, header.igst) if field is not None),
-            Decimal("0"),
-        )
-        round_off = header.round_off.value if header.round_off is not None else Decimal("0")
-        expected_total = header.taxable_total.value + tax + round_off
-        if abs(expected_total - header.grand_total.value) > Decimal("1"):
-            failures.append("grand total")
-
+    checks_run, failures = arithmetic_failures(
+        [
+            (
+                line.line_no,
+                plain(line.quantity),
+                plain(line.rate),
+                plain(line.discount),
+                plain(line.amount),
+            )
+            for line in lines
+        ],
+        taxable_total=plain(header.taxable_total),
+        taxes=[plain(header.cgst), plain(header.sgst), plain(header.igst)],
+        round_off=plain(header.round_off),
+        grand_total=plain(header.grand_total),
+    )
     if not failures:
         return True, checks_run, 0, ()
     message = "Extraction arithmetic did not reconcile: " + ", ".join(failures) + "."

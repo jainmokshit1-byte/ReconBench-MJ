@@ -32,6 +32,8 @@ export interface IngestionFile {
   docs_updated: number;
   docs_skipped: number;
   version: number;
+  retry_available?: boolean;
+  retry_reason?: string | null;
   uploaded_at: string;
 }
 
@@ -91,6 +93,8 @@ function parseFile(value: unknown): IngestionFile | null {
     docs_updated: numberOrZero(value["docs_updated"]),
     docs_skipped: numberOrZero(value["docs_skipped"]),
     version: numberOrZero(value["version"]),
+    retry_available: value["retry_available"] === true,
+    retry_reason: typeof value["retry_reason"] === "string" ? value["retry_reason"] : null,
     uploaded_at: typeof value["uploaded_at"] === "string" ? value["uploaded_at"] : "",
   };
 }
@@ -234,6 +238,17 @@ export async function resolveFileMismatch(fileId: string, acceptSuggested: boole
   });
 }
 
+/** Accept a PDF's proposed split into documents, or keep it as one document of its zone. */
+export async function resolvePageSplit(fileId: string, acceptSplit: boolean, csrfToken: string): Promise<void> {
+  const { etag } = await getFile(fileId);
+  if (!etag) throw new Error("The file version could not be verified. Refresh and try again.");
+  await request(`/files/${encodeURIComponent(fileId)}/page-split`, csrfToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "If-Match": etag },
+    body: JSON.stringify({ decision: acceptSplit ? "accept_split" : "keep_one" }),
+  });
+}
+
 export async function retryFile(fileId: string, csrfToken: string): Promise<void> {
   await request(`/files/${encodeURIComponent(fileId)}/retry`, csrfToken, { method: "POST" });
 }
@@ -277,6 +292,40 @@ export async function listCurrentDocuments(docType?: UploadZone): Promise<Docume
 export async function getDocumentDetails(documentId: string): Promise<DocumentDetails> {
   const value: unknown = await json(await request(`/documents/${encodeURIComponent(documentId)}`, null));
   if (!isRecord(value)) throw new Error("The server returned invalid document details.");
+  return value;
+}
+
+export async function createManualInvoice(
+  sourceFileId: string,
+  invoice: Record<string, unknown>,
+  csrfToken: string,
+): Promise<DocumentDetails> {
+  const response = await request(`/files/${encodeURIComponent(sourceFileId)}/manual-invoice`, csrfToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(invoice),
+  });
+  const value: unknown = await json(response);
+  if (!isRecord(value)) throw new Error("The server returned invalid manually entered invoice details.");
+  return value;
+}
+
+export async function correctInvoiceDocument(
+  documentId: string,
+  version: number,
+  correction: Record<string, unknown>,
+  csrfToken: string,
+): Promise<DocumentDetails> {
+  const response = await request(`/documents/${encodeURIComponent(documentId)}/correction`, csrfToken, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "If-Match": `"${version}"`,
+    },
+    body: JSON.stringify(correction),
+  });
+  const value: unknown = await json(response);
+  if (!isRecord(value)) throw new Error("The server returned invalid corrected invoice details.");
   return value;
 }
 

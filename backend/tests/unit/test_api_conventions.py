@@ -368,3 +368,12 @@ def test_idempotent_job_result_rebuilds_the_same_202_location() -> None:
     assert initial.body == replay.body == b'{"status":"queued","amount":"2.50"}'
     with pytest.raises(ValueError, match="require a durable resource"):
         idempotent_json_response(IdempotentResult(202, {"status": "queued"}))
+
+
+def test_keyset_context_accepts_filter_lists() -> None:
+    from reconbench_app.api.pagination import _context_hash
+
+    empty = _context_hash({"status": [], "workspace_id": uuid4()})
+    assert len(empty) == 64
+    assert _context_hash({"status": ["matched"]}) != _context_hash({"status": ["exception"]})
+    assert _context_hash({"status": ["a", "b"]}) == _context_hash({"status": ["a", "b"]})

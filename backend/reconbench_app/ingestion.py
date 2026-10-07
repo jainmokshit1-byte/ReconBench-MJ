@@ -6,23 +6,26 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import re
 import shutil
 import tempfile
 import time
 import zipfile
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import PurePosixPath
-from typing import Any, BinaryIO, Protocol, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Protocol, cast
 from uuid import UUID
 
 import sqlalchemy as sa
 from botocore.exceptions import BotoCoreError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from reconbench_core.extraction.pages import split_pages
+from reconbench_core.extraction.vision import align_lines as align_vision_lines
 from reconbench_core.normalize import (
     canonicalize_document_number,
     normalize_item_text,
@@ -30,26 +33,47 @@ from reconbench_core.normalize import (
     normalize_vendor_name,
 )
 from reconbench_core.parsers import ParseResult, ParserHints, parse
-from reconbench_core.parsers.types import ParseWarning
+from reconbench_core.parsers.common import arithmetic_failures
+from reconbench_core.parsers.parties import party_hints_from_config
+from reconbench_core.parsers.types import PageSplit, ParseWarning
 from reconbench_core.schema import (
+    DocLine,
     DocType,
     Document,
     ExtractionMethod,
+    FieldEvidence,
+    FieldSource,
     FieldValue,
     FileFormat,
+    InvoiceHeader,
     UploadZone,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 
+from reconbench_app.ai import h1, vision
+from reconbench_app.ai.contracts import (
+    FieldKind,
+    H1Output,
+    InvalidOutput,
+    VisionOutput,
+    typed_value,
+)
+from reconbench_app.ai.limits import AiLimits, LimitsState
+from reconbench_app.ai.validators import GroundedSuggestion, validate_h1
 from reconbench_app.audit import write_audit_event
 from reconbench_app.authorization import ActorContext, requires
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
+from reconbench_app.extraction.vision_pages import vision_pages_isolated
 from reconbench_app.pdf_sandbox import parse_pdf_isolated
 from reconbench_app.storage import ObjectStore
 
-PARSER_VERSION = "phase4-parser-2"
+if TYPE_CHECKING:
+    from reconbench_app.ai.enqueue import AiHookEnqueuer
+
+_LOGGER = logging.getLogger(__name__)
+PARSER_VERSION = "phase4-parser-4"
 _MAX_DISPLAY_NAME = 255
 _READ_CHUNK_BYTES = 64 * 1024
 _CSV_MAPPING_FIELDS = frozenset(
@@ -100,6 +124,56 @@ _CSV_MAPPING_FIELDS = frozenset(
         "po_line_ref",
     }
 )
+# Invoice fields a correction may change, mapped to their ``document_version`` /
+# ``doc_line`` columns. The H1 invoice allowlists in ``ai.contracts`` match these.
+INVOICE_HEADER_COLUMNS: Mapping[str, str] = {
+    "doc_no": "doc_no",
+    "doc_date": "doc_date",
+    "vendor_name": "vendor_name",
+    "vendor_gstin": "vendor_gstin",
+    "buyer_gstin": "buyer_gstin",
+    "currency": "currency",
+    "taxable_total": "taxable_total",
+    "cgst": "cgst_total",
+    "sgst": "sgst_total",
+    "igst": "igst_total",
+    "round_off": "round_off",
+    "grand_total": "grand_total",
+    "po_refs": "po_refs",
+    "grn_refs": "grn_refs",
+    "challan_no": "challan_no",
+    "e_way_bill_no": "e_way_bill_no",
+    "irn": "irn",
+    "place_of_supply": "place_of_supply",
+}
+INVOICE_LINE_COLUMNS: Mapping[str, str] = {
+    "description": "description",
+    "item_code": "item_code",
+    "hsn_sac": "hsn_sac",
+    "uom": "uom_as_read",
+    "quantity": "quantity",
+    "rate": "rate",
+    "amount": "amount",
+}
+_MANUAL_SNIPPET = "Entered by reviewer; not quoted from the PDF source."
+_AI_SNIPPET_LIMIT = 500
+_CORRECTION_QA_CODE = "CORRECTION_QA_FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class AiSuggestionRef:
+    """A correction value the reviewer took from an H1 suggestion."""
+
+    ai_call_id: UUID
+    scope: str
+    line_no: int | None
+    field: str
+
+
+def _parser_refresh_required(file_row: Mapping[str, Any]) -> bool:
+    """Whether a parsed file should be offered a safe re-run with the current parser."""
+
+    return file_row.get("status") == "parsed" and file_row.get("parser_version") != PARSER_VERSION
 
 
 class IngestionLimits(BaseModel):
@@ -174,6 +248,19 @@ def sniff_format(prefix: bytes) -> FileFormat:
         return FileFormat.ZIP
     if probe.startswith(b"<"):
         return FileFormat.XML
+    if probe.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            if probe.decode("utf-16").lstrip().startswith("<"):
+                return FileFormat.XML
+        except UnicodeDecodeError:
+            pass
+    elif probe.startswith(b"<\x00") or probe.startswith(b"\x00<"):
+        encoding = "utf-16-le" if probe.startswith(b"<\x00") else "utf-16-be"
+        try:
+            if probe.decode(encoding).lstrip().startswith("<"):
+                return FileFormat.XML
+        except UnicodeDecodeError:
+            pass
     # CSV is the text-table fallback. The parser validates encoding and structure.
     return FileFormat.CSV
 
@@ -230,11 +317,17 @@ class IngestionService:
         queue: QueuePort,
         *,
         ocr_languages: tuple[str, ...] = ("eng",),
+        einvoice_keys: tuple[Any, ...] = (),
+        ai_hooks: AiHookEnqueuer | None = None,
+        ai_limits: Callable[[], LimitsState] | None = None,
     ) -> None:
         self.engine = engine
         self.object_store = object_store
         self.queue = queue
         self.ocr_languages = ocr_languages
+        self.einvoice_keys = einvoice_keys
+        self.ai_hooks = ai_hooks
+        self.ai_limits = ai_limits or (lambda: LimitsState(AiLimits()))
 
     @requires("data.view")
     def limits(self, workspace_id: UUID) -> IngestionLimits:
@@ -581,9 +674,21 @@ class IngestionService:
             )
             if row is None:
                 raise IngestionFailure("FILE_NOT_FOUND", "The file was not found.")
-            if row["status"] not in {"failed", "partial"}:
+            retryable_pdf_without_text = (
+                row["status"] == "parsed"
+                and row["format"] == FileFormat.PDF.value
+                and file_id in self._pdf_files_without_extracted_text(connection, [file_id])
+            )
+            parser_refresh_required = _parser_refresh_required(row)
+            if (
+                row["status"] not in {"failed", "partial"}
+                and not retryable_pdf_without_text
+                and not parser_refresh_required
+            ):
                 raise IngestionFailure(
-                    "FILE_NOT_RETRYABLE", "Only failed or partial files can be retried."
+                    "FILE_NOT_RETRYABLE",
+                    "Only failed, partial, textless scanned PDF, or outdated parser files "
+                    "can be retried.",
                 )
             connection.execute(
                 sa.update(table)
@@ -605,7 +710,7 @@ class IngestionService:
                 stage="sniffed",
                 outcome="ok",
                 job_id=job_id,
-                detail={"manual_retry": True},
+                detail={"manual_retry": True, "parser_refresh": parser_refresh_required},
             )
         return {"file_id": file_id, "job_id": job_id, "status": "queued"}
 
@@ -842,98 +947,15 @@ class IngestionService:
                     version=source.c.version + 1,
                 )
             )
-            dirty_scopes: set[tuple[str, UUID]] = set()
-            for row in affected:
-                doc_id = cast(UUID, row["id"])
-                live_version = (
-                    connection.execute(
-                        sa.select(document_version)
-                        .select_from(
-                            document_version.join(
-                                source,
-                                sa.and_(
-                                    source.c.workspace_id == document_version.c.workspace_id,
-                                    source.c.id == document_version.c.source_file_id,
-                                ),
-                            )
-                        )
-                        .where(
-                            document_version.c.workspace_id == actor.workspace_id,
-                            document_version.c.document_id == doc_id,
-                            source.c.removed_at.is_(None),
-                        )
-                        .order_by(
-                            document_version.c.revision_rank.desc(), document_version.c.seq.desc()
-                        )
-                        .limit(1)
-                    )
-                    .mappings()
-                    .one_or_none()
-                )
-                if live_version is None:
-                    connection.execute(
-                        sa.update(document)
-                        .where(
-                            document.c.id == doc_id, document.c.workspace_id == actor.workspace_id
-                        )
-                        .values(
-                            current_version_id=None,
-                            withdrawn_at=sa.func.now(),
-                            withdrawn_by=actor.actor_id,
-                            updated_at=sa.func.now(),
-                            input_seq=document.c.input_seq + (1 if row["doc_type"] == "po" else 0),
-                            version=document.c.version + 1,
-                        )
-                    )
-                else:
-                    connection.execute(
-                        sa.update(document)
-                        .where(
-                            document.c.id == doc_id, document.c.workspace_id == actor.workspace_id
-                        )
-                        .values(
-                            current_version_id=live_version["id"],
-                            doc_no=live_version["doc_no"],
-                            canonical_doc_no=live_version["canonical_doc_no"],
-                            doc_date=live_version["doc_date"],
-                            grand_total=live_version["grand_total"],
-                            needs_verification=live_version["needs_verification"],
-                            withdrawn_at=None,
-                            withdrawn_by=None,
-                            updated_at=sa.func.now(),
-                            input_seq=document.c.input_seq + (1 if row["doc_type"] == "po" else 0),
-                            version=document.c.version + 1,
-                        )
-                    )
-                if row["doc_type"] == "po":
-                    dirty_scopes.add(("po", doc_id))
-                _event(
-                    connection,
-                    workspace_id=actor.workspace_id,
-                    file_id=file_id,
-                    document_id=doc_id,
-                    document_version_id=cast(UUID | None, live_version["id"])
-                    if live_version is not None
-                    else None,
-                    stage="gated",
-                    outcome="warn",
-                    detail={
-                        "source_removed": True,
-                        "document_withdrawn": live_version is None,
-                        "current_version_id": str(live_version["id"])
-                        if live_version is not None
-                        else None,
-                    },
-                )
-
-            for scope_kind, scope_id in dirty_scopes:
-                self._mark_dirty_scope(
-                    connection,
-                    workspace_id=actor.workspace_id,
-                    scope_kind=scope_kind,
-                    scope_id=scope_id,
-                    reason="source file removed",
-                )
+            self._settle_documents(
+                connection,
+                workspace_id=actor.workspace_id,
+                actor_id=actor.actor_id,
+                file_id=file_id,
+                rows=affected,
+                exclude_file=False,
+                reason="source file removed",
+            )
             write_audit_event(
                 connection,
                 actor,
@@ -952,6 +974,117 @@ class IngestionService:
                 detail={"soft_deleted": True, "withdrawn_documents": len(affected)},
             )
         return {"file_id": file_id, "status": "removed", "withdrawn_documents": len(affected)}
+
+    def _settle_documents(
+        self,
+        connection: Connection,
+        *,
+        workspace_id: UUID,
+        actor_id: UUID | None,
+        file_id: UUID,
+        rows: Sequence[Mapping[str, Any]],
+        exclude_file: bool,
+        reason: str,
+    ) -> None:
+        """Point each document at its newest live version, or withdraw it.
+
+        A version is live while its file is not removed; with ``exclude_file`` the
+        versions read from ``file_id`` no longer count either (a page split undone).
+        """
+
+        source = metadata.tables["source_file"]
+        document = metadata.tables["document"]
+        document_version = metadata.tables["document_version"]
+        dirty_scopes: set[tuple[str, UUID]] = set()
+        for row in rows:
+            doc_id = cast(UUID, row["id"])
+            conditions = [
+                document_version.c.workspace_id == workspace_id,
+                document_version.c.document_id == doc_id,
+                source.c.removed_at.is_(None),
+            ]
+            if exclude_file:
+                conditions.append(document_version.c.source_file_id != file_id)
+            live_version = (
+                connection.execute(
+                    sa.select(document_version)
+                    .select_from(
+                        document_version.join(
+                            source,
+                            sa.and_(
+                                source.c.workspace_id == document_version.c.workspace_id,
+                                source.c.id == document_version.c.source_file_id,
+                            ),
+                        )
+                    )
+                    .where(*conditions)
+                    .order_by(
+                        document_version.c.revision_rank.desc(), document_version.c.seq.desc()
+                    )
+                    .limit(1)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if live_version is None:
+                connection.execute(
+                    sa.update(document)
+                    .where(document.c.id == doc_id, document.c.workspace_id == workspace_id)
+                    .values(
+                        current_version_id=None,
+                        withdrawn_at=sa.func.now(),
+                        withdrawn_by=actor_id,
+                        updated_at=sa.func.now(),
+                        input_seq=document.c.input_seq + (1 if row["doc_type"] == "po" else 0),
+                        version=document.c.version + 1,
+                    )
+                )
+            else:
+                connection.execute(
+                    sa.update(document)
+                    .where(document.c.id == doc_id, document.c.workspace_id == workspace_id)
+                    .values(
+                        current_version_id=live_version["id"],
+                        doc_no=live_version["doc_no"],
+                        canonical_doc_no=live_version["canonical_doc_no"],
+                        doc_date=live_version["doc_date"],
+                        grand_total=live_version["grand_total"],
+                        needs_verification=live_version["needs_verification"],
+                        withdrawn_at=None,
+                        withdrawn_by=None,
+                        updated_at=sa.func.now(),
+                        input_seq=document.c.input_seq + (1 if row["doc_type"] == "po" else 0),
+                        version=document.c.version + 1,
+                    )
+                )
+            if row["doc_type"] == "po":
+                dirty_scopes.add(("po", doc_id))
+            _event(
+                connection,
+                workspace_id=workspace_id,
+                file_id=file_id,
+                document_id=doc_id,
+                document_version_id=cast(UUID | None, live_version["id"])
+                if live_version is not None
+                else None,
+                stage="gated",
+                outcome="warn",
+                detail={
+                    "source_removed" if not exclude_file else "page_split_undone": True,
+                    "document_withdrawn": live_version is None,
+                    "current_version_id": str(live_version["id"])
+                    if live_version is not None
+                    else None,
+                },
+            )
+        for scope_kind, scope_id in dirty_scopes:
+            self._mark_dirty_scope(
+                connection,
+                workspace_id=workspace_id,
+                scope_kind=scope_kind,
+                scope_id=scope_id,
+                reason=reason,
+            )
 
     @requires("files.upload")
     def ingest_file(self, file_id: UUID, *, job_id: int | None = None) -> None:
@@ -1493,7 +1626,12 @@ class IngestionService:
         content = self._read_object(cast(str, row["object_key"]))
         if row["format"] == FileFormat.PDF.value:
             parser_hints = self._parser_hints(cast(UUID, row["workspace_id"]), row)
-            result = parse_pdf_isolated(content, parser_hints, languages=self.ocr_languages)
+            result = parse_pdf_isolated(
+                content,
+                parser_hints,
+                languages=self.ocr_languages,
+                einvoice_keys=self.einvoice_keys,
+            )
         elif row["zone"] == UploadZone.OPENING_BALANCE.value:
             result = ParseResult(
                 success=False,
@@ -1525,6 +1663,53 @@ class IngestionService:
             self._persist_parse(file_row=row, result=result, duration_ms=duration_ms, job_id=job_id)
         except (BotoCoreError, OSError) as exc:
             raise ObjectStoreUnavailable from exc
+
+    @requires("files.upload")
+    def prepare_vision_pages(
+        self, workspace_id: UUID, version_id: UUID, *, job_id: int | None = None
+    ) -> str:
+        """Render and mask a parsed version's pages, then queue the vision request.
+
+        Runs in the general worker (the PDF sandbox has no network). Returns the
+        outcome for logging: ``queued``, ``skipped`` (no longer ready, eligible or
+        current) or ``failed`` (the pages could not be rendered; a skipped request
+        records why).
+        """
+
+        del job_id
+        hooks = self.ai_hooks
+        if hooks is None:
+            return "skipped"
+        with self.engine.connect() as connection:
+            subject = vision.load_subject(connection, workspace_id, version_id)
+            targets = hooks.vision_targets(connection, workspace_id, [version_id])
+        if subject is None or subject.object_key is None or version_id not in targets:
+            return "skipped"
+        content = self._read_object(subject.object_key)
+        rendered = vision_pages_isolated(content, subject.pages, languages=self.ocr_languages)
+        with self.engine.begin() as connection:
+            current = vision.load_subject(connection, workspace_id, version_id, for_update=True)
+            if current is None or not current.current:
+                return "skipped"
+            if rendered is None or [page.page for page in rendered] != list(subject.pages):
+                hooks.vision_read(
+                    connection,
+                    workspace_id,
+                    version_id,
+                    subject_version=f"failed:{subject.content_hash}",
+                    skip_code=vision.SKIP_PAGES_FAILED,
+                )
+                return "failed"
+            vision.store_pages(connection, workspace_id, version_id, rendered)
+            request_id = hooks.vision_read(
+                connection,
+                workspace_id,
+                version_id,
+                subject_version=vision.fingerprint(rendered),
+            )
+        # No new request (not ready any more, or the same one is already live): the AI
+        # worker's sweep clears image bytes that no live request uses.
+        return "queued" if request_id is not None else "skipped"
 
     def _parser_hints(self, workspace_id: UUID, file_row: Mapping[str, Any]) -> ParserHints:
         body = self._active_config_body(workspace_id)
@@ -1571,6 +1756,8 @@ class IngestionService:
             charge_keywords=tuple(policies) if policies else ParserHints().charge_keywords,
             max_bytes=limits.max_file_bytes,
             max_pages=limits.max_pages,
+            page_split=_page_split_mode(file_row),
+            **(party_hints_from_config(engine_body) if isinstance(engine_body, Mapping) else {}),
         )
 
     def _active_config_body(self, workspace_id: UUID) -> dict[str, Any]:
@@ -1622,7 +1809,7 @@ class IngestionService:
         parse_failed = not result.success or not result.documents
         partial = bool(result.documents) and any(
             warning.level.value == "error"
-            or warning.code in {"RECORD_PARSE_ERROR", "DOC_TYPE_REQUIRED"}
+            or warning.code in {"RECORD_PARSE_ERROR", "DOC_TYPE_REQUIRED", "NO_TEXT_LAYER"}
             for warning in result.warnings
         )
         status = "failed" if parse_failed else "partial" if partial else "parsed"
@@ -1630,6 +1817,7 @@ class IngestionService:
         with self.engine.begin() as connection:
             documents_new = documents_updated = documents_skipped = 0
             document_ids: list[UUID] = []
+            pdf_version_ids: list[UUID] = []
             if not parse_failed:
                 hints = self._parser_hints(workspace_id, file_row)
                 for document in result.documents:
@@ -1659,8 +1847,13 @@ class IngestionService:
                     else:
                         documents_skipped += 1
                     if version_id is not None and outcome != "skipped" and result.page_texts:
+                        if result.file_format is FileFormat.PDF:
+                            pdf_version_ids.append(version_id)
                         text_table = metadata.tables["document_text"]
+                        own_pages = split_pages(document)
                         for page_text in result.page_texts:
+                            if own_pages and page_text.page not in own_pages:
+                                continue
                             connection.execute(
                                 sa.insert(text_table).values(
                                     document_version_id=version_id,
@@ -1675,6 +1868,11 @@ class IngestionService:
                         warning
                         for warning in result.warnings
                         if warning.locator == document.source_locator
+                        or (
+                            len(result.documents) == 1
+                            and warning.locator == "pdf"
+                            and document.source_locator is not None
+                        )
                     ]
                     self._write_warnings(
                         connection,
@@ -1685,6 +1883,13 @@ class IngestionService:
                         document=document,
                         document_version_id=version_id,
                     )
+                self._record_page_split(
+                    connection,
+                    file_row=file_row,
+                    result=result,
+                    document_ids=document_ids,
+                    job_id=job_id,
+                )
                 batch_id = cast(UUID | None, file_row["batch_id"])
                 if batch_id is not None:
                     self._suggest_batch_label(connection, workspace_id, batch_id)
@@ -1708,7 +1913,15 @@ class IngestionService:
                             "The file could not be parsed.",
                         )
                         if parse_failed
-                        else None
+                        # The open "split this file?" question, shown on the file row.
+                        else next(
+                            (
+                                warning.message
+                                for warning in result.warnings
+                                if warning.code == "PAGE_SPLIT_SUGGESTED"
+                            ),
+                            None,
+                        )
                     ),
                     layout_signature=result.layout_signature,
                     parser_version=PARSER_VERSION,
@@ -1775,8 +1988,238 @@ class IngestionService:
             )
             if documents_new or documents_updated:
                 self.queue.enqueue("resolve_vendors", file_id=file_id, connection=connection)
+            self._queue_extraction_suggestions(connection, workspace_id, pdf_version_ids)
         if file_row["parent_file_id"] is not None:
             self._refresh_parent(cast(UUID, file_row["parent_file_id"]))
+
+    def _record_page_split(
+        self,
+        connection: Connection,
+        *,
+        file_row: Mapping[str, Any],
+        result: ParseResult,
+        document_ids: Sequence[UUID],
+        job_id: int | None,
+    ) -> None:
+        """Open the "split this file?" question, or settle an answered one (AC-3, D-9)."""
+
+        workspace_id = cast(UUID, file_row["workspace_id"])
+        file_id = cast(UUID, file_row["id"])
+        if file_row["format"] != FileFormat.PDF.value:
+            return
+        source = metadata.tables["source_file"]
+        warning_table = metadata.tables["document_warning"]
+        document = metadata.tables["document"]
+        document_version = metadata.tables["document_version"]
+        suggested = next(
+            (warning for warning in result.warnings if warning.code == "PAGE_SPLIT_SUGGESTED"),
+            None,
+        )
+        connection.execute(
+            sa.update(warning_table)
+            .where(
+                warning_table.c.workspace_id == workspace_id,
+                warning_table.c.source_file_id == file_id,
+                warning_table.c.code == "PAGE_SPLIT_SUGGESTED",
+                warning_table.c.resolved_at.is_(None),
+            )
+            .values(resolved_at=sa.func.now())
+        )
+        if suggested is not None:
+            groups = [
+                {
+                    "document_id": str(document_id),
+                    "doc_type": parsed.header.doc_type.value,
+                    "pages": list(split_pages(parsed)),
+                    "doc_no": str(parsed.header.doc_no.value) if parsed.header.doc_no else None,
+                }
+                for parsed, document_id in zip(result.documents, document_ids, strict=True)
+            ]
+            connection.execute(
+                sa.insert(warning_table).values(
+                    id=new_id(),
+                    workspace_id=workspace_id,
+                    source_file_id=file_id,
+                    code="PAGE_SPLIT_SUGGESTED",
+                    level="warning",
+                    message=suggested.message,
+                    detail={"zone_uploaded": str(file_row["zone"]), "groups": groups},
+                )
+            )
+            connection.execute(
+                sa.update(source)
+                .where(source.c.workspace_id == workspace_id, source.c.id == file_id)
+                .values(mismatch_state="suggested")
+            )
+            _event(
+                connection,
+                workspace_id=workspace_id,
+                file_id=file_id,
+                stage="gated",
+                outcome="warn",
+                warning_codes=("PAGE_SPLIT_SUGGESTED",),
+                job_id=job_id,
+                detail={"page_split_suggested": True, "documents": len(groups)},
+            )
+            return
+        if str(file_row["mismatch_state"]) not in {"accepted", "kept"}:
+            return
+        # After an answer the file is read again; documents only the earlier
+        # reading produced fall back to their other sources or are withdrawn.
+        conditions = [
+            document.c.workspace_id == workspace_id,
+            document.c.id.in_(
+                sa.select(document_version.c.document_id).where(
+                    document_version.c.workspace_id == workspace_id,
+                    document_version.c.source_file_id == file_id,
+                )
+            ),
+            document.c.withdrawn_at.is_(None),
+        ]
+        if document_ids:
+            conditions.append(document.c.id.not_in(list(document_ids)))
+        stale = (
+            connection.execute(sa.select(document).where(*conditions).with_for_update())
+            .mappings()
+            .all()
+        )
+        if stale:
+            self._settle_documents(
+                connection,
+                workspace_id=workspace_id,
+                actor_id=None,
+                file_id=file_id,
+                rows=stale,
+                exclude_file=True,
+                reason="page split answered",
+            )
+
+    @requires("files.upload")
+    def resolve_page_split(
+        self,
+        actor: ActorContext,
+        file_id: UUID,
+        *,
+        accept: bool,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        """Accept the proposed documents, or keep the file as one document of its zone.
+
+        Either answer reads the file again, so the stored versions carry it.
+        """
+
+        table = metadata.tables["source_file"]
+        warning = metadata.tables["document_warning"]
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    sa.select(table)
+                    .where(
+                        table.c.workspace_id == actor.workspace_id,
+                        table.c.id == file_id,
+                        table.c.removed_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                raise IngestionFailure("FILE_NOT_FOUND", "The file was not found.")
+            if row["version"] != expected_version:
+                raise BatchVersionConflict
+            pending = connection.scalar(
+                sa.select(warning.c.id)
+                .where(
+                    warning.c.workspace_id == actor.workspace_id,
+                    warning.c.source_file_id == file_id,
+                    warning.c.code == "PAGE_SPLIT_SUGGESTED",
+                    warning.c.resolved_at.is_(None),
+                )
+                .limit(1)
+            )
+            if row["mismatch_state"] != "suggested" or pending is None:
+                raise IngestionFailure("PAGE_SPLIT_NOT_PENDING", "No page split is pending.")
+            state = "accepted" if accept else "kept"
+            updated = (
+                connection.execute(
+                    sa.update(table)
+                    .where(table.c.id == file_id)
+                    .values(
+                        mismatch_state=state,
+                        status="queued",
+                        error_code=None,
+                        error_message=None,
+                        version=table.c.version + 1,
+                    )
+                    .returning(*table.c)
+                )
+                .mappings()
+                .one()
+            )
+            connection.execute(
+                sa.update(warning)
+                .where(
+                    warning.c.workspace_id == actor.workspace_id,
+                    warning.c.source_file_id == file_id,
+                    warning.c.code == "PAGE_SPLIT_SUGGESTED",
+                    warning.c.resolved_at.is_(None),
+                )
+                .values(resolved_at=sa.func.now(), resolved_by=actor.actor_id)
+            )
+            job_id = self.queue.enqueue("parse_file", file_id=file_id, connection=connection)
+            write_audit_event(
+                connection,
+                actor,
+                action="file.page_split.resolve",
+                target_type="file",
+                target_id=file_id,
+                before_state={"mismatch_state": "suggested"},
+                after_state={"mismatch_state": state},
+            )
+            _event(
+                connection,
+                workspace_id=actor.workspace_id,
+                file_id=file_id,
+                stage="sniffed",
+                outcome="ok",
+                job_id=job_id,
+                detail={"page_split_resolution": state},
+            )
+        return dict(updated)
+
+    def _queue_extraction_suggestions(
+        self, connection: Connection, workspace_id: UUID, version_ids: Sequence[UUID]
+    ) -> None:
+        """Queue advisory H1 suggestions or vision page preparation; never blocks parsing.
+
+        With page images on for the workspace the vision reader replaces H1 (the
+        consented hook list then has no H1), so at most one of them is queued.
+        """
+
+        if self.ai_hooks is None or not version_ids:
+            return
+        enqueue_vision = getattr(self.queue, "enqueue_vision_pages", None)
+        if enqueue_vision is not None:
+            try:
+                with connection.begin_nested():
+                    for version_id in self.ai_hooks.vision_targets(
+                        connection, workspace_id, version_ids
+                    ):
+                        enqueue_vision(
+                            workspace_id=workspace_id,
+                            document_version_id=version_id,
+                            connection=connection,
+                        )
+            except Exception as exc:  # noqa: BLE001 - AI is optional; rules continue.
+                _LOGGER.warning(
+                    "ai_enqueue_failed hook=h6_vision error_type=%s", type(exc).__name__
+                )
+        try:
+            with connection.begin_nested():
+                self.ai_hooks.extraction_suggestions(connection, workspace_id, version_ids)
+        except Exception as exc:  # noqa: BLE001 - AI is optional; rules continue.
+            _LOGGER.warning("ai_enqueue_failed hook=h1_extract error_type=%s", type(exc).__name__)
 
     @staticmethod
     def _suggest_batch_label(connection: Connection, workspace_id: UUID, batch_id: UUID) -> None:
@@ -1872,18 +2315,7 @@ class IngestionService:
         vendor_identity = _vendor_identity(gstin, vendor_name)
         content_value = document.model_dump(mode="json")
         content_hash = _canonical_hash(content_value)
-        natural_payload: dict[str, Any] = {
-            "type": header.doc_type.value,
-            "vendor_identity": vendor_identity,
-            "canonical_doc_no": canonical_doc_no,
-            "doc_date": doc_date.isoformat() if isinstance(doc_date, date) else None,
-        }
-        if not canonical_doc_no:
-            natural_payload["missing_number_fallback"] = {
-                "source_sha256": file_sha,
-                "locator": document.source_locator,
-            }
-        natural_key = document.natural_key or _canonical_hash(natural_payload)
+        natural_key = document_natural_key(document, file_sha)
         existing = (
             connection.execute(
                 sa.select(document_table)
@@ -1901,12 +2333,60 @@ class IngestionService:
         current_version_id = cast(UUID | None, existing["current_version_id"]) if existing else None
         current_hash = None
         if current_version_id is not None:
-            current_hash = connection.scalar(
-                sa.select(version_table.c.content_hash).where(
-                    version_table.c.workspace_id == workspace_id,
-                    version_table.c.id == current_version_id,
+            current_snapshot = (
+                connection.execute(
+                    sa.select(
+                        version_table.c.content_hash,
+                        version_table.c.extraction_method,
+                        version_table.c.source_file_id,
+                        version_table.c.parser_version,
+                    ).where(
+                        version_table.c.workspace_id == workspace_id,
+                        version_table.c.id == current_version_id,
+                    )
                 )
+                .mappings()
+                .one()
             )
+            current_hash = cast(str, current_snapshot["content_hash"])
+            if (
+                current_snapshot["extraction_method"] == ExtractionMethod.MANUAL.value
+                and current_snapshot["source_file_id"] == file_id
+                and current_snapshot["parser_version"] == parser_version
+            ):
+                _event(
+                    connection,
+                    workspace_id=workspace_id,
+                    file_id=file_id,
+                    document_id=document_id,
+                    document_version_id=current_version_id,
+                    stage="upserted",
+                    outcome="skipped",
+                    parser_version=parser_version,
+                    job_id=job_id,
+                    detail={"outcome": "skipped", "reason": "manual_review_version_preserved"},
+                )
+                return "skipped", document_id, current_version_id
+            if split_pages(document) and current_snapshot["extraction_method"] in {
+                ExtractionMethod.XML_PROFILE.value,
+                ExtractionMethod.CSV_MAPPING.value,
+                ExtractionMethod.MANUAL.value,
+            }:
+                # A bundle page printed from a structured record or a person's entry
+                # never replaces it (accuracy plan AC-3); AC-8 generalises this guard.
+                _event(
+                    connection,
+                    workspace_id=workspace_id,
+                    file_id=file_id,
+                    document_id=document_id,
+                    document_version_id=current_version_id,
+                    stage="upserted",
+                    outcome="skipped",
+                    parser_version=parser_version,
+                    job_id=job_id,
+                    detail={"outcome": "skipped", "reason": "structured_version_preserved"},
+                )
+                return "skipped", document_id, current_version_id
         if current_hash == content_hash:
             if existing is not None and existing["withdrawn_at"] is not None:
                 connection.execute(
@@ -2458,7 +2938,28 @@ class IngestionService:
                 .mappings()
                 .one_or_none()
             )
-        return dict(row) if row is not None else None
+            if row is None:
+                return None
+            file_row = dict(row)
+            retryable_pdf_ids = self._pdf_files_without_extracted_text(connection, [file_id])
+        parser_refresh_required = _parser_refresh_required(file_row)
+        file_row["retry_available"] = (
+            file_row["status"] in {"failed", "partial"}
+            or (parser_refresh_required)
+            or (
+                file_row["status"] == "parsed"
+                and file_row["format"] == FileFormat.PDF.value
+                and file_id in retryable_pdf_ids
+            )
+        )
+        file_row["retry_reason"] = (
+            "PARSER_VERSION_OUTDATED"
+            if parser_refresh_required
+            else "NO_TEXT_LAYER"
+            if file_id in retryable_pdf_ids
+            else None
+        )
+        return file_row
 
     @requires("data.view")
     def list_files(
@@ -2475,7 +2976,62 @@ class IngestionService:
         query = query.order_by(table.c.uploaded_at.desc(), table.c.display_name).limit(limit)
         with self.engine.connect() as connection:
             rows = connection.execute(query).mappings().all()
-        return [dict(row) for row in rows]
+            retryable_pdf_ids = self._pdf_files_without_extracted_text(
+                connection,
+                [
+                    cast(UUID, row["id"])
+                    for row in rows
+                    if row["status"] == "parsed" and row["format"] == FileFormat.PDF.value
+                ],
+            )
+        result_rows: list[dict[str, Any]] = []
+        for row in rows:
+            file_row = dict(row)
+            file_id = cast(UUID, row["id"])
+            parser_refresh_required = _parser_refresh_required(file_row)
+            file_row["retry_available"] = (
+                row["status"] in {"failed", "partial"}
+                or (parser_refresh_required)
+                or (
+                    row["status"] == "parsed"
+                    and row["format"] == FileFormat.PDF.value
+                    and file_id in retryable_pdf_ids
+                )
+            )
+            file_row["retry_reason"] = (
+                "PARSER_VERSION_OUTDATED"
+                if parser_refresh_required
+                else "NO_TEXT_LAYER"
+                if file_id in retryable_pdf_ids
+                else None
+            )
+            result_rows.append(file_row)
+        return result_rows
+
+    @staticmethod
+    def _pdf_files_without_extracted_text(
+        connection: Connection, file_ids: list[UUID]
+    ) -> set[UUID]:
+        if not file_ids:
+            return set()
+        version = metadata.tables["document_version"]
+        document = metadata.tables["document"]
+        document_text = metadata.tables["document_text"]
+        statement = (
+            sa.select(sa.distinct(version.c.source_file_id))
+            .join(document, document.c.current_version_id == version.c.id)
+            .where(
+                version.c.source_file_id.in_(file_ids),
+                version.c.extraction_method == ExtractionMethod.PDF_TEXT.value,
+                ~sa.exists(
+                    sa.select(document_text.c.document_version_id).where(
+                        document_text.c.document_version_id == version.c.id,
+                        document_text.c.char_count > 0,
+                    )
+                ),
+            )
+        )
+        return set(connection.execute(statement).scalars())
 
     @requires("data.view")
     def batch_summary(self, workspace_id: UUID, batch_id: UUID) -> dict[str, Any] | None:
@@ -2683,6 +3239,1225 @@ class IngestionService:
             "processing_log": [dict(row) for row in events],
         }
 
+    @requires("files.upload")
+    def create_manual_invoice(
+        self,
+        actor: ActorContext,
+        source_file_id: UUID,
+        *,
+        header_patch: Mapping[str, Any],
+        lines_patch: list[Mapping[str, Any]],
+        verified: bool,
+        reason: str | None,
+    ) -> dict[str, Any] | None:
+        """Create a reviewer-entered invoice when parsing created no document."""
+
+        source = metadata.tables["source_file"]
+        version_table = metadata.tables["document_version"]
+        document_table = metadata.tables["document"]
+        created_document_id: UUID | None = None
+        with self.engine.begin() as connection:
+            file_row = (
+                connection.execute(
+                    sa.select(source)
+                    .where(
+                        source.c.workspace_id == actor.workspace_id,
+                        source.c.id == source_file_id,
+                        source.c.removed_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if file_row is None:
+                return None
+            if file_row["zone"] != UploadZone.INVOICE.value:
+                raise IngestionFailure(
+                    "MANUAL_INVOICE_ZONE_INVALID", "Manual invoice entry requires an invoice file."
+                )
+            if file_row["status"] in {"queued", "processing"}:
+                raise IngestionFailure(
+                    "MANUAL_INVOICE_PENDING",
+                    "Wait for file processing to finish before manual entry.",
+                )
+
+            existing = (
+                connection.execute(
+                    sa.select(
+                        version_table.c.document_id,
+                        version_table.c.extraction_method,
+                    )
+                    .select_from(
+                        version_table.join(
+                            document_table,
+                            sa.and_(
+                                document_table.c.workspace_id == version_table.c.workspace_id,
+                                document_table.c.id == version_table.c.document_id,
+                            ),
+                        )
+                    )
+                    .where(
+                        version_table.c.workspace_id == actor.workspace_id,
+                        version_table.c.source_file_id == source_file_id,
+                        document_table.c.withdrawn_at.is_(None),
+                    )
+                    .order_by(version_table.c.seq.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is not None:
+                if existing["extraction_method"] != ExtractionMethod.MANUAL.value:
+                    raise BatchVersionConflict(
+                        "A document now exists for this file; edit that document."
+                    )
+                created_document_id = cast(UUID, existing["document_id"])
+            else:
+
+                def manual_value(value: Any) -> FieldValue[Any] | None:
+                    if isinstance(value, str):
+                        value = value.strip()
+                    if value is None or value == "":
+                        return None
+                    return FieldValue(
+                        value=value,
+                        confidence=Decimal("1"),
+                        source=FieldSource.MANUAL,
+                        evidence=FieldEvidence(),
+                    )
+
+                header_values = {
+                    field: value
+                    for field, value in header_patch.items()
+                    if field not in {"po_refs", "grn_refs"}
+                }
+                if "po_refs" in header_patch:
+                    references = tuple(header_patch.get("po_refs") or ())
+                    header_values["po_refs"] = references or None
+                if "grn_refs" in header_patch:
+                    references = tuple(header_patch.get("grn_refs") or ())
+                    header_values["grn_refs"] = references or None
+                if any(row.get("id") is not None for row in lines_patch):
+                    raise IngestionFailure(
+                        "MANUAL_INVOICE_LINE_INVALID",
+                        "New manual invoice lines cannot reference an existing line.",
+                    )
+                line_rows = [
+                    DocLine(
+                        line_no=int(row["line_no"]),
+                        description=manual_value(row.get("description")),
+                        item_code=manual_value(row.get("item_code")),
+                        hsn_sac=manual_value(row.get("hsn_sac")),
+                        uom=manual_value(row.get("uom")),
+                        quantity=manual_value(row.get("quantity")),
+                        rate=manual_value(row.get("rate")),
+                        amount=manual_value(row.get("amount")),
+                    )
+                    for row in lines_patch
+                    if any(
+                        value not in (None, "") for key, value in row.items() if key != "line_no"
+                    )
+                ]
+                invoice_header = InvoiceHeader(
+                    **{
+                        field: manual_value(value)
+                        for field, value in header_values.items()
+                        if field not in {"doc_type", "extras"}
+                    },
+                    extras={},
+                )
+                has_invoice_content = any(
+                    getattr(invoice_header, field) is not None
+                    for field in (
+                        "doc_no",
+                        "doc_date",
+                        "vendor_name",
+                        "vendor_gstin",
+                        "po_refs",
+                        "grn_refs",
+                        "taxable_total",
+                        "grand_total",
+                    )
+                ) or bool(line_rows)
+                if not has_invoice_content:
+                    raise IngestionFailure(
+                        "MANUAL_INVOICE_EMPTY", "Enter at least one invoice field or line item."
+                    )
+                file_hash = cast(str, file_row["sha256"])
+                manual_document = Document(
+                    header=invoice_header,
+                    lines=tuple(line_rows),
+                    natural_key=_canonical_hash(
+                        {"manual_source_file_id": str(source_file_id), "source_sha256": file_hash}
+                    ),
+                    source_locator="manual_invoice_entry",
+                    needs_verification=not verified,
+                )
+                hints = self._parser_hints(actor.workspace_id, file_row)
+                outcome, created_document_id, version_id = self._upsert_document(
+                    connection,
+                    workspace_id=actor.workspace_id,
+                    batch_id=cast(UUID | None, file_row["batch_id"]),
+                    file_id=source_file_id,
+                    actor_id=actor.actor_id,
+                    document=manual_document,
+                    file_sha=file_hash,
+                    job_id=None,
+                    parser_version=PARSER_VERSION,
+                    layout_signature=cast(
+                        str,
+                        file_row["layout_signature"]
+                        or _canonical_hash({"manual_invoice_file": str(source_file_id)}),
+                    ),
+                    extraction_method=ExtractionMethod.MANUAL,
+                    uom_aliases=hints.uom_aliases,
+                    charge_keywords=hints.charge_keywords,
+                )
+                if outcome != "new":
+                    raise BatchVersionConflict("A document already exists for this file.")
+                connection.execute(
+                    sa.update(source)
+                    .where(
+                        source.c.workspace_id == actor.workspace_id,
+                        source.c.id == source_file_id,
+                    )
+                    .values(
+                        status="parsed",
+                        error_code=None,
+                        error_message=None,
+                        parser_version=PARSER_VERSION,
+                        docs_found=1,
+                        docs_new=1,
+                        docs_updated=0,
+                        docs_skipped=0,
+                        parse_finished_at=sa.func.now(),
+                        version=source.c.version + 1,
+                    )
+                )
+                _event(
+                    connection,
+                    workspace_id=actor.workspace_id,
+                    file_id=source_file_id,
+                    document_id=created_document_id,
+                    document_version_id=version_id,
+                    stage="upserted",
+                    outcome="ok" if verified else "warn",
+                    parser_version=PARSER_VERSION,
+                    detail={
+                        "source": "manual",
+                        "verified": verified,
+                        "reason": reason,
+                    },
+                )
+                write_audit_event(
+                    connection,
+                    actor,
+                    action="document.manual_create",
+                    target_type="document",
+                    target_id=created_document_id,
+                    before_state={
+                        "source_file_id": str(source_file_id),
+                        "status": file_row["status"],
+                    },
+                    after_state={
+                        "doc_type": DocType.INVOICE.value,
+                        "extraction_method": ExtractionMethod.MANUAL.value,
+                        "needs_verification": not verified,
+                    },
+                    reason=reason
+                    or "Reviewer entered invoice fields because parsing created no record.",
+                )
+                self.queue.enqueue("resolve_vendors", file_id=source_file_id, connection=connection)
+
+        if created_document_id is not None and file_row["parent_file_id"] is not None:
+            self._refresh_parent(cast(UUID, file_row["parent_file_id"]))
+        return (
+            self.get_document(actor.workspace_id, created_document_id)
+            if created_document_id
+            else None
+        )
+
+    @requires("files.upload")
+    def correct_invoice_document(
+        self,
+        actor: ActorContext,
+        document_id: UUID,
+        *,
+        expected_version: int,
+        header_patch: Mapping[str, Any],
+        lines_patch: list[Mapping[str, Any]] | None,
+        verified: bool,
+        reason: str | None,
+        ai_suggestion_refs: Sequence[AiSuggestionRef] = (),
+    ) -> dict[str, Any] | None:
+        """Append a human-reviewed invoice version and preserve correction evidence.
+
+        Every save runs deterministic arithmetic QA (TR-PAR-5) on the new version
+        and records the result; a failure is flagged as a warning. Values taken
+        from H1 suggestions must still match a currently grounded suggestion; their
+        evidence keeps the quote, page and ``ai_call_id``.
+        """
+
+        document_table = metadata.tables["document"]
+        version_table = metadata.tables["document_version"]
+        line_table = metadata.tables["doc_line"]
+        evidence_table = metadata.tables["field_evidence"]
+        document_text_table = metadata.tables["document_text"]
+        header_columns = INVOICE_HEADER_COLUMNS
+        line_columns = INVOICE_LINE_COLUMNS
+
+        with self.engine.begin() as connection:
+            current_document = (
+                connection.execute(
+                    sa.select(document_table)
+                    .where(
+                        document_table.c.workspace_id == actor.workspace_id,
+                        document_table.c.id == document_id,
+                        document_table.c.withdrawn_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current_document is None:
+                return None
+            if int(current_document["version"]) != expected_version:
+                raise BatchVersionConflict("The document changed after it was loaded.")
+            if current_document["doc_type"] != DocType.INVOICE.value:
+                raise IngestionFailure(
+                    "MANUAL_CORRECTION_UNSUPPORTED",
+                    "Manual field correction is currently enabled for invoices.",
+                )
+            previous_version_id = cast(UUID, current_document["current_version_id"])
+            current_version = (
+                connection.execute(
+                    sa.select(version_table)
+                    .where(
+                        version_table.c.workspace_id == actor.workspace_id,
+                        version_table.c.id == previous_version_id,
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            current_lines = (
+                connection.execute(
+                    sa.select(*line_table.c)
+                    .where(
+                        line_table.c.workspace_id == actor.workspace_id,
+                        line_table.c.document_version_id == previous_version_id,
+                    )
+                    .order_by(line_table.c.line_no)
+                )
+                .mappings()
+                .all()
+            )
+            old_line_by_id = {cast(UUID, row["id"]): dict(row) for row in current_lines}
+            current_line_ids = list(old_line_by_id)
+            old_evidence = (
+                connection.execute(
+                    sa.select(*evidence_table.c).where(
+                        evidence_table.c.workspace_id == actor.workspace_id,
+                        sa.or_(
+                            evidence_table.c.document_version_id == previous_version_id,
+                            evidence_table.c.doc_line_id.in_(current_line_ids)
+                            if current_line_ids
+                            else sa.false(),
+                        ),
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            old_text_pages = (
+                connection.execute(
+                    sa.select(*document_text_table.c).where(
+                        document_text_table.c.workspace_id == actor.workspace_id,
+                        document_text_table.c.document_version_id == previous_version_id,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
+            new_version = dict(current_version)
+            new_version_id = new_id()
+            latest_seq = connection.scalar(
+                sa.select(sa.func.max(version_table.c.seq)).where(
+                    version_table.c.workspace_id == actor.workspace_id,
+                    version_table.c.document_id == document_id,
+                )
+            )
+            new_version.update(
+                id=new_version_id,
+                seq=int(latest_seq or 0) + 1,
+                derived_from_version_id=previous_version_id,
+                created_by=actor.actor_id,
+                extraction_method=ExtractionMethod.MANUAL.value,
+            )
+            new_version.pop("created_at", None)
+
+            normalized_header_patch: dict[str, Any] = {}
+            header_changes: dict[str, tuple[Any, Any]] = {}
+            for field_name, raw_value in header_patch.items():
+                column_name = header_columns.get(field_name)
+                if column_name is None:
+                    raise IngestionFailure(
+                        "MANUAL_CORRECTION_FIELD_INVALID", "An invoice field is not editable."
+                    )
+                if field_name in {"po_refs", "grn_refs"}:
+                    if raw_value is None:
+                        value: Any = []
+                    elif isinstance(raw_value, (tuple, list)):
+                        value = [str(item).strip() for item in raw_value if str(item).strip()]
+                        if len(value) > 50 or any(len(item) > 128 for item in value):
+                            raise IngestionFailure(
+                                "MANUAL_CORRECTION_VALUE_INVALID",
+                                "A reference is too long or there are too many references.",
+                            )
+                    else:
+                        raise IngestionFailure(
+                            "MANUAL_CORRECTION_VALUE_INVALID",
+                            "PO and GRN references must be sent as a list.",
+                        )
+                elif isinstance(raw_value, str):
+                    value = raw_value.strip() or None
+                    if value is not None and len(value) > 1_000:
+                        raise IngestionFailure(
+                            "MANUAL_CORRECTION_VALUE_INVALID", "An invoice value is too long."
+                        )
+                    if field_name == "vendor_gstin" and value is not None:
+                        value = value.upper().replace(" ", "")
+                    if field_name == "currency" and value is not None:
+                        value = value.upper()
+                else:
+                    value = raw_value
+                previous_value = current_version[column_name]
+                if field_name == "po_refs":
+                    previous_value = list(current_version["po_refs"] or [])
+                elif field_name == "grn_refs":
+                    previous_value = list(current_version["grn_refs"] or [])
+                if previous_value != value:
+                    header_changes[field_name] = (previous_value, value)
+                normalized_header_patch[field_name] = value
+                new_version[column_name] = value
+
+            vendor_gstin = new_version.get("vendor_gstin")
+            if "vendor_gstin" in normalized_header_patch:
+                vendor_gstin = vendor_gstin.upper().replace(" ", "") if vendor_gstin else None
+                new_version["vendor_gstin"] = vendor_gstin
+                new_version["vendor_pan"] = (
+                    vendor_gstin[2:12] if vendor_gstin and len(vendor_gstin) == 15 else None
+                )
+                new_version["vendor_state_code"] = (
+                    vendor_gstin[:2] if vendor_gstin and len(vendor_gstin) == 15 else None
+                )
+            if "vendor_name" in normalized_header_patch:
+                name = new_version.get("vendor_name")
+                new_version["vendor_name_norm"] = normalize_vendor_name(name) if name else None
+            if "doc_no" in normalized_header_patch:
+                doc_no = new_version.get("doc_no")
+                new_version["canonical_doc_no"] = (
+                    canonicalize_document_number(doc_no) if doc_no else None
+                )
+            if "po_refs" in normalized_header_patch:
+                new_version["canonical_po_refs"] = [
+                    canonicalize_document_number(ref) for ref in new_version["po_refs"]
+                ]
+            if "grn_refs" in normalized_header_patch:
+                new_version["canonical_grn_refs"] = [
+                    canonicalize_document_number(ref) for ref in new_version["grn_refs"]
+                ]
+
+            old_lines_by_id = old_line_by_id
+            requested_lines = None if lines_patch is None else list(lines_patch)
+            if requested_lines is None:
+                requested_lines = [
+                    {"id": row["id"], "line_no": row["line_no"]} for row in current_lines
+                ]
+            seen_old_ids: set[UUID] = set()
+            seen_line_numbers: set[int] = set()
+            new_lines: list[dict[str, Any]] = []
+            new_line_ids: dict[UUID, UUID] = {}
+            changed_line_fields: dict[UUID, set[str]] = {}
+            changed_line_values: dict[tuple[UUID, str], Any] = {}
+            line_no_by_owner: dict[UUID, int] = {}
+            for supplied in requested_lines:
+                old_id = supplied.get("id")
+                old_row: dict[str, Any] | None = None
+                if old_id is not None:
+                    old_uuid = old_id if isinstance(old_id, UUID) else UUID(str(old_id))
+                    old_row = old_lines_by_id.get(old_uuid)
+                    if old_row is None or old_uuid in seen_old_ids:
+                        raise IngestionFailure(
+                            "MANUAL_CORRECTION_LINE_INVALID",
+                            "A line does not belong to this invoice or is duplicated.",
+                        )
+                    seen_old_ids.add(old_uuid)
+                line_no = int(supplied["line_no"])
+                if line_no < 1 or line_no in seen_line_numbers:
+                    raise IngestionFailure(
+                        "MANUAL_CORRECTION_LINE_INVALID", "Invoice line numbers must be unique."
+                    )
+                seen_line_numbers.add(line_no)
+                row = dict(old_row or {})
+                new_line_id = new_id()
+                row.update(
+                    id=new_line_id,
+                    workspace_id=actor.workspace_id,
+                    document_version_id=new_version_id,
+                    line_no=line_no,
+                )
+                row.setdefault("line_type", "goods")
+                row.setdefault("extras", {})
+                row.setdefault("tokens", [])
+                row.setdefault("spec_tokens", [])
+                change_owner_id = cast(UUID, old_row["id"]) if old_row is not None else new_line_id
+                line_no_by_owner[change_owner_id] = line_no
+                for field_name, column_name in line_columns.items():
+                    if field_name not in supplied:
+                        continue
+                    raw_value = supplied[field_name]
+                    value = raw_value.strip() or None if isinstance(raw_value, str) else raw_value
+                    if isinstance(value, str) and len(value) > 2_000:
+                        raise IngestionFailure(
+                            "MANUAL_CORRECTION_VALUE_INVALID", "An invoice line value is too long."
+                        )
+                    previous_value = old_row.get(column_name) if old_row else None
+                    if field_name == "uom":
+                        previous_value = old_row.get("uom_as_read") if old_row else None
+                    if previous_value != value:
+                        changed_line_fields.setdefault(change_owner_id, set()).add(field_name)
+                        changed_line_values[(change_owner_id, field_name)] = value
+                    if field_name == "uom":
+                        row["uom_as_read"] = value
+                        unit = normalize_uom(value, {}) if value else None
+                        row["uom"] = unit.canonical if unit and unit.is_known else None
+                    else:
+                        row[column_name] = value
+                description = row.get("description")
+                normalized = normalize_item_text(description) if description else None
+                row["description_norm"] = normalized.description if normalized else None
+                row["tokens"] = list(normalized.tokens) if normalized else []
+                row["spec_tokens"] = list(normalized.spec_tokens) if normalized else []
+                new_lines.append(row)
+                if old_row is not None:
+                    new_line_ids[cast(UUID, old_row["id"])] = new_line_id
+                else:
+                    new_line_ids[new_line_id] = new_line_id
+
+            removed_line_ids = (
+                set(old_lines_by_id) - seen_old_ids if lines_patch is not None else set()
+            )
+
+            changed_header_fields = set(header_changes)
+            any_correction = bool(changed_header_fields or changed_line_fields or removed_line_ids)
+            should_verify = verified
+            needs_verification = (
+                not should_verify
+                if any_correction or verified
+                else bool(current_version["needs_verification"])
+            )
+            if verified and not any_correction and not current_version["needs_verification"]:
+                needs_verification = False
+            new_version["needs_verification"] = needs_verification
+            new_version["verification_reasons"] = (
+                []
+                if not needs_verification
+                else list(current_version["verification_reasons"] or [])
+            )
+            extras = dict(new_version.get("extras") or {})
+            extras["manual_review"] = {
+                "actor_id": str(actor.actor_id),
+                "verified": not needs_verification,
+                "reason": reason,
+            }
+            qa = _correction_qa(new_version, new_lines)
+            extras["correction_qa"] = qa
+            new_version["extras"] = extras
+            ai_evidence = self._ai_reference_evidence(
+                connection,
+                actor.workspace_id,
+                current_document,
+                ai_suggestion_refs,
+                new_version=new_version,
+                new_lines=new_lines,
+            )
+
+            def manual_evidence(key: tuple[str, int | None, str]) -> dict[str, Any]:
+                grounded = ai_evidence.get(key)
+                if grounded is None:
+                    return {
+                        "source": "manual",
+                        "confidence": Decimal("1"),
+                        "page": None,
+                        "bbox": None,
+                        "snippet": _MANUAL_SNIPPET,
+                        "ai_call_id": None,
+                    }
+                ai_call_id, suggestion = grounded
+                return {
+                    "source": "manual",
+                    "confidence": Decimal("1"),
+                    "page": suggestion.page,
+                    "bbox": list(suggestion.bbox) if suggestion.bbox is not None else None,
+                    "snippet": suggestion.quote[:_AI_SNIPPET_LIMIT],
+                    "ai_call_id": ai_call_id,
+                }
+
+            version_hash_payload = {
+                "header": {
+                    key: value
+                    for key, value in new_version.items()
+                    if key
+                    not in {
+                        "id",
+                        "workspace_id",
+                        "document_id",
+                        "seq",
+                        "content_hash",
+                        "derived_from_version_id",
+                        "created_by",
+                        "created_at",
+                    }
+                },
+                "lines": [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"id", "workspace_id", "document_version_id"}
+                    }
+                    for row in new_lines
+                ],
+            }
+            new_version["content_hash"] = _canonical_hash(version_hash_payload)
+            connection.execute(sa.insert(version_table).values(**new_version))
+            for old_page in old_text_pages:
+                page = dict(old_page)
+                page["document_version_id"] = new_version_id
+                page.pop("created_at", None)
+                connection.execute(sa.insert(document_text_table).values(**page))
+            for row in new_lines:
+                connection.execute(sa.insert(line_table).values(**row))
+
+            manual_evidence_done: set[tuple[str, UUID | None, str]] = set()
+            header_column_by_field = header_columns
+            for old_item in old_evidence:
+                item = dict(old_item)
+                old_line_id = cast(UUID | None, item["doc_line_id"])
+                if old_line_id is not None:
+                    new_line_id = new_line_ids.get(old_line_id)
+                    if new_line_id is None:
+                        continue
+                    item["doc_line_id"] = new_line_id
+                    item["document_version_id"] = None
+                    changed = item["field_name"] in changed_line_fields.get(old_line_id, set())
+                    if changed:
+                        field_name = str(item["field_name"])
+                        raw_value = changed_line_values.get((old_line_id, field_name))
+                        item.update(
+                            value_text=_field_text(raw_value) if raw_value is not None else None,
+                            **manual_evidence(
+                                ("line", line_no_by_owner.get(old_line_id), field_name)
+                            ),
+                        )
+                        manual_evidence_done.add(("line", old_line_id, field_name))
+                else:
+                    item["document_version_id"] = new_version_id
+                    changed = item["field_name"] in changed_header_fields
+                    if changed:
+                        field_name = str(item["field_name"])
+                        column_name = header_column_by_field[field_name]
+                        raw_value = new_version[column_name]
+                        item.update(
+                            value_text=_field_text(raw_value) if raw_value else None,
+                            **manual_evidence(("header", None, field_name)),
+                        )
+                        manual_evidence_done.add(("header", None, field_name))
+                item["id"] = new_id()
+                item.pop("created_at", None)
+                connection.execute(sa.insert(evidence_table).values(**item))
+
+            for field_name in changed_header_fields:
+                if ("header", None, field_name) in manual_evidence_done:
+                    continue
+                raw_value = new_version[header_column_by_field[field_name]]
+                connection.execute(
+                    sa.insert(evidence_table).values(
+                        id=new_id(),
+                        workspace_id=actor.workspace_id,
+                        document_version_id=new_version_id,
+                        field_name=field_name,
+                        value_text=_field_text(raw_value) if raw_value else None,
+                        **manual_evidence(("header", None, field_name)),
+                    )
+                )
+            changed_line_evidence = {
+                (old_id, field_name)
+                for old_id, fields in changed_line_fields.items()
+                if old_id is not None
+                for field_name in fields
+            }
+            existing_manual_evidence = {
+                (old_id, field_name)
+                for kind, old_id, field_name in manual_evidence_done
+                if kind == "line" and old_id is not None
+            }
+            for old_id, field_name in changed_line_evidence - existing_manual_evidence:
+                target_id = new_line_ids.get(old_id)
+                if target_id is None:
+                    continue
+                value = changed_line_values.get((old_id, field_name))
+                connection.execute(
+                    sa.insert(evidence_table).values(
+                        id=new_id(),
+                        workspace_id=actor.workspace_id,
+                        doc_line_id=target_id,
+                        field_name=field_name,
+                        value_text=_field_text(value) if value is not None else None,
+                        **manual_evidence(("line", line_no_by_owner.get(old_id), field_name)),
+                    )
+                )
+
+            new_doc_no = new_version.get("doc_no")
+            new_doc_date = new_version.get("doc_date")
+            new_vendor_identity = _vendor_identity(
+                cast(str | None, new_version.get("vendor_gstin")),
+                cast(str | None, new_version.get("vendor_name")),
+            )
+            connection.execute(
+                sa.update(document_table)
+                .where(
+                    document_table.c.workspace_id == actor.workspace_id,
+                    document_table.c.id == document_id,
+                )
+                .values(
+                    current_version_id=new_version_id,
+                    vendor_identity=new_vendor_identity,
+                    doc_no=new_doc_no,
+                    canonical_doc_no=(
+                        canonicalize_document_number(new_doc_no) if new_doc_no else None
+                    ),
+                    doc_date=new_doc_date,
+                    grand_total=new_version.get("grand_total"),
+                    needs_verification=needs_verification,
+                    updated_at=sa.func.now(),
+                    version=document_table.c.version + 1,
+                )
+            )
+            write_audit_event(
+                connection,
+                actor,
+                action="document.correct",
+                target_type="document",
+                target_id=document_id,
+                before_state={
+                    "document_version_id": str(previous_version_id),
+                    "fields": {key: before for key, (before, _after) in header_changes.items()},
+                },
+                after_state={
+                    "document_version_id": str(new_version_id),
+                    "fields": {key: after for key, (_before, after) in header_changes.items()},
+                    "corrected_line_count": len(changed_line_fields) + len(removed_line_ids),
+                    "removed_line_ids": sorted(str(value) for value in removed_line_ids),
+                    "needs_verification": needs_verification,
+                    "correction_qa": qa,
+                    "ai_suggestion_refs": [
+                        {
+                            "ai_call_id": str(ai_call_id),
+                            "scope": scope,
+                            "line_no": line_no,
+                            "field": field_name,
+                        }
+                        for (scope, line_no, field_name), (ai_call_id, _item) in sorted(
+                            ai_evidence.items(), key=lambda item: str(item[0])
+                        )
+                    ],
+                },
+                reason=reason or "Invoice extraction reviewed by user.",
+            )
+            if {"vendor_name", "vendor_gstin"} & changed_header_fields:
+                source_file_id = current_version["source_file_id"]
+                if source_file_id is not None:
+                    self.queue.enqueue(
+                        "resolve_vendors",
+                        file_id=cast(UUID, source_file_id),
+                        connection=connection,
+                    )
+            _event(
+                connection,
+                workspace_id=actor.workspace_id,
+                file_id=cast(UUID, current_version["source_file_id"]),
+                document_id=document_id,
+                document_version_id=new_version_id,
+                stage="qa",
+                outcome="ok" if qa["passed"] else "warn",
+                parser_version=PARSER_VERSION,
+                warning_codes=() if qa["passed"] else (_CORRECTION_QA_CODE,),
+                detail={
+                    "changed_header_fields": sorted(header_changes),
+                    "changed_line_count": len(changed_line_fields),
+                    "verified": not needs_verification,
+                    "correction_qa": qa,
+                },
+            )
+            self._record_correction_qa(
+                connection,
+                actor,
+                document_id=document_id,
+                version_id=new_version_id,
+                file_id=cast(UUID | None, current_version["source_file_id"]),
+                qa=qa,
+            )
+            self._mark_dirty_scope(
+                connection,
+                workspace_id=actor.workspace_id,
+                scope_kind="invoice",
+                scope_id=document_id,
+                reason="invoice extraction corrected or verified by user",
+            )
+        return self.get_document(actor.workspace_id, document_id)
+
+    def _record_correction_qa(
+        self,
+        connection: Connection,
+        actor: ActorContext,
+        *,
+        document_id: UUID,
+        version_id: UUID,
+        file_id: UUID | None,
+        qa: Mapping[str, Any],
+    ) -> None:
+        """Open a warning when correction QA fails; resolve it once a save passes."""
+
+        table = metadata.tables["document_warning"]
+        if qa["passed"]:
+            connection.execute(
+                sa.update(table)
+                .where(
+                    table.c.workspace_id == actor.workspace_id,
+                    table.c.document_id == document_id,
+                    table.c.code == _CORRECTION_QA_CODE,
+                    table.c.resolved_at.is_(None),
+                )
+                .values(resolved_at=sa.func.now(), resolved_by=actor.actor_id)
+            )
+            return
+        if file_id is None:
+            return
+        self._write_warnings(
+            connection,
+            workspace_id=actor.workspace_id,
+            file_id=file_id,
+            document_id=document_id,
+            warning_rows=[
+                ParseWarning(
+                    code=_CORRECTION_QA_CODE,
+                    message=(
+                        "Corrected values do not reconcile arithmetically: "
+                        + ", ".join(qa["failures"])
+                        + "."
+                    ),
+                )
+            ],
+            document=None,
+            document_version_id=version_id,
+        )
+
+    def _h1_review(
+        self, connection: Connection, workspace_id: UUID, document: Mapping[Any, Any]
+    ) -> tuple[dict[str, Any], tuple[GroundedSuggestion, ...]]:
+        """The latest H1 or vision answer for this document, checked again before use.
+
+        H1 answers are re-grounded on the current page text; vision answers (AC-5)
+        are re-checked against the pages that were read, the current buyer
+        entities and the current values. PO and GRN documents get vision readings
+        only, shown read-only (corrections are invoice-only until AC-7).
+        """
+
+        requests = metadata.tables["ai_request"]
+        versions = metadata.tables["document_version"]
+        cache = metadata.tables["ai_cache"]
+        call_log = metadata.tables["ai_call_log"]
+        current_version_id = cast(UUID, document["current_version_id"])
+        view: dict[str, Any] = {
+            "document_id": document["id"],
+            "document_version": int(document["version"]),
+            "current_version_id": current_version_id,
+            "state": "not_applicable",
+            "code": None,
+            "ai_call_id": None,
+            "mode": None,
+            "label": None,
+            "provider": None,
+            "model": None,
+            "requested_at": None,
+            "suggestions": [],
+            "dropped": {},
+            "source": None,
+            "correctable": document["doc_type"] in vision.CORRECTABLE_DOC_TYPES,
+            "annotations": [],
+        }
+        if document["doc_type"] not in vision.WIRED_DOC_TYPES:
+            return view, ()
+        hooks = [vision.HOOK]
+        if document["doc_type"] in h1.WIRED_DOC_TYPES:
+            hooks.append(h1.HOOK)
+        request = (
+            connection.execute(
+                sa.select(requests)
+                .where(
+                    requests.c.workspace_id == workspace_id,
+                    requests.c.hook.in_(hooks),
+                    requests.c.subject_type == h1.SUBJECT_TYPE,
+                    requests.c.subject_id.in_(
+                        sa.select(versions.c.id).where(
+                            versions.c.workspace_id == workspace_id,
+                            versions.c.document_id == document["id"],
+                        )
+                    ),
+                )
+                .order_by(requests.c.created_at.desc(), requests.c.attempt_no.desc())
+                .limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        if request is None:
+            return view, ()
+        is_vision = request["hook"] == vision.HOOK
+        view.update(
+            source="vision" if is_vision else "text",
+            mode=request["mode"],
+            label=(vision.SUGGESTION_LABELS if is_vision else h1.SUGGESTION_LABELS).get(
+                str(request["mode"])
+            ),
+            provider=request["provider"],
+            model=request["model"],
+            requested_at=request["created_at"],
+        )
+        state = str(request["request_state"])
+        if state in {"queued", "reserved", "sending"}:
+            view["state"] = "pending"
+            return view, ()
+        if state != "succeeded" or request["apply_outcome"] not in {"applied", "not_applicable"}:
+            view.update(
+                state="unavailable",
+                code=request["error_code"]
+                or request["skip_code"]
+                or (request["apply_outcome"] if state == "succeeded" else state),
+            )
+            return view, ()
+        ttl_days = (self.ai_limits().limits or AiLimits()).cache_ttl_days
+        response = connection.scalar(
+            sa.select(cache.c.response).where(
+                cache.c.workspace_id == workspace_id,
+                cache.c.cache_key == request["cache_key"],
+                cache.c.created_at > datetime.now(UTC) - timedelta(days=ttl_days),
+            )
+        )
+        if request["cache_key"] is None or not isinstance(response, Mapping):
+            view["state"] = "expired"
+            return view, ()
+        view["ai_call_id"] = connection.scalar(
+            sa.select(call_log.c.id)
+            .where(
+                call_log.c.workspace_id == workspace_id,
+                call_log.c.ai_request_id == request["id"],
+            )
+            .order_by(call_log.c.created_at.desc())
+            .limit(1)
+        )
+        if is_vision:
+            return self._vision_review(
+                connection, workspace_id, document, request, dict(response), view
+            )
+        pages = h1.redacted_pages(h1.load_pages(connection, workspace_id, current_version_id))
+        try:
+            validation = validate_h1(
+                H1Output.model_validate(dict(response)),
+                doc_type=document["doc_type"],
+                pages=pages,
+            )
+        except (InvalidOutput, ValidationError) as exc:
+            code = exc.code if isinstance(exc, InvalidOutput) else "invalid_output"
+            view.update(state="unavailable", code=code)
+            return view, ()
+        version_row = (
+            connection.execute(
+                sa.select(versions).where(
+                    versions.c.workspace_id == workspace_id, versions.c.id == current_version_id
+                )
+            )
+            .mappings()
+            .one()
+        )
+        line_table = metadata.tables["doc_line"]
+        lines_by_no = {
+            int(row["line_no"]): row
+            for row in connection.execute(
+                sa.select(line_table).where(
+                    line_table.c.workspace_id == workspace_id,
+                    line_table.c.document_version_id == current_version_id,
+                )
+            ).mappings()
+        }
+        suggestions = []
+        for item in validation.accepted:
+            if item.scope == "header":
+                current = version_row[INVOICE_HEADER_COLUMNS[item.field]]
+            else:
+                line = lines_by_no.get(cast(int, item.line_no))
+                current = line[INVOICE_LINE_COLUMNS[item.field]] if line is not None else None
+            suggestions.append(
+                {
+                    "scope": item.scope,
+                    "line_no": item.line_no,
+                    "field": item.field,
+                    "value": item.value,
+                    "current_value": current,
+                    "matches_current": _suggestion_matches(item, current),
+                    "page": item.page,
+                    "quote": item.quote,
+                    "start": item.original_start,
+                    "end": item.original_end,
+                }
+            )
+        view.update(state="available", suggestions=suggestions, dropped=dict(validation.dropped))
+        return view, validation.accepted
+
+    def _vision_review(
+        self,
+        connection: Connection,
+        workspace_id: UUID,
+        document: Mapping[Any, Any],
+        request: Mapping[str, Any],
+        response: dict[str, Any],
+        view: dict[str, Any],
+    ) -> tuple[dict[str, Any], tuple[GroundedSuggestion, ...]]:
+        """Vision readings mapped onto the document's correctable fields and lines."""
+
+        versions = metadata.tables["document_version"]
+        line_table = metadata.tables["doc_line"]
+        doc_type = cast(Any, document["doc_type"])
+        current_version_id = cast(UUID, document["current_version_id"])
+        read_version_id = UUID(str(request["subject_id"]))
+        pages = vision.load_pages(connection, workspace_id, read_version_id)
+        try:
+            context = vision.context_for(
+                connection, workspace_id, current_version_id, doc_type, pages
+            )
+            validation = vision.validate_vision(VisionOutput.model_validate(response), context)
+        except (InvalidOutput, ValidationError) as exc:
+            code = exc.code if isinstance(exc, InvalidOutput) else "invalid_output"
+            view.update(state="unavailable", code=code)
+            return view, ()
+        version_row = (
+            connection.execute(
+                sa.select(versions).where(
+                    versions.c.workspace_id == workspace_id, versions.c.id == current_version_id
+                )
+            )
+            .mappings()
+            .one()
+        )
+        current_lines = [
+            dict(row)
+            for row in connection.execute(
+                sa.select(line_table).where(
+                    line_table.c.workspace_id == workspace_id,
+                    line_table.c.document_version_id == current_version_id,
+                )
+            ).mappings()
+        ]
+        geometry = {page.page: page.render for page in pages}
+
+        def boxes(page: int, box: Any) -> tuple[tuple[int, int, int, int], tuple[int, ...]]:
+            render = geometry.get(page, {})
+            width = int(render.get("work_width") or 1000)
+            height = int(render.get("work_height") or 1000)
+            pixels = (
+                box.xmin * width // 1000,
+                box.ymin * height // 1000,
+                box.xmax * width // 1000,
+                box.ymax * height // 1000,
+            )
+            return pixels, (box.ymin, box.xmin, box.ymax, box.xmax)
+
+        accepted: list[GroundedSuggestion] = []
+        header_columns = _VISION_HEADER_COLUMNS
+        for item in validation.check.fields:
+            target = header_columns.get(item.name)
+            if target is None:
+                continue
+            field, kind = target
+            pixels, box_2d = boxes(item.page, item.box)
+            value = item.value.isoformat() if isinstance(item.value, date) else str(item.value)
+            accepted.append(
+                GroundedSuggestion(
+                    scope="header",
+                    line_no=None,
+                    field=field,
+                    kind=kind,
+                    value=value,
+                    typed=item.value,
+                    page=item.page,
+                    quote=item.text,
+                    original_start=-1,
+                    original_end=-1,
+                    bbox=pixels,
+                    box_2d=cast(tuple[int, int, int, int], box_2d),
+                )
+            )
+        positions = align_vision_lines(current_lines, validation.check.lines)
+        next_no = max((int(row["line_no"]) for row in current_lines), default=0)
+        for line, matched in zip(validation.check.lines, positions, strict=True):
+            if matched is None:
+                next_no += 1
+                matched = next_no
+            pixels, box_2d = boxes(line.page, line.box)
+            for cell in line.cells:
+                target = _VISION_LINE_FIELDS.get(cell.name)
+                if target is None:
+                    continue
+                field, kind = target
+                accepted.append(
+                    GroundedSuggestion(
+                        scope="line",
+                        line_no=matched,
+                        field=field,
+                        kind=kind,
+                        value=str(cell.value),
+                        typed=cell.value,
+                        page=line.page,
+                        quote=cell.text,
+                        original_start=-1,
+                        original_end=-1,
+                        bbox=pixels,
+                        box_2d=cast(tuple[int, int, int, int], box_2d),
+                    )
+                )
+        lines_by_no = {int(row["line_no"]): row for row in current_lines}
+        suggestions = []
+        for item in accepted:
+            if item.scope == "header":
+                column = _VISION_COLUMNS.get(item.field, item.field)
+                current = version_row.get(column)
+            else:
+                row = lines_by_no.get(cast(int, item.line_no))
+                current = row.get(INVOICE_LINE_COLUMNS[item.field]) if row is not None else None
+            suggestions.append(
+                {
+                    "scope": item.scope,
+                    "line_no": item.line_no,
+                    "field": item.field,
+                    "value": item.value,
+                    "current_value": current,
+                    "matches_current": _suggestion_matches(item, current),
+                    "page": item.page,
+                    "quote": item.quote,
+                    "start": None,
+                    "end": None,
+                    "box": list(item.box_2d) if item.box_2d else None,
+                }
+            )
+        view.update(
+            state="available",
+            suggestions=suggestions,
+            dropped=dict(validation.check.dropped),
+            annotations=[
+                {
+                    "kind": note.kind,
+                    "text": note.text,
+                    "looks_like": note.looks_like,
+                    "page": note.page,
+                    "box": note.box.as_list(),
+                }
+                for note in validation.check.annotations
+            ],
+        )
+        return view, tuple(accepted)
+
+    @requires("data.view")
+    def ai_suggestions(self, workspace_id: UUID, document_id: UUID) -> dict[str, Any] | None:
+        """Advisory H1 suggestions for a document; nothing here changes the document."""
+
+        document_table = metadata.tables["document"]
+        with self.engine.connect() as connection:
+            document = (
+                connection.execute(
+                    sa.select(document_table).where(
+                        document_table.c.workspace_id == workspace_id,
+                        document_table.c.id == document_id,
+                        document_table.c.withdrawn_at.is_(None),
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if document is None:
+                return None
+            view, _accepted = self._h1_review(connection, workspace_id, document)
+        return view
+
+    def _ai_reference_evidence(
+        self,
+        connection: Connection,
+        workspace_id: UUID,
+        document: Mapping[Any, Any],
+        refs: Sequence[AiSuggestionRef],
+        *,
+        new_version: Mapping[str, Any],
+        new_lines: Sequence[Mapping[str, Any]],
+    ) -> dict[tuple[str, int | None, str], tuple[UUID, GroundedSuggestion]]:
+        """Check each reference against a grounded suggestion with the saved value."""
+
+        if not refs:
+            return {}
+        view, accepted = self._h1_review(connection, workspace_id, document)
+        if view["state"] != "available" or view["ai_call_id"] is None:
+            raise IngestionFailure(
+                "AI_SUGGESTION_UNAVAILABLE",
+                "The AI suggestions for this document are no longer available.",
+            )
+        ai_call_id = cast(UUID, view["ai_call_id"])
+        lines_by_no = {int(row["line_no"]): row for row in new_lines}
+        evidence: dict[tuple[str, int | None, str], tuple[UUID, GroundedSuggestion]] = {}
+        for ref in refs:
+            key = (ref.scope, ref.line_no, ref.field)
+            if ref.ai_call_id != ai_call_id or key in evidence:
+                raise IngestionFailure(
+                    "AI_SUGGESTION_REF_INVALID",
+                    "An AI suggestion reference is stale or repeated.",
+                )
+            if ref.scope == "header":
+                column = INVOICE_HEADER_COLUMNS.get(ref.field)
+                saved = new_version.get(column) if column else None
+            else:
+                column = INVOICE_LINE_COLUMNS.get(ref.field)
+                line = lines_by_no.get(ref.line_no or 0)
+                saved = line.get(column) if column and line is not None else None
+            match = next(
+                (
+                    item
+                    for item in accepted
+                    if (item.scope, item.line_no, item.field) == key
+                    and _suggestion_matches(item, saved)
+                ),
+                None,
+            )
+            if match is None:
+                raise IngestionFailure(
+                    "AI_SUGGESTION_REF_INVALID",
+                    "A value marked as AI-suggested does not match a grounded suggestion.",
+                )
+            evidence[key] = (ai_call_id, match)
+        return evidence
+
     @requires("data.view")
     def document_source(self, workspace_id: UUID, document_id: UUID) -> dict[str, Any] | None:
         document = metadata.tables["document"]
@@ -2828,6 +4603,113 @@ class IngestionService:
             "unresolved_warnings": [dict(row) for row in warnings],
             "retry_actions": [dict(row) for row in retryable],
         }
+
+
+def _correction_qa(
+    version: Mapping[str, Any], lines: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """TR-PAR-5 arithmetic on a corrected version (the parser's ±1 tolerances)."""
+
+    def number(value: Any) -> Decimal | None:
+        return Decimal(str(value)) if value is not None else None
+
+    checked, failures = arithmetic_failures(
+        [
+            (
+                int(row["line_no"]),
+                number(row.get("quantity")),
+                number(row.get("rate")),
+                number(row.get("discount")),
+                number(row.get("amount")),
+            )
+            for row in sorted(lines, key=lambda item: int(item["line_no"]))
+        ],
+        taxable_total=number(version.get("taxable_total")),
+        taxes=[
+            number(version.get("cgst_total")),
+            number(version.get("sgst_total")),
+            number(version.get("igst_total")),
+        ],
+        round_off=number(version.get("round_off")),
+        grand_total=number(version.get("grand_total")),
+    )
+    return {"checked": checked, "passed": not failures, "failures": list(failures)}
+
+
+# Vision field → (correction field, value kind); the correction field names the
+# document_version column through INVOICE_HEADER_COLUMNS or _VISION_COLUMNS.
+_VISION_HEADER_COLUMNS: Mapping[str, tuple[str, FieldKind]] = {
+    "doc_no": ("doc_no", "ref"),
+    "doc_date": ("doc_date", "date"),
+    "supplier_name": ("vendor_name", "text"),
+    "supplier_gstin": ("vendor_gstin", "gstin"),
+    "buyer_gstin": ("buyer_gstin", "gstin"),
+    "currency": ("currency", "currency"),
+    "taxable_total": ("taxable_total", "money"),
+    "cgst_total": ("cgst", "money"),
+    "sgst_total": ("sgst", "money"),
+    "igst_total": ("igst", "money"),
+    "round_off": ("round_off", "money"),
+    "grand_total": ("grand_total", "money"),
+    "po_ref": ("po_refs", "ref"),
+    "grn_ref": ("grn_refs", "ref"),
+    "challan_no": ("challan_no", "ref"),
+    "e_way_bill_no": ("e_way_bill_no", "ref"),
+    "irn": ("irn", "ref"),
+    "place_of_supply": ("place_of_supply", "text"),
+    "supplier_invoice_no": ("supplier_invoice_no", "ref"),
+    "ship_to_name": ("ship_to", "text"),
+    "payment_terms": ("payment_terms", "text"),
+    "delivery_date": ("delivery_date", "date"),
+}
+_VISION_COLUMNS: Mapping[str, str] = {
+    **INVOICE_HEADER_COLUMNS,
+    "supplier_invoice_no": "supplier_invoice_no",
+    "ship_to": "ship_to",
+    "payment_terms": "payment_terms_text",
+    "delivery_date": "delivery_date",
+}
+_VISION_LINE_FIELDS: Mapping[str, tuple[str, FieldKind]] = {
+    "description": ("description", "text"),
+    "item_code": ("item_code", "ref"),
+    "hsn_sac": ("hsn_sac", "ref"),
+    "uom": ("uom", "ref"),
+    "quantity": ("quantity", "number"),
+    "rate": ("rate", "number"),
+    "amount": ("amount", "money"),
+}
+
+
+def _suggestion_matches(item: GroundedSuggestion, value: Any) -> bool:
+    """Whether a stored or saved value equals a grounded suggestion's typed value."""
+
+    if value is None:
+        return False
+    if item.field in {"po_refs", "grn_refs"}:
+        values = value if isinstance(value, (list, tuple)) else [value]
+        return any(str(entry).strip() == item.typed for entry in values)
+    kind = item.kind
+    if kind in {"money", "number"}:
+        try:
+            return Decimal(str(value)) == item.typed
+        except ArithmeticError:
+            return False
+    if kind == "date":
+        return value == item.typed if isinstance(value, date) else str(value) == str(item.typed)
+    try:
+        return typed_value(kind, str(value).strip()) == item.typed
+    except ValueError:
+        return False
+
+
+def _page_split_mode(file_row: Mapping[str, Any]) -> PageSplit:
+    """A person's answer to a proposed page split; PDFs never carry a type mismatch."""
+
+    if file_row.get("format") != FileFormat.PDF.value:
+        return PageSplit.AUTO
+    return {"accepted": PageSplit.CONFIRMED, "kept": PageSplit.OFF}.get(
+        str(file_row.get("mismatch_state")), PageSplit.AUTO
+    )
 
 
 def sniff_document_type(content: bytes, file_format: FileFormat) -> DocType | None:
@@ -3033,7 +4915,7 @@ def _plain(value: Any) -> Any:
 
 def _field_text(value: Any) -> str:
     value = _plain(value)
-    if isinstance(value, tuple):
+    if isinstance(value, (tuple, list)):
         return ";".join(_field_text(item) for item in value)
     if isinstance(value, (date, Decimal)):
         return str(value)
@@ -3056,6 +4938,29 @@ def _vendor_identity(gstin: str | None, name: str | None) -> str | None:
     if name:
         return normalize_vendor_name(name) or None
     return None
+
+
+def document_natural_key(document: Document, file_sha: str) -> str:
+    """Workspace identity of a parsed document: a re-upload with the same key is a new version."""
+
+    header_values = _header_values(document.header)
+    doc_no = _plain(header_values.get("doc_no"))
+    doc_date = _plain(header_values.get("doc_date"))
+    canonical_doc_no = canonicalize_document_number(doc_no) if doc_no else None
+    natural_payload: dict[str, Any] = {
+        "type": document.header.doc_type.value,
+        "vendor_identity": _vendor_identity(
+            _plain(header_values.get("vendor_gstin")), _plain(header_values.get("vendor_name"))
+        ),
+        "canonical_doc_no": canonical_doc_no,
+        "doc_date": doc_date.isoformat() if isinstance(doc_date, date) else None,
+    }
+    if not canonical_doc_no:
+        natural_payload["missing_number_fallback"] = {
+            "source_sha256": file_sha,
+            "locator": document.source_locator,
+        }
+    return document.natural_key or _canonical_hash(natural_payload)
 
 
 def _canonical_optional(value: Any) -> str | None:

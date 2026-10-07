@@ -12,11 +12,21 @@ import sqlalchemy as sa
 from botocore.config import Config  # type: ignore[import-untyped]
 from botocore.exceptions import BotoCoreError  # type: ignore[import-untyped]
 from procrastinate import App, JobContext, PsycopgConnector, SyncPsycopgConnector
+from procrastinate.manager import JobManager
 from procrastinate.retry import RetryStrategy
 from sqlalchemy.engine import Connection, Engine, make_url
 
+from reconbench_app.ai.enqueue import AiHookEnqueuer
+from reconbench_app.ai.gate import DeploymentGate
+from reconbench_app.ai.limits import load_limits
+from reconbench_app.ai.task_contracts import (
+    RUN_AI_REQUEST,
+    register_ai_task_declarations,
+    run_request_kwargs,
+)
 from reconbench_app.db.metadata import metadata
 from reconbench_app.export_service import ExportService
+from reconbench_app.extraction.einvoice_keys import einvoice_keys
 from reconbench_app.ingestion import (
     IngestionService,
     ObjectStoreUnavailable,
@@ -31,6 +41,8 @@ from reconbench_app.storage import S3ObjectStore
 from reconbench_app.vendor_resolution import VendorResolutionService
 from reconbench_app.worker_control import run_controlled_worker
 
+# The "ai" queue is consumed only by the dedicated AI worker process.
+GENERAL_WORKER_QUEUES = ("ingest", "parse", "mapping", "reconcile", "exports")
 MAX_INFRASTRUCTURE_ATTEMPTS = 4  # One initial attempt plus three infrastructure retries.
 _RETRYABLE_ERRORS = (BotoCoreError, OSError, sa.exc.DBAPIError, ObjectStoreUnavailable)
 _INFRASTRUCTURE_RETRY = RetryStrategy(
@@ -43,15 +55,40 @@ _INFRASTRUCTURE_RETRY = RetryStrategy(
 class ProcrastinateJobQueue(QueuePort):
     """Queue tasks on the current PostgreSQL transaction when one is supplied."""
 
-    def __init__(self, tasks: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        tasks: dict[str, Any],
+        *,
+        sync_job_manager: JobManager | None = None,
+    ) -> None:
         self.tasks = tasks
+        self.sync_job_manager = sync_job_manager
 
-    def enqueue(self, task_name: str, *, file_id: UUID, connection: Connection) -> int:
+    def _defer(
+        self,
+        task_name: str,
+        *,
+        connection: Connection,
+        task_kwargs: dict[str, str],
+    ) -> int:
         task = self.tasks.get(task_name)
         if task is None:
             raise RuntimeError(f"unknown ingestion task: {task_name}")
         psycopg_connection = connection.connection.driver_connection
-        return int(task.configure(connection=psycopg_connection).defer(file_id=str(file_id)))
+        deferrer = task.configure(connection=psycopg_connection)
+        if self.sync_job_manager is not None:
+            # Worker tasks run on Procrastinate's async connector, but their
+            # services use synchronous SQLAlchemy transactions. Use the
+            # connector's sync JobManager for this transaction-bound enqueue.
+            deferrer.job_manager = self.sync_job_manager
+        return int(deferrer.defer(**task_kwargs))
+
+    def enqueue(self, task_name: str, *, file_id: UUID, connection: Connection) -> int:
+        return self._defer(
+            task_name,
+            connection=connection,
+            task_kwargs={"file_id": str(file_id)},
+        )
 
     def enqueue_recompute_po(
         self,
@@ -60,39 +97,54 @@ class ProcrastinateJobQueue(QueuePort):
         po_document_id: UUID,
         connection: Connection,
     ) -> int:
-        task = self.tasks.get("recompute_po")
-        if task is None:
-            raise RuntimeError("recompute_po task is not registered")
-        psycopg_connection = connection.connection.driver_connection
-        return int(
-            task.configure(connection=psycopg_connection).defer(
-                workspace_id=str(workspace_id),
-                po_document_id=str(po_document_id),
-            )
+        return self._defer(
+            "recompute_po",
+            connection=connection,
+            task_kwargs={
+                "workspace_id": str(workspace_id),
+                "po_document_id": str(po_document_id),
+            },
         )
 
     def enqueue_dirty_scopes(self, *, workspace_id: UUID, connection: Connection) -> int:
-        task = self.tasks.get("drain_dirty_scopes")
-        if task is None:
-            raise RuntimeError("drain_dirty_scopes task is not registered")
-        psycopg_connection = connection.connection.driver_connection
-        return int(
-            task.configure(connection=psycopg_connection).defer(workspace_id=str(workspace_id))
+        return self._defer(
+            "drain_dirty_scopes",
+            connection=connection,
+            task_kwargs={"workspace_id": str(workspace_id)},
         )
 
     def enqueue_reconciliation(self, *, run_id: UUID, connection: Connection) -> int:
-        task = self.tasks.get("evaluate_cases")
-        if task is None:
-            raise RuntimeError("evaluate_cases task is not registered")
-        psycopg_connection = connection.connection.driver_connection
-        return int(task.configure(connection=psycopg_connection).defer(run_id=str(run_id)))
+        return self._defer(
+            "evaluate_cases",
+            connection=connection,
+            task_kwargs={"run_id": str(run_id)},
+        )
 
     def enqueue_export(self, *, export_id: UUID, connection: Connection) -> int:
-        task = self.tasks.get("build_export")
-        if task is None:
-            raise RuntimeError("build_export task is not registered")
-        psycopg_connection = connection.connection.driver_connection
-        return int(task.configure(connection=psycopg_connection).defer(export_id=str(export_id)))
+        return self._defer(
+            "build_export",
+            connection=connection,
+            task_kwargs={"export_id": str(export_id)},
+        )
+
+    def enqueue_vision_pages(
+        self, *, workspace_id: UUID, document_version_id: UUID, connection: Connection
+    ) -> int:
+        return self._defer(
+            "prepare_vision_pages",
+            connection=connection,
+            task_kwargs={
+                "workspace_id": str(workspace_id),
+                "document_version_id": str(document_version_id),
+            },
+        )
+
+    def enqueue_ai_request(self, *, ai_request_id: UUID, connection: Connection) -> int:
+        return self._defer(
+            RUN_AI_REQUEST,
+            connection=connection,
+            task_kwargs=run_request_kwargs(ai_request_id),
+        )
 
     def enqueue_pending_recomputes(self, *, workspace_id: UUID, connection: Connection) -> int:
         scopes = metadata.tables["dirty_scope"]
@@ -150,19 +202,32 @@ def register_ingestion_tasks(
     )
     task_app = App(connector=connector)
     task_registry: dict[str, Any] = {}
-    queue = ProcrastinateJobQueue(task_registry)
+    sync_job_manager = JobManager(connector.get_sync_connector()) if worker_process else None
+    queue = ProcrastinateJobQueue(task_registry, sync_job_manager=sync_job_manager)
+    ai_hooks = AiHookEnqueuer(
+        gate=DeploymentGate.from_values(
+            settings.ai_external_calls, settings.ai_external_calls_approval_ref
+        ),
+        queue=queue,
+        limits=lambda: load_limits(settings.ai_limits_file),
+        vision_reader_name=settings.vision_reader,
+    )
     service = IngestionService(
         engine,
         S3ObjectStore(s3_client, settings.s3_bucket),
         queue,
         ocr_languages=tuple(settings.pdf_ocr_languages.split("+")),
+        einvoice_keys=einvoice_keys(settings.einvoice_public_key_file),
+        ai_hooks=ai_hooks,
+        ai_limits=lambda: load_limits(settings.ai_limits_file),
     )
-    vendor_resolution = VendorResolutionService(engine)
-    mapping_service = MappingService(engine, queue)
+    vendor_resolution = VendorResolutionService(engine, ai_hooks)
+    mapping_service = MappingService(engine, queue, ai_hooks)
     ledger_service = LedgerRebuildService(engine)
     reconciliation_service = ReconciliationService(
         engine,
         process_workers=settings.reconciliation_processes,
+        ai_hooks=ai_hooks,
     )
     export_service = ExportService(engine, S3ObjectStore(s3_client, settings.s3_bucket))
 
@@ -205,6 +270,19 @@ def register_ingestion_tasks(
                 job_id=job.id,
             )
             raise
+
+    @task_app.task(
+        name="reconbench.prepare_vision_pages",
+        queue="parse",
+        retry=_INFRASTRUCTURE_RETRY,
+        pass_context=True,
+    )
+    def prepare_vision_pages(
+        context: JobContext, workspace_id: str, document_version_id: str
+    ) -> None:
+        service.prepare_vision_pages(
+            UUID(workspace_id), UUID(document_version_id), job_id=context.job.id
+        )
 
     @task_app.task(
         name="reconbench.resolve_vendors",
@@ -321,12 +399,14 @@ def register_ingestion_tasks(
         {
             "ingest_file": ingest_file,
             "parse_file": parse_file,
+            "prepare_vision_pages": prepare_vision_pages,
             "resolve_vendors": resolve_vendors,
             "link_vendor": link_vendor,
             "recompute_po": recompute_po,
             "drain_dirty_scopes": drain_dirty_scopes,
             "evaluate_cases": evaluate_cases,
             "build_export": build_export,
+            **register_ai_task_declarations(task_app),
         }
     )
     return task_app, queue
@@ -355,7 +435,7 @@ def worker_main(
             run_controlled_worker(
                 app,
                 settings.database_url,
-                queues=["ingest", "parse", "mapping", "reconcile", "exports", "ai"],
+                queues=list(GENERAL_WORKER_QUEUES),
                 name=f"reconbench-ingestion-{socket.gethostname()}-{socket.getfqdn()}",
                 fetch_job_polling_interval=fetch_job_polling_interval,
                 update_heartbeat_interval=update_heartbeat_interval,
@@ -369,6 +449,7 @@ def worker_main(
 
 
 __all__ = [
+    "GENERAL_WORKER_QUEUES",
     "MAX_INFRASTRUCTURE_ATTEMPTS",
     "ProcrastinateJobQueue",
     "make_s3_client",

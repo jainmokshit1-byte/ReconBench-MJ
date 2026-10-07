@@ -5,6 +5,13 @@ export interface WorkspaceConfiguration {
   body: Record<string, unknown>;
   engine_hash: string;
   rules_hash: string;
+  /** Selected P0 default body (Schema §10.2) for comparison and reset. */
+  defaults?: Record<string, unknown>;
+}
+
+export interface ConfigProblemField {
+  location: (string | number)[];
+  detail: string;
 }
 
 async function send(path: string, init: RequestInit = {}, csrf?: string): Promise<Response> {
@@ -16,9 +23,10 @@ async function send(path: string, init: RequestInit = {}, csrf?: string): Promis
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
     const detail = typeof body === "object" && body !== null && "detail" in body && typeof body.detail === "string" ? body.detail : `Request failed (${response.status})`;
-    const error = new Error(detail) as Error & { status?: number; current?: unknown };
+    const error = new Error(detail) as Error & { status?: number; current?: unknown; fields?: ConfigProblemField[] };
     error.status = response.status;
     if (typeof body === "object" && body !== null && "current" in body) error.current = body.current;
+    if (typeof body === "object" && body !== null && "errors" in body && Array.isArray(body.errors)) error.fields = body.errors as ConfigProblemField[];
     throw error;
   }
   return response;

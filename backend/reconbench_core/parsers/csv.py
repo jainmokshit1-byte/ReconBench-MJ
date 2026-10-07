@@ -19,6 +19,7 @@ from reconbench_core.parsers.common import (
     combined_synonyms,
     normalize_label,
 )
+from reconbench_core.parsers.parties import guard_result
 from reconbench_core.parsers.types import ParseResult, ParserHints, ParseWarning
 from reconbench_core.schema import DocType, Document, FieldSource, FileFormat
 
@@ -101,6 +102,14 @@ def _document_type(
     if hint_type is not None:
         return hint_type
     normalized_headers = [normalize_label(header) for header in headers]
+    # The document's own number column names its type ("GRN No", "Invoice No").
+    # Receipts and invoices routinely carry a PO reference column, so a PO
+    # label only decides the type when no receipt or invoice number is present.
+    own_numbers = [name for name in normalized_headers if alias_map.get(name) == "doc_no"]
+    if any(any(word in name for word in ("GRN", "MRN", "RECEIPT")) for name in own_numbers):
+        return DocType.GRN
+    if any("INVOICE" in name or "BILL" in name for name in own_numbers):
+        return DocType.INVOICE
     if any("PURCHASE ORDER" in name or name == "PO NO" for name in normalized_headers):
         return DocType.PO
     if any(
@@ -148,6 +157,12 @@ def _row_ranges(numbers: list[int]) -> str:
 
 
 def parse_csv(content: bytes, hints: ParserHints) -> ParseResult:
+    """Parse CSV bytes, then apply the shared party and GST guards."""
+
+    return guard_result(_parse_csv(content, hints), hints)
+
+
+def _parse_csv(content: bytes, hints: ParserHints) -> ParseResult:
     """Parse CSV rows as text and group them into canonical documents."""
 
     empty_signature = hashlib.sha256(b"csv:empty").hexdigest()

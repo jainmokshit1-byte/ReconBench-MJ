@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from reconbench_core.version import ENGINE_VERSION
 from sqlalchemy.orm import Session
 
+from reconbench_app.ai import h2
 from reconbench_app.api.conventions import (
     ApiProblem,
     conditional_json_response,
@@ -354,10 +355,15 @@ def list_cases(
                 request, 422, "One or more status filters are invalid.", "invalid_status"
             )
         statement = statement.where(current.c.effective_status.in_(status))
+    # Undated invoices (unreadable scans) stay visible under any period filter.
     if from_date is not None:
-        statement = statement.where(current.c.invoice_date >= from_date)
+        statement = statement.where(
+            sa.or_(current.c.invoice_date.is_(None), current.c.invoice_date >= from_date)
+        )
     if to_date is not None:
-        statement = statement.where(current.c.invoice_date <= to_date)
+        statement = statement.where(
+            sa.or_(current.c.invoice_date.is_(None), current.c.invoice_date <= to_date)
+        )
     context = {
         "workspace_id": workspace_id,
         "vendor_id": vendor_id,
@@ -449,6 +455,12 @@ def get_case(case_id: UUID, request: Request) -> Response:
                 .where(line.c.workspace_id == workspace_id, line.c.case_id == case_id)
                 .order_by(line.c.line_no)
             ).mappings()
+        )
+        opinion_states = h2.line_states(
+            connection,
+            workspace_id,
+            cast(UUID, row["run_id"]),
+            [cast(UUID, item["id"]) for item in line_rows],
         )
         history = list(
             connection.execute(
@@ -571,15 +583,24 @@ def get_case(case_id: UUID, request: Request) -> Response:
         evidence_docs.append(value)
     content = {
         "case": to_jsonable({**dict(row), "is_stale": is_stale}),
-        "lines": to_jsonable([dict(item) for item in line_rows]),
+        "lines": to_jsonable(
+            [
+                {**dict(item), "ai_opinion": opinion_states[cast(UUID, item["id"])]}
+                for item in line_rows
+            ]
+        ),
         "documents": to_jsonable(evidence_docs),
         "history": to_jsonable([dict(item) for item in history]),
     }
-    return conditional_json_response(
-        request,
-        content,
-        etag_for_version(int(row["etag_version"])),
-    )
+    etag = etag_for_version(int(row["etag_version"]))
+    # The ETag is the case version (also used for If-Match), but an H2 opinion can arrive
+    # later without changing it, so a case with an eligible line is never answered with 304.
+    if any(
+        state["state"] != "not_applicable" or state["code"] == h2.NOT_REQUESTED
+        for state in opinion_states.values()
+    ):
+        return DecimalJSONResponse(content=content, headers={"ETag": etag})
+    return conditional_json_response(request, content, etag)
 
 
 @router.get("/kpis", tags=["Reconciliation"])
@@ -607,6 +628,133 @@ def get_kpis(
             .one()
         )
     return DecimalJSONResponse(content=to_jsonable(dict(row)))
+
+
+# Home 4-step tracker; "complete" follows decision G-12. The period uses the KPI rule:
+# an invoice without a readable date belongs to every period (revision 0018).
+_WORKFLOW_STATUS_SQL = """
+WITH docs AS (
+  SELECT count(*) FILTER (WHERE current_version_id IS NOT NULL) AS parsed_documents,
+         count(*) FILTER (WHERE vendor_id IS NULL) AS unassigned_documents
+    FROM document
+   WHERE workspace_id = :workspace_id AND withdrawn_at IS NULL
+),
+files AS (
+  SELECT count(*) AS files_in_progress
+    FROM source_file
+   WHERE workspace_id = :workspace_id AND removed_at IS NULL
+     AND status IN ('queued', 'parsing')
+),
+suggested AS (
+  SELECT count(*) AS suggested_links
+    FROM link_current lc
+    JOIN link l ON l.id = lc.current_link_id
+    JOIN document d ON d.id = lc.from_document_id
+   WHERE lc.workspace_id = :workspace_id AND l.state = 'suggested' AND d.withdrawn_at IS NULL
+),
+period_cases AS (
+  SELECT count(*) AS current_cases, count(*) FILTER (WHERE is_stale) AS stale_cases
+    FROM v_case_current
+   WHERE workspace_id = :workspace_id
+     AND (invoice_date IS NULL OR invoice_date BETWEEN :from_date AND :to_date)
+),
+latest_run AS (
+  SELECT r.id
+    FROM recon_run r
+   WHERE r.workspace_id = :workspace_id AND r.status = 'succeeded'
+     AND EXISTS (
+       SELECT 1
+         FROM recon_case c
+         JOIN document_version v ON v.id = c.invoice_version_id
+        WHERE c.workspace_id = r.workspace_id AND c.run_id = r.id
+          AND (v.doc_date IS NULL OR v.doc_date BETWEEN :from_date AND :to_date))
+   ORDER BY r.finished_at DESC NULLS LAST, r.queued_at DESC
+   LIMIT 1
+),
+active_run AS (
+  SELECT id FROM recon_run
+   WHERE workspace_id = :workspace_id AND status IN ('queued', 'running')
+   ORDER BY queued_at DESC
+   LIMIT 1
+)
+SELECT docs.parsed_documents, docs.unassigned_documents, files.files_in_progress,
+       suggested.suggested_links, period_cases.current_cases, period_cases.stale_cases,
+       (SELECT id FROM latest_run) AS run_id,
+       (SELECT id FROM active_run) AS active_run_id,
+       EXISTS (SELECT 1 FROM export_file e
+                WHERE e.workspace_id = :workspace_id AND e.status = 'ready'
+                  AND e.run_id = (SELECT id FROM latest_run)) AS has_export
+  FROM docs, files, suggested, period_cases
+"""
+
+
+@router.get("/workflow-status", tags=["Reconciliation"])
+@requires("data.view")
+def get_workflow_status(
+    request: Request,
+    from_date: date = Query(alias="from"),  # noqa: B008 - FastAPI query metadata.
+    to_date: date = Query(alias="to"),  # noqa: B008 - FastAPI query metadata.
+) -> Response:
+    if from_date > to_date:
+        return _problem(
+            request, 422, "The from date must be on or before the to date.", "invalid_date_range"
+        )
+    with request.app.state.database_engine.connect() as connection:
+        row = (
+            connection.execute(
+                sa.text(_WORKFLOW_STATUS_SQL),
+                {
+                    "workspace_id": _actor(request).workspace_id,
+                    "from_date": from_date,
+                    "to_date": to_date,
+                },
+            )
+            .mappings()
+            .one()
+        )
+    ingest_done = row["parsed_documents"] > 0 and row["files_in_progress"] == 0
+    map_done = (
+        row["parsed_documents"] > 0
+        and row["unassigned_documents"] == 0
+        and row["suggested_links"] == 0
+    )
+    reconcile_done = row["run_id"] is not None and row["stale_cases"] == 0
+    export_done = reconcile_done and bool(row["has_export"])
+    steps = [
+        {
+            "key": "ingest",
+            "complete": ingest_done,
+            "parsed_documents": row["parsed_documents"],
+            "files_in_progress": row["files_in_progress"],
+        },
+        {
+            "key": "map",
+            "complete": map_done,
+            "unassigned_documents": row["unassigned_documents"],
+            "suggested_links": row["suggested_links"],
+        },
+        {
+            "key": "reconcile",
+            "complete": reconcile_done,
+            "current_cases": row["current_cases"],
+            "stale_cases": row["stale_cases"],
+        },
+        {"key": "export", "complete": export_done},
+    ]
+    next_step = next((step["key"] for step in steps if not step["complete"]), None)
+    return DecimalJSONResponse(
+        content=to_jsonable(
+            {
+                "from": from_date,
+                "to": to_date,
+                "steps": steps,
+                "next_step": next_step,
+                "run_id": row["run_id"],
+                "active_run_id": row["active_run_id"],
+            }
+        ),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _stable_hash(value: object) -> str:

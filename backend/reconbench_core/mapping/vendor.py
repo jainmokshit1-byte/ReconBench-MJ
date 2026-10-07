@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from decimal import Decimal
+from enum import StrEnum
 from typing import Self
 from uuid import UUID
 
@@ -30,7 +32,8 @@ class VendorRecord(FrozenModel):
     """One known vendor and its GSTIN/PAN anchors and accepted display aliases."""
 
     vendor_id: UUID
-    display_name: str = Field(min_length=1)
+    # Empty while the vendor's name is pending (AC-4); never matches by name then.
+    display_name: str = ""
     gstins: tuple[str, ...] = ()
     pan: str | None = None
     aliases: tuple[str, ...] = ()
@@ -254,3 +257,251 @@ def resolve_vendors(
         output.append(VendorResolution(document_id=document.document_id))
 
     return VendorResolutionBatch(resolutions=tuple(output))
+
+
+# --------------------------------------------------------------------------- anchors (AC-4)
+
+
+class VendorNameStatus(StrEnum):
+    """How far a vendor's display name can be trusted, best first."""
+
+    MANUAL = "manual"
+    VERIFIED = "verified"
+    PROVISIONAL = "provisional"
+    PENDING = "pending"
+
+
+_NAME_RANK = {
+    VendorNameStatus.MANUAL: 3,
+    VendorNameStatus.VERIFIED: 2,
+    VendorNameStatus.PROVISIONAL: 1,
+    VendorNameStatus.PENDING: 0,
+}
+
+
+class AnchorDocument(FrozenModel):
+    """Supplier identity read from one document, already cleaned by the caller.
+
+    ``vendor_name`` must already be free of labels, GSTINs, line text and the
+    buyer's own names. ``gstin_verified``/``name_verified`` mean the value came
+    from a digital or signed source or a person, or passed its checks (L0/L1).
+    """
+
+    document_id: UUID
+    natural_key: str = ""
+    vendor_gstin: str | None = None
+    gstin_verified: bool = False
+    vendor_name: str | None = None
+    name_verified: bool = False
+
+
+class AnchorVendor(FrozenModel):
+    """An existing (unmerged) vendor as the anchor planner sees it."""
+
+    vendor_id: UUID
+    name: str = ""
+    name_status: VendorNameStatus = VendorNameStatus.PROVISIONAL
+    pan: str | None = None
+    gstins: tuple[str, ...] = ()
+    alias_norms: tuple[str, ...] = ()
+
+
+class PlannedVendor(FrozenModel):
+    """A vendor to create; ``key`` (the PAN) is how the other actions refer to it."""
+
+    key: str
+    name: str
+    name_status: VendorNameStatus
+    pan: str
+
+
+class PlannedRegistration(FrozenModel):
+    vendor_id: UUID | None = None
+    new_vendor_key: str | None = None
+    gstin: str
+    state_code: str
+    pan: str
+
+
+class PlannedRename(FrozenModel):
+    vendor_id: UUID
+    name: str
+    name_status: VendorNameStatus
+
+
+class PlannedAlias(FrozenModel):
+    vendor_id: UUID | None = None
+    new_vendor_key: str | None = None
+    alias: str
+
+
+class AnchorPlan(FrozenModel):
+    """Deterministic vendor-master changes for one workspace snapshot."""
+
+    new_vendors: tuple[PlannedVendor, ...] = ()
+    registrations: tuple[PlannedRegistration, ...] = ()
+    renames: tuple[PlannedRename, ...] = ()
+    aliases: tuple[PlannedAlias, ...] = ()
+    skipped: tuple[tuple[UUID, str], ...] = ()
+
+
+def _best_name(
+    candidates: list[tuple[str, VendorNameStatus]],
+) -> tuple[str, VendorNameStatus]:
+    """Highest status, then the most common spelling, then the smallest text (order-free)."""
+
+    if not candidates:
+        return "", VendorNameStatus.PENDING
+    top_rank = max(_NAME_RANK[status] for _, status in candidates)
+    top = [(name, status) for name, status in candidates if _NAME_RANK[status] == top_rank]
+    counts = Counter(normalize_vendor_name(name) for name, _ in top)
+    best_norm = min(counts, key=lambda norm: (-counts[norm], norm))
+    spelling = min(name for name, _ in top if normalize_vendor_name(name) == best_norm)
+    return spelling, top[0][1]
+
+
+def _anchor_pans(vendor: AnchorVendor) -> set[str]:
+    pans = {vendor.pan.upper()} if vendor.pan else set()
+    pans.update(pan for value in vendor.gstins if (pan := _gstin_pan(value)))
+    return pans
+
+
+def plan_vendor_anchors(
+    documents: tuple[AnchorDocument, ...] | list[AnchorDocument],
+    vendors: tuple[AnchorVendor, ...] | list[AnchorVendor],
+    buyer_gstins: frozenset[str] = frozenset(),
+) -> AnchorPlan:
+    """Plan vendor creation, GSTIN registrations, name upgrades and learned aliases.
+
+    Accuracy plan AC-4: a vendor is created only from a verified, checksum-valid
+    supplier GSTIN that is not a buyer entity; a document without one stays
+    vendor-pending (resolution may still match or suggest an existing vendor).
+    The name is never a GSTIN: without a usable name the vendor is ``pending``,
+    and a better name later (verified over provisional over pending) replaces it.
+    A person's name (``manual``) is never replaced. Aliases are learned only from
+    verified names, so OCR misspellings never become aliases. GSTINs sharing a PAN
+    belong to one vendor; when several vendors already hold that PAN nothing is
+    created and a person decides. The result does not depend on input order.
+    """
+
+    skipped: list[tuple[UUID, str]] = []
+    by_pan: dict[str, dict[str, list[AnchorDocument]]] = {}
+    state_of: dict[str, str] = {}
+    for document in documents:
+        if document.vendor_gstin is None:
+            continue
+        facts = validate_gstin(document.vendor_gstin)
+        if not facts.is_valid or facts.state_code is None or facts.pan is None:
+            skipped.append((document.document_id, "gstin_invalid"))
+            continue
+        if facts.normalized in buyer_gstins:
+            skipped.append((document.document_id, "buyer_gstin"))
+            continue
+        if not document.gstin_verified:
+            skipped.append((document.document_id, "gstin_unverified"))
+            continue
+        by_pan.setdefault(facts.pan, {}).setdefault(facts.normalized, []).append(document)
+        state_of[facts.normalized] = facts.state_code
+
+    sorted_vendors = sorted(vendors, key=lambda item: str(item.vendor_id))
+    vendor_by_gstin: dict[str, AnchorVendor] = {}
+    for vendor in sorted_vendors:
+        for gstin in vendor.gstins:
+            normalized = _valid_gstin(gstin)
+            if normalized is not None:
+                vendor_by_gstin.setdefault(normalized, vendor)
+
+    new_vendors: list[PlannedVendor] = []
+    registrations: list[PlannedRegistration] = []
+    renames: list[PlannedRename] = []
+    aliases: list[PlannedAlias] = []
+    used_aliases = {norm for vendor in sorted_vendors for norm in vendor.alias_norms}
+
+    def add_aliases(
+        vendor_id: UUID | None,
+        new_vendor_key: str | None,
+        canonical: str,
+        group: list[AnchorDocument],
+    ) -> None:
+        canonical_norm = normalize_vendor_name(canonical)
+        verified_names = sorted(
+            {
+                document.vendor_name.strip()
+                for document in group
+                if document.name_verified and document.vendor_name and document.vendor_name.strip()
+            }
+        )
+        for name in verified_names:
+            norm = normalize_vendor_name(name)
+            if not norm or norm == canonical_norm or norm in used_aliases:
+                continue
+            used_aliases.add(norm)
+            aliases.append(
+                PlannedAlias(vendor_id=vendor_id, new_vendor_key=new_vendor_key, alias=name)
+            )
+
+    for pan in sorted(by_pan):
+        groups = by_pan[pan]
+        group_docs = [document for gstin in sorted(groups) for document in groups[gstin]]
+        best_name, best_status = _best_name(
+            [
+                (
+                    document.vendor_name.strip(),
+                    VendorNameStatus.VERIFIED
+                    if document.name_verified
+                    else VendorNameStatus.PROVISIONAL,
+                )
+                for document in group_docs
+                if document.vendor_name and document.vendor_name.strip()
+            ]
+        )
+        known = {vendor_by_gstin[gstin].vendor_id for gstin in groups if gstin in vendor_by_gstin}
+        pan_vendors = [vendor for vendor in sorted_vendors if pan in _anchor_pans(vendor)]
+        target: AnchorVendor | None = None
+        if len(known) == 1:
+            target = next(vendor for vendor in sorted_vendors if vendor.vendor_id in known)
+        elif not known and len(pan_vendors) == 1:
+            target = pan_vendors[0]
+        elif known or pan_vendors:
+            for gstin in sorted(groups):
+                if gstin not in vendor_by_gstin:
+                    skipped.extend(
+                        (document.document_id, "pan_ambiguous") for document in groups[gstin]
+                    )
+            continue
+
+        if target is None:
+            new_vendors.append(
+                PlannedVendor(key=pan, name=best_name, name_status=best_status, pan=pan)
+            )
+            registrations.extend(
+                PlannedRegistration(
+                    new_vendor_key=pan, gstin=gstin, state_code=state_of[gstin], pan=pan
+                )
+                for gstin in sorted(groups)
+            )
+            add_aliases(None, pan, best_name, group_docs)
+            continue
+
+        registrations.extend(
+            PlannedRegistration(
+                vendor_id=target.vendor_id, gstin=gstin, state_code=state_of[gstin], pan=pan
+            )
+            for gstin in sorted(groups)
+            if gstin not in vendor_by_gstin
+        )
+        canonical = target.name
+        if best_name and _NAME_RANK[best_status] > _NAME_RANK[target.name_status]:
+            renames.append(
+                PlannedRename(vendor_id=target.vendor_id, name=best_name, name_status=best_status)
+            )
+            canonical = best_name
+        add_aliases(target.vendor_id, None, canonical, group_docs)
+
+    return AnchorPlan(
+        new_vendors=tuple(new_vendors),
+        registrations=tuple(registrations),
+        renames=tuple(renames),
+        aliases=tuple(aliases),
+        skipped=tuple(sorted(skipped, key=lambda item: (str(item[0]), item[1]))),
+    )

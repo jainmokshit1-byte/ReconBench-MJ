@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
+import { createPortal } from "react-dom";
 import { Save, Settings, Sparkles } from "lucide-react";
 import { Link } from "react-router";
 
-import { runLocalAiGuardrailTest, type AiGuardrailReport } from "../api/ai";
-import { getWorkspaceConfiguration, saveWorkspaceConfiguration, type WorkspaceConfiguration } from "../api/settings";
+import {
+  runLocalAiGuardrailTest,
+  type AiGuardrailReport,
+} from "../api/ai";
+import { getWorkspaceConfiguration, saveWorkspaceConfiguration, type ConfigProblemField, type WorkspaceConfiguration } from "../api/settings";
 import {
   addVendorAlias,
   deleteVendorAlias,
@@ -15,65 +19,81 @@ import {
 } from "../api/mapping";
 import { PageHeader } from "../components/PageHeader";
 import { useAuth } from "../auth/useAuth";
+import { diffConfig, validateEngine, type ConfigChange, type EngineBody } from "../settings/configModel";
+import {
+  BuyerEntitiesSection,
+  GstSlabsSection,
+  PaymentTermsSection,
+  PoliciesSection,
+  SynonymsSection,
+  TolerancesSection,
+  UomSection,
+} from "../settings/SettingsSections";
 
-const toleranceRules = [
-  ["qty_vs_grn", "Invoice quantity vs accepted GRN"],
-  ["cum_qty_vs_po", "Cumulative billed vs PO quantity"],
-  ["unit_rate", "Invoice unit rate vs PO rate"],
-  ["total_vs_expected", "Invoice taxable total vs expected"],
-  ["arithmetic", "Invoice arithmetic"],
-  ["cum_value_vs_po", "Cumulative PO value"],
-] as const;
+interface Conflict {
+  theirs: WorkspaceConfiguration;
+  etag: string;
+  changes: ConfigChange[];
+}
 
-const referenceEditors = [
-  ["synonyms", "Document field synonyms"],
-  ["uom", "UOM aliases and conversions"],
-  ["buyer_entities", "Buyer entities and GSTINs"],
-  ["gst_slabs", "Effective GST slabs"],
-  ["payment_terms", "Payment terms"],
-  ["overrides", "Vendor and item overrides"],
-] as const;
+const aliasSourceLabels: Record<VendorAlias["source"], string> = {
+  merge: "Learned from a vendor merge",
+  learned: "Learned from a confirmed assignment",
+  manual: "Manual entry",
+  seed: "Seeded",
+};
 
-function object(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+function engineOf(body: Record<string, unknown> | undefined): EngineBody | null {
+  const engine = body?.["engine"];
+  return typeof engine === "object" && engine !== null ? engine as EngineBody : null;
+}
+
+function serverFieldErrors(fields: ConfigProblemField[] | undefined): Record<string, string> {
+  return Object.fromEntries((fields ?? []).map((field) => [field.location.join("."), "The server rejected this value."]));
 }
 
 export function SettingsPage() {
   const { user, hasCapability } = useAuth();
+  const [saved, setSaved] = useState<WorkspaceConfiguration | null>(null);
   const [config, setConfig] = useState<WorkspaceConfiguration | null>(null);
   const [etag, setEtag] = useState('"1"');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [serverErrors, setServerErrors] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<Conflict | null>(null);
   const [aiTesting, setAiTesting] = useState(false);
   const [aiReport, setAiReport] = useState<AiGuardrailReport | null>(null);
-  const [referenceDrafts, setReferenceDrafts] = useState<Record<string, string>>({});
-  const [referenceErrors, setReferenceErrors] = useState<Record<string, string>>({});
   const [aliasRows, setAliasRows] = useState<VendorAlias[]>([]);
   const [vendors, setVendors] = useState<MappingVendor[]>([]);
   const [aliasVendorId, setAliasVendorId] = useState("");
   const [aliasDraft, setAliasDraft] = useState("");
+  const [aliasSearch, setAliasSearch] = useState("");
   const [aliasBusy, setAliasBusy] = useState(false);
   const [aliasError, setAliasError] = useState<string | null>(null);
   const [aliasNotice, setAliasNotice] = useState<string | null>(null);
   const [aliasesLoading, setAliasesLoading] = useState(true);
   const canManageAI = hasCapability("ai.manage");
   const canEditLinks = hasCapability("links.edit");
+  const canChangeSettings = hasCapability("settings.change");
+
+  const adopt = (value: WorkspaceConfiguration, nextEtag: string) => {
+    setSaved(value);
+    setConfig(value);
+    setEtag(nextEtag);
+    setServerErrors({});
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const current = await getWorkspaceConfiguration();
+      setSaved(current.value);
       setConfig(current.value);
       setEtag(current.etag);
-      const engine = object(current.value.body["engine"]);
-      setReferenceDrafts(Object.fromEntries(referenceEditors.map(([key]) => [
-        key,
-        JSON.stringify(engine[key] ?? {}, null, 2),
-      ])));
-      setReferenceErrors({});
+      setServerErrors({});
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Workspace configuration could not be loaded.");
     } finally {
@@ -105,71 +125,45 @@ export function SettingsPage() {
     return () => window.clearTimeout(timer);
   }, [refreshAliases]);
 
-  const body = config?.body ?? {};
-  const engine = object(body["engine"]);
-  const tolerance = object(engine["tolerances"]);
-  const setTolerance = (rule: string, key: "pct" | "abs", value: string) => {
+  const engine = engineOf(config?.body);
+  const defaults = engineOf(config?.defaults);
+  const changes = useMemo(() => (saved && config ? diffConfig(saved.body, config.body) : []), [saved, config]);
+  const clientErrors = useMemo(() => (engine ? validateEngine(engine) : {}), [engine]);
+  const errors = { ...serverErrors, ...clientErrors };
+  const errorCount = Object.keys(clientErrors).length;
+
+  const update = (change: (engine: EngineBody) => void) => {
+    setNotice(null);
+    setServerErrors({});
     setConfig((current) => {
       if (!current) return current;
       const nextBody = structuredClone(current.body);
-      const nextEngine = object(nextBody["engine"]);
-      const nextTolerances = object(nextEngine["tolerances"]);
-      const nextRule = object(nextTolerances[rule]);
-      nextRule[key] = value;
-      nextTolerances[rule] = nextRule;
-      nextEngine["tolerances"] = nextTolerances;
-      nextBody["engine"] = nextEngine;
+      const nextEngine = engineOf(nextBody);
+      if (!nextEngine) return current;
+      change(nextEngine);
       return { ...current, body: nextBody };
     });
-  };
-
-  const setLimitMode = (value: "or" | "both") => {
-    setConfig((current) => {
-      if (!current) return current;
-      const nextBody = structuredClone(current.body);
-      const nextEngine = object(nextBody["engine"]);
-      const nextTolerances = object(nextEngine["tolerances"]);
-      nextTolerances["limit_mode"] = value;
-      nextEngine["tolerances"] = nextTolerances;
-      nextBody["engine"] = nextEngine;
-      return { ...current, body: nextBody };
-    });
-  };
-
-  const setReferenceJson = (key: string, value: string) => {
-    setReferenceDrafts((current) => ({ ...current, [key]: value }));
-    try {
-      const parsed: unknown = JSON.parse(value);
-      setReferenceErrors((current) => ({ ...current, [key]: "" }));
-      setConfig((current) => {
-        if (!current) return current;
-        const nextBody = structuredClone(current.body);
-        const nextEngine = object(nextBody["engine"]);
-        nextEngine[key] = parsed;
-        nextBody["engine"] = nextEngine;
-        return { ...current, body: nextBody };
-      });
-    } catch {
-      setReferenceErrors((current) => ({ ...current, [key]: "Enter valid JSON before saving." }));
-    }
   };
 
   const save = async () => {
-    if (!config || !user?.csrf_token) return;
+    if (!config || !user?.csrf_token || errorCount) return;
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
       const result = await saveWorkspaceConfiguration(config.body, etag, user.csrf_token);
-      setConfig(result.value);
-      setEtag(result.etag);
-      const engine = object(result.value.body["engine"]);
-      setReferenceDrafts(Object.fromEntries(referenceEditors.map(([key]) => [key, JSON.stringify(engine[key] ?? {}, null, 2)])));
-      setNotice("Configuration saved as a new version. Existing reconciliation cases are now stale; run reconciliation again to use these settings.");
+      adopt(result.value, result.etag);
+      setNotice("saved");
     } catch (cause) {
-      const value = cause as Error & { status?: number };
-      if (value.status === 409) {
+      const value = cause as Error & { status?: number; current?: unknown; fields?: ConfigProblemField[] };
+      const current = value.current as { etag?: string; config?: WorkspaceConfiguration } | undefined;
+      if (value.status === 409 && current?.config && saved) {
+        setConflict({ theirs: current.config, etag: current.etag ?? `"${current.config.seq}"`, changes: diffConfig(saved.body, current.config.body) });
+      } else if (value.status === 409) {
         setError("Another user changed settings. Reload current settings before making another change.");
+      } else if (value.status === 422) {
+        setServerErrors(serverFieldErrors(value.fields));
+        setError(`The server rejected ${value.fields?.length ?? "some"} field${value.fields?.length === 1 ? "" : "s"}: ${(value.fields ?? []).map((field) => field.location.join(" › ")).join("; ") || value.message}`);
       } else {
         setError(cause instanceof Error ? cause.message : "Settings could not be saved.");
       }
@@ -230,16 +224,38 @@ export function SettingsPage() {
     }
   };
 
+  const vendorName = (id: string) => vendors.find((vendor) => vendor.id === id)?.canonical_name ?? id;
+  const search = aliasSearch.trim().toLowerCase();
+  const visibleAliases = search ? aliasRows.filter((alias) => `${alias.alias_raw} ${vendorName(alias.vendor_id)} ${alias.source}`.toLowerCase().includes(search)) : aliasRows;
+  const saveDisabled = !config || busy || loading || !changes.length || errorCount > 0 || !canChangeSettings;
+  const sectionProps = engine ? { engine, defaults, errors, update } : null;
+
   return <>
-    <PageHeader title="Settings" description="Versioned reconciliation tolerances and workspace reference data." action={<button className="button button-primary" type="button" disabled={!config || busy || loading || Object.values(referenceErrors).some(Boolean)} onClick={() => void save()}><Save size={15} /> {busy ? "Saving…" : "Save settings"}</button>} />
+    <PageHeader title="Settings" description="Versioned reconciliation rules and workspace reference data. Each save creates a new immutable configuration version." action={<button className="button button-primary" type="button" disabled={saveDisabled} onClick={() => void save()}><Save size={15} /> {busy ? "Saving…" : "Save settings"}</button>} />
     {error ? <div className="inline-error" role="alert">{error} {error.includes("Reload") ? <button className="button" type="button" onClick={() => void load()}>Reload</button> : null}</div> : null}
-    {notice ? <div className="mapping-info" role="status">{notice}</div> : null}
+    {notice === "saved" ? <div className="mapping-info" role="status">Configuration saved as version {config?.seq}. Existing reconciliation cases are now stale and keep their old settings until you re-run. <Link className="text-link" to="/reconciliation">Open Reconciliation to re-run</Link></div> : notice ? <div className="mapping-info" role="status">{notice}</div> : null}
     {loading ? <div className="panel">Loading workspace settings…</div> : null}
-    {config ? <>
-      <section className="panel settings-panel"><div className="panel-heading"><div><div className="panel-kicker">RECONCILIATION CONTROLS</div><h2>Tolerance rules</h2></div><label className="settings-mode"><span>Limit mode</span><select value={String(tolerance["limit_mode"] ?? "or")} onChange={(event) => setLimitMode(event.currentTarget.value as "or" | "both")}><option value="or">OR: percentage or absolute limit</option><option value="both">Both: percentage and absolute limit</option></select></label></div><p>These values are applied by the deterministic rules engine. Changing them creates a new immutable configuration version.</p><div className="recon-table-wrap"><table className="recon-table"><thead><tr><th>Check</th><th>Percentage tolerance</th><th>Absolute tolerance (₹ / units)</th></tr></thead><tbody>{toleranceRules.map(([key, title]) => { const value = object(tolerance[key]); return <tr key={key}><td>{title}</td><td><input aria-label={`${title} percentage tolerance`} inputMode="decimal" value={String(value["pct"] ?? "0")} onChange={(event) => setTolerance(key, "pct", event.currentTarget.value)} /></td><td><input aria-label={`${title} absolute tolerance`} inputMode="decimal" value={String(value["abs"] ?? "0")} onChange={(event) => setTolerance(key, "abs", event.currentTarget.value)} /></td></tr>; })}</tbody></table></div><small>Configuration version {config.seq} · rules hash {config.rules_hash}</small></section>
-      <section className="panel settings-panel"><div className="panel-heading"><div><div className="panel-kicker">REFERENCE DATA</div><h2>Matching and finance reference values</h2></div></div><p>These structured values are saved as a new immutable config version. Enter valid JSON; the server validates the field shapes and reconciliation is marked stale after saving.</p><div className="settings-reference-grid">{referenceEditors.map(([key, title]) => <details className="settings-reference" key={key}><summary>{title}</summary><label><span className="sr-only">{title} JSON</span><textarea aria-label={`${title} JSON`} spellCheck={false} value={referenceDrafts[key] ?? ""} onChange={(event) => setReferenceJson(key, event.currentTarget.value)} rows={9} /></label>{referenceErrors[key] ? <small className="settings-json-error" role="alert">{referenceErrors[key]}</small> : null}</details>)}</div></section>
-      <section className="panel settings-panel" aria-label="Vendor aliases"><div className="panel-heading"><div><div className="panel-kicker">VENDOR IDENTITY</div><h2>Vendor aliases</h2></div></div><p>Aliases help group printed supplier names with an existing vendor. They do not merge vendors or bypass PAN conflict checks.</p>{aliasError ? <div className="inline-error" role="alert">{aliasError}</div> : null}{aliasNotice ? <div className="mapping-info" role="status">{aliasNotice}</div> : null}<form className="settings-alias-form" onSubmit={(event) => void saveVendorAlias(event)}><label><span>Vendor</span><select aria-label="Vendor for alias" value={aliasVendorId} onChange={(event) => setAliasVendorId(event.currentTarget.value)} required><option value="">Choose vendor…</option>{vendors.map((vendor) => <option value={vendor.id ?? ""} key={vendor.id}>{vendor.canonical_name}</option>)}</select></label><label><span>Printed vendor alias</span><input aria-label="Printed vendor alias" value={aliasDraft} onChange={(event) => setAliasDraft(event.currentTarget.value)} maxLength={240} required /></label><button className="button" type="submit" disabled={!canEditLinks || aliasBusy || aliasesLoading || !aliasVendorId || !aliasDraft.trim()}>{aliasBusy ? "Saving…" : "Add alias"}</button></form>{aliasesLoading ? <p role="status">Loading vendor aliases…</p> : aliasRows.length ? <div className="recon-table-wrap"><table className="recon-table"><thead><tr><th>Vendor</th><th>Printed alias</th><th>Source</th><th>Action</th></tr></thead><tbody>{aliasRows.map((alias) => <tr key={alias.id}><td>{vendors.find((vendor) => vendor.id === alias.vendor_id)?.canonical_name ?? alias.vendor_id}</td><td>{alias.alias_raw}</td><td>{alias.source}</td><td><button className="button button-subtle" type="button" aria-label={`Remove alias ${alias.alias_raw}`} disabled={!canEditLinks || aliasBusy} onClick={() => void removeVendorAlias(alias.id)}>Remove</button></td></tr>)}</tbody></table></div> : <p>No vendor aliases are saved yet.</p>}</section>
-      <section className="panel settings-panel"><div className="panel-heading"><div><div className="panel-kicker">AI ASSIST</div><h2>Rules-only mode</h2></div><span className="quiet-badge">AI off</span></div><p>AI remains disabled. This local stub validates grounded suggestions, PO-pool membership, strict output shape, and spec/PAN conflict handling. It never contacts an external provider or changes a financial verdict. Provider, model, key storage and document-sharing consent remain off until approved.</p><button className="button" type="button" disabled={!canManageAI || aiTesting} onClick={() => void testAiGuardrails()}><Sparkles size={15} /> {aiTesting ? "Checking guardrails…" : "Run offline guardrail test"}</button>{aiReport ? <ul className="ai-guardrail-results" aria-label="AI guardrail results">{Object.entries(aiReport.checks).map(([name, passed]) => <li key={name}><span>{name.replaceAll("_", " ")}</span><strong>{passed ? "Passed" : "Failed"}</strong></li>)}</ul> : null}<Link className="text-link" to="/admin/errors"><Settings size={14} /> Processing errors and retry queue</Link></section>
+    {!canChangeSettings && config ? <div className="mapping-info" role="note">You can view settings. Only a manager can change them.</div> : null}
+    {config && sectionProps ? <>
+      <TolerancesSection {...sectionProps} vendors={vendors} />
+      <PoliciesSection {...sectionProps} />
+      <SynonymsSection {...sectionProps} />
+      <UomSection {...sectionProps} />
+      <BuyerEntitiesSection {...sectionProps} />
+      <GstSlabsSection {...sectionProps} />
+      <PaymentTermsSection {...sectionProps} />
+      <section className="panel settings-panel" aria-label="Vendor aliases"><div className="panel-heading"><div><div className="panel-kicker">VENDOR IDENTITY</div><h2>Vendor aliases</h2></div><label className="settings-search"><span className="sr-only">Search vendor aliases</span><input aria-label="Search vendor aliases" placeholder="Search alias, vendor or source" value={aliasSearch} onChange={(event) => setAliasSearch(event.currentTarget.value)} /></label></div><p>Aliases help group printed supplier names with an existing vendor. They are saved immediately, separately from the versioned settings, and do not merge vendors or bypass PAN conflict checks.</p>{aliasError ? <div className="inline-error" role="alert">{aliasError}</div> : null}{aliasNotice ? <div className="mapping-info" role="status">{aliasNotice}</div> : null}<form className="settings-alias-form" onSubmit={(event) => void saveVendorAlias(event)}><label><span>Vendor</span><select aria-label="Vendor for alias" value={aliasVendorId} onChange={(event) => setAliasVendorId(event.currentTarget.value)} required><option value="">Choose vendor…</option>{vendors.map((vendor) => <option value={vendor.id ?? ""} key={vendor.id}>{vendor.canonical_name}</option>)}</select></label><label><span>Printed vendor alias</span><input aria-label="Printed vendor alias" value={aliasDraft} onChange={(event) => setAliasDraft(event.currentTarget.value)} maxLength={240} required /></label><button className="button" type="submit" disabled={!canEditLinks || aliasBusy || aliasesLoading || !aliasVendorId || !aliasDraft.trim()}>{aliasBusy ? "Saving…" : "Add alias"}</button></form>{aliasesLoading ? <p role="status">Loading vendor aliases…</p> : visibleAliases.length ? <div className="recon-table-wrap"><table className="recon-table"><thead><tr><th>Vendor</th><th>Printed alias</th><th>Source</th><th>Action</th></tr></thead><tbody>{visibleAliases.map((alias) => <tr key={alias.id}><td>{vendorName(alias.vendor_id)}</td><td>{alias.alias_raw}</td><td>{aliasSourceLabels[alias.source]}</td><td><button className="button button-subtle" type="button" aria-label={`Remove alias ${alias.alias_raw}`} disabled={!canEditLinks || aliasBusy} onClick={() => void removeVendorAlias(alias.id)}>Remove</button></td></tr>)}</tbody></table></div> : <p>{aliasRows.length ? "No aliases match this search." : "No vendor aliases are saved yet."}</p>}</section>
+      <section className="panel settings-panel"><div className="panel-heading"><div><div className="panel-kicker">AI ASSIST</div><h2>Offline guardrail test</h2></div><span className="quiet-badge">Local only</span></div><p>This local stub validates grounded suggestions, PO-pool membership, strict output shape, and spec/PAN conflict handling. It never contacts an external provider or changes a financial verdict. Mode, Gemini model, API key, consent, limits and the provider test are managed from the AI Assist card on <Link className="text-link" to="/home">Home</Link>.</p><button className="button" type="button" disabled={!canManageAI || aiTesting} onClick={() => void testAiGuardrails()}><Sparkles size={15} /> {aiTesting ? "Checking guardrails…" : "Run offline guardrail test"}</button>{aiReport ? <ul className="ai-guardrail-results" aria-label="AI guardrail results">{Object.entries(aiReport.checks).map(([name, passed]) => <li key={name}><span>{name.replaceAll("_", " ")}</span><strong>{passed ? "Passed" : "Failed"}</strong></li>)}</ul> : null}<Link className="text-link" to="/admin/errors"><Settings size={14} /> Processing errors and retry queue</Link></section>
+      <small className="settings-version">Configuration version {config.seq} · rules hash {config.rules_hash}</small>
+      {changes.length || errorCount ? <div className="settings-savebar" role="region" aria-label="Unsaved settings">
+        <span>{changes.length} unsaved change{changes.length === 1 ? "" : "s"}{errorCount ? ` · ${errorCount} field${errorCount === 1 ? "" : "s"} to fix before saving` : ""}</span>
+        <div><button className="button" type="button" disabled={busy || !changes.length} onClick={() => { if (saved) adopt(saved, etag); }}>Discard changes</button><button className="button button-primary" type="button" disabled={saveDisabled} onClick={() => void save()}><Save size={14} /> {busy ? "Saving…" : "Save as new version"}</button></div>
+      </div> : null}
     </> : null}
+    {conflict ? createPortal(<div className="dialog-backdrop" role="presentation"><div className="dialog-card settings-conflict" role="dialog" aria-modal="true" aria-labelledby="settings-conflict-title">
+      <div className="dialog-heading"><div><div className="panel-kicker">VERSION CONFLICT</div><h2 id="settings-conflict-title">Someone saved settings first</h2><p>Version {conflict.theirs.seq} is now active. Your {changes.length} unsaved change{changes.length === 1 ? " was" : "s were"} not saved. Review what they changed, then load their version and re-apply your edits.</p></div></div>
+      <div className="settings-conflict-body"><table className="recon-table settings-table"><thead><tr><th>Setting</th><th>Before</th><th>Now</th></tr></thead><tbody>{conflict.changes.length ? conflict.changes.map((change) => <tr key={change.path}><td><code>{change.path}</code></td><td>{change.before}</td><td>{change.after}</td></tr>) : <tr><td colSpan={3}>No setting values differ; only the version moved.</td></tr>}</tbody></table></div>
+      <div className="dialog-actions"><span>Your edits stay on screen until you load the new version.</span><div><button className="button" type="button" onClick={() => setConflict(null)}>Keep my edits for now</button><button className="button button-primary" type="button" onClick={() => { adopt(conflict.theirs, conflict.etag); setConflict(null); setError(null); }}>Load version {conflict.theirs.seq}</button></div></div>
+    </div></div>, document.body) : null}
   </>;
 }

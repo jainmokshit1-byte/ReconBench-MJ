@@ -25,7 +25,8 @@
       "h2_item",
       "h3_rerank",
       "h4_vendor",
-      "h5_explain"
+      "h5_explain",
+      "h6_vision"
     ],
     "ai_key_storage": [
       "session",
@@ -231,6 +232,12 @@
       "gstin",
       "pan",
       "name"
+    ],
+    "vendor_name_status": [
+      "manual",
+      "verified",
+      "provisional",
+      "pending"
     ],
     "vendor_rule": [
       "gstin",
@@ -460,6 +467,10 @@
       "kind": "e",
       "owner": "reconbench_migrator"
     },
+    "vendor_name_status": {
+      "kind": "e",
+      "owner": "reconbench_migrator"
+    },
     "vendor_rule": {
       "kind": "e",
       "owner": "reconbench_migrator"
@@ -495,7 +506,22 @@
       "is_partition": false,
       "owner": "reconbench_migrator"
     },
+    "ai_line_opinion": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
+    "ai_request": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
     "ai_setting": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
+    "ai_worker_heartbeat": {
       "kind": "r",
       "is_partition": false,
       "owner": "reconbench_migrator"
@@ -556,6 +582,11 @@
       "owner": "reconbench_migrator"
     },
     "document": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
+    "document_page_image": {
       "kind": "r",
       "is_partition": false,
       "owner": "reconbench_migrator"
@@ -920,7 +951,7 @@
     "kpi_summary(p_workspace uuid, p_from date, p_to date)": {
       "kind": "f",
       "owner": "reconbench_migrator",
-      "sha256": "162f78af16c72ad4d882ecab24e17f080384310b0a0b33132d74b190e76d8f4e",
+      "sha256": "a1fd12fcbe0920990fb05c6e2551a80e4db8eef2cb54d6c139735007aea05831",
       "security_definer": false,
       "volatility": "s",
       "strict": false,
@@ -1099,6 +1130,16 @@
     }
   },
   "triggers": {
+    "ai_line_opinion.ai_line_opinion_append_only": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "9528a6bfdd2fb5bf446e1287107c7083975d9166b31b166223d944b376cd5023"
+    },
+    "ai_line_opinion.ai_line_opinion_append_only_truncate": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "1506ed057190d3fb08b570a3581b08a2e30ffc425e1a76065fbd90c03674eb6a"
+    },
     "audit_log.audit_log_append_only": {
       "enabled": "O",
       "routine": "forbid_mutation()",
@@ -1288,6 +1329,19 @@
     },
     {
       "table": "ai_call_log",
+      "name": "ai_call_log_ai_request_id_fkey",
+      "columns": [
+        "ai_request_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "ai_request",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_call_log",
       "name": "ai_call_log_document_id_fkey",
       "columns": [
         "document_id"
@@ -1328,6 +1382,164 @@
     {
       "table": "ai_call_log",
       "name": "ai_call_log_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_line_opinion",
+      "name": "ai_line_opinion_ai_call_id_fkey",
+      "columns": [
+        "ai_call_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "ai_call_log",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_line_opinion",
+      "name": "ai_line_opinion_ai_request_id_fkey",
+      "columns": [
+        "ai_request_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "ai_request",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_line_opinion",
+      "name": "ai_line_opinion_invoice_line_id_fkey",
+      "columns": [
+        "invoice_line_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "doc_line",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_line_opinion",
+      "name": "ai_line_opinion_po_doc_line_id_fkey",
+      "columns": [
+        "po_doc_line_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "doc_line",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_line_opinion",
+      "name": "ai_line_opinion_recon_line_result_id_fkey",
+      "columns": [
+        "recon_line_result_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "recon_line_result",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_line_opinion",
+      "name": "ai_line_opinion_run_id_fkey",
+      "columns": [
+        "run_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "recon_run",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_line_opinion",
+      "name": "ai_line_opinion_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_request",
+      "name": "ai_request_acknowledged_by_fkey",
+      "columns": [
+        "acknowledged_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "app_user",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_request",
+      "name": "ai_request_ai_cache_id_fkey",
+      "columns": [
+        "ai_cache_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "ai_cache",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {
+        "ondelete": "SET NULL"
+      }
+    },
+    {
+      "table": "ai_request",
+      "name": "ai_request_requested_by_fkey",
+      "columns": [
+        "requested_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "app_user",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_request",
+      "name": "ai_request_run_id_fkey",
+      "columns": [
+        "run_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "recon_run",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_request",
+      "name": "ai_request_workspace_id_fkey",
       "columns": [
         "workspace_id"
       ],
@@ -1773,6 +1985,32 @@
     {
       "table": "document",
       "name": "document_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "document_page_image",
+      "name": "document_page_image_document_version_id_fkey",
+      "columns": [
+        "document_version_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "document_version",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "document_page_image",
+      "name": "document_page_image_workspace_id_fkey",
       "columns": [
         "workspace_id"
       ],
@@ -2775,6 +3013,23 @@
     },
     {
       "table": "secret",
+      "name": "secret_session_fkey",
+      "columns": [
+        "workspace_id",
+        "session_id",
+        "created_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "session",
+      "referred_columns": [
+        "workspace_id",
+        "id",
+        "user_id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "secret",
       "name": "secret_workspace_id_fkey",
       "columns": [
         "workspace_id"
@@ -3224,13 +3479,6 @@
     {
       "kind": "table",
       "object": "ai_cache",
-      "grantee": "reconbench_report",
-      "privilege_type": "SELECT",
-      "is_grantable": false
-    },
-    {
-      "kind": "table",
-      "object": "ai_cache",
       "grantee": "reconbench_retention",
       "privilege_type": "DELETE",
       "is_grantable": false
@@ -3279,6 +3527,55 @@
     },
     {
       "kind": "table",
+      "object": "ai_line_opinion",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_line_opinion",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_request",
+      "grantee": "reconbench_app",
+      "privilege_type": "DELETE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_request",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_request",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_request",
+      "grantee": "reconbench_app",
+      "privilege_type": "UPDATE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_request",
+      "grantee": "reconbench_report",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
       "object": "ai_setting",
       "grantee": "reconbench_app",
       "privilege_type": "DELETE",
@@ -3308,6 +3605,41 @@
     {
       "kind": "table",
       "object": "ai_setting",
+      "grantee": "reconbench_report",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_worker_heartbeat",
+      "grantee": "reconbench_app",
+      "privilege_type": "DELETE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_worker_heartbeat",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_worker_heartbeat",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_worker_heartbeat",
+      "grantee": "reconbench_app",
+      "privilege_type": "UPDATE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_worker_heartbeat",
       "grantee": "reconbench_report",
       "privilege_type": "SELECT",
       "is_grantable": false
@@ -3646,6 +3978,34 @@
       "object": "document",
       "grantee": "reconbench_report",
       "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "document_page_image",
+      "grantee": "reconbench_app",
+      "privilege_type": "DELETE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "document_page_image",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "document_page_image",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "document_page_image",
+      "grantee": "reconbench_app",
+      "privilege_type": "UPDATE",
       "is_grantable": false
     },
     {
@@ -4779,17 +5139,17 @@
     }
   ],
   "object_counts": {
-    "application_tables": 42,
+    "application_tables": 46,
     "extensions": 2,
     "views": 4,
     "materialized_views": 0,
     "routines": 37,
-    "triggers": 22,
-    "enums": 37,
+    "triggers": 24,
+    "enums": 38,
     "domains": 5,
     "sequences": 1,
-    "foreign_keys": 138,
-    "explicit_acls": 235,
+    "foreign_keys": 154,
+    "explicit_acls": 250,
     "default_privileges": 7
   }
 }

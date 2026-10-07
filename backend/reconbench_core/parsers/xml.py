@@ -19,6 +19,7 @@ from reconbench_core.parsers.common import (
     combined_synonyms,
     normalize_label,
 )
+from reconbench_core.parsers.parties import guard_result
 from reconbench_core.parsers.types import ParseResult, ParserHints, ParseWarning
 from reconbench_core.schema import DocType, Document, FieldSource, FileFormat, ReasonCode
 
@@ -99,6 +100,43 @@ _DBC_NUMBER = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 _DBC_MEASURE = re.compile(
     rf"\s*(?P<number>{_DBC_NUMBER})(?:\s*(?:/|\s)\s*(?P<uom>[A-Za-z][A-Za-z0-9._-]*))?\s*"
 )
+# Narration rows under a Tally stock item: "SN: X,Y" serial lists, bare serials
+# ("RC310CKKN3U31254900038") and part codes ("RC-310C-KKN3-U3").
+_DBC_SERIAL_LABEL = re.compile(r"^\s*(?:S\.?\s*N(?:O)?\.?|SERIAL(?:\s+NO\.?)?)\s*[:#-]\s*", re.I)
+_DBC_SERIAL = re.compile(r"^(?=(?:[A-Z]*\d){4})[A-Z0-9]{8,}$", re.I)
+_DBC_PART_CODE = re.compile(r"^(?=.*\d)[A-Z0-9]+(?:[-/.][A-Z0-9]+)+$", re.I)
+
+
+def _dbc_narration(texts: list[str]) -> tuple[str | None, str | None, list[str], list[str]]:
+    """Split an item's narration rows into (item name, part code, serials, other text)."""
+
+    name: str | None = None
+    code: str | None = None
+    serials: list[str] = []
+    other: list[str] = []
+    in_serials = False
+    for raw in texts:
+        text = " ".join(raw.split())
+        labelled = _DBC_SERIAL_LABEL.match(text)
+        tokens = [token for token in re.split(r"[,;\s]+", text) if token]
+        if labelled:
+            in_serials = True
+            serials.extend(t for t in re.split(r"[,;\s]+", text[labelled.end() :]) if t)
+        elif (
+            tokens
+            and all(_DBC_SERIAL.match(token) for token in tokens)
+            and (in_serials or len(tokens) > 1 or name is not None)
+        ):
+            serials.extend(tokens)
+        elif len(tokens) == 1 and code is None and name is not None and _DBC_PART_CODE.match(text):
+            code = text
+            in_serials = False
+        elif name is None:
+            name = text
+        else:
+            other.append(text)
+            in_serials = False
+    return name, code, serials, other
 
 
 def _tag_name(element: etree._Element) -> str:
@@ -283,6 +321,7 @@ def _parse_one(
             alternatives=raw_line_alternatives,
         )
         if raw_line:
+            _unit_from_measures(raw_line)
             raw_lines.append(raw_line)
             line_alternatives.append(raw_line_alternatives)
             line_extras.append(_extras(line_node, known_tags))
@@ -353,6 +392,27 @@ def _dbc_values(rows: list[etree._Element]) -> dict[str, list[str]]:
     return values
 
 
+def _unit_from_measures(raw_line: dict[str, str]) -> None:
+    """Take the unit from Tally-style measures such as ``10 Nos`` or ``1003.00/Nos``.
+
+    Tally writes the unit inside ACTUALQTY/BILLEDQTY/RATE rather than in its own
+    tag. The unit is only filled when the line has none and the measures agree.
+    """
+
+    if raw_line.get("uom"):
+        return
+    units = {
+        unit.casefold(): unit
+        for unit in (
+            _dbc_measure(raw_line.get("quantity"))[1],
+            _dbc_measure(raw_line.get("rate"))[1],
+        )
+        if unit
+    }
+    if len(units) == 1:
+        raw_line["uom"] = next(iter(units.values()))
+
+
 def _dbc_measure(value: str | None) -> tuple[str | None, str | None]:
     if not value:
         return None, None
@@ -364,6 +424,42 @@ def _dbc_measure(value: str | None) -> tuple[str | None, str | None]:
     except ValueError:
         return None, None
     return format(parsed, "f"), match.group("uom")
+
+
+def _dbc_amount(value: str | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return abs(parse_decimal(value))
+    except ValueError:
+        return None
+
+
+def _dbc_first(values: dict[str, list[str]], tag: str) -> str | None:
+    return next((value.strip() for value in values.get(tag, []) if value.strip()), None)
+
+
+def _dbc_totals_reconcile(rows: list[dict[str, list[str]]], lines: list[dict[str, str]]) -> bool:
+    """Lines sum to the voucher's taxable amount, and its ledger amounts to its gross."""
+
+    taxable = _dbc_amount(_dbc_first(rows[0], "DBCAMOUNT"))
+    gross = _dbc_amount(_dbc_first(rows[0], "DBCGROSSAMT"))
+    if taxable is None or gross is None or not lines:
+        return False
+    amounts = [_dbc_amount(line.get("amount")) for line in lines]
+    if any(amount is None for amount in amounts):
+        return False
+    if sum((amount or Decimal("0") for amount in amounts), Decimal("0")) != taxable:
+        return False
+    ledger: list[Decimal] = []
+    for values in rows:
+        for raw in values.get("DBCLEDAMT", []):
+            if raw.strip():
+                amount = _dbc_amount(raw.strip())
+                if amount is None:
+                    return False
+                ledger.append(amount)
+    return bool(ledger) and sum(ledger, Decimal("0")) == gross
 
 
 def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str]) -> ParseResult:
@@ -447,6 +543,7 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
 
         line_raw: list[dict[str, str]] = []
         line_extras: list[dict[str, Any]] = []
+        narrations: list[list[str]] = []
         for row_number, values in enumerate(rows, start=start_row):
             quantity_raw = next(
                 (value.strip() for value in values.get("DBCQTY", []) if value.strip()), None
@@ -455,6 +552,10 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
                 (value.strip() for value in values.get("DBCRATE", []) if value.strip()), None
             )
             if quantity_raw is None or rate_raw is None:
+                # A row without quantity and rate under an item is its narration.
+                party = next((v.strip() for v in values.get("DBCPARTY", []) if v.strip()), None)
+                if narrations and party and row_number != start_row:
+                    narrations[-1].append(party)
                 continue
             quantity, quantity_uom = _dbc_measure(quantity_raw)
             rate, rate_uom = _dbc_measure(rate_raw)
@@ -468,6 +569,17 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
                 )
                 continue
             raw_line: dict[str, str] = {"quantity": quantity, "rate": rate}
+            # On the voucher's first row DBCPARTY is the party, not a stock item.
+            description = (
+                None
+                if row_number == start_row
+                else next(
+                    (value.strip() for value in values.get("DBCPARTY", []) if value.strip()),
+                    None,
+                )
+            )
+            if description:
+                raw_line["description"] = description
             uom = quantity_uom or rate_uom
             if quantity_uom and rate_uom and quantity_uom.casefold() != rate_uom.casefold():
                 warnings.append(
@@ -479,20 +591,57 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
                 )
             if uom:
                 raw_line["uom"] = uom
+            accounting_amount_raw = next(
+                (value.strip() for value in values.get("DBCAMOUNT", []) if value.strip()), None
+            )
+            amount_reconciles = False
+            if accounting_amount_raw is not None:
+                try:
+                    accounting_amount = abs(parse_decimal(accounting_amount_raw))
+                except ValueError:
+                    accounting_amount = None
+                extended_amount = Decimal(quantity) * Decimal(rate)
+                if accounting_amount is not None and abs(accounting_amount - extended_amount) <= 1:
+                    raw_line["amount"] = format(accounting_amount, "f")
+                    amount_reconciles = True
+                else:
+                    warnings.append(
+                        ParseWarning(
+                            code="DBC_AMOUNT_CONFLICT",
+                            message=(
+                                "The DBC accounting amount does not agree with quantity times "
+                                "rate; the source amount was retained for review."
+                            ),
+                            locator=f"/ENVELOPE/DBC_RECORD[{record_number}]/ROW[{row_number}]",
+                        )
+                    )
             line_raw.append(raw_line)
+            narrations.append([])
             line_extras.append(
                 {
+                    "dbc_stock_item": description,
                     "dbc_quantity_raw": quantity_raw,
                     "dbc_rate_raw": rate_raw,
-                    "dbc_accounting_amount_raw": next(
-                        (value.strip() for value in values.get("DBCAMOUNT", []) if value.strip()),
-                        None,
-                    ),
+                    "dbc_accounting_amount_raw": accounting_amount_raw,
                     "dbc_alternate_units_raw": values.get("DBCALTUNITS", []),
                     "dbc_source_row": row_number,
-                    "dbc_line_description_missing": True,
+                    "dbc_line_description_missing": description is None,
+                    "dbc_amount_reconciles_to_quantity_times_rate": amount_reconciles,
                 }
             )
+
+        for raw_line, extras, texts in zip(line_raw, line_extras, narrations, strict=True):
+            name, code, serials, other = _dbc_narration(texts)
+            if name:
+                # The stock item is often a category ("CABINET"); the item is named below it.
+                raw_line["description"] = name
+            if code:
+                raw_line.setdefault("item_code", code)
+            if serials:
+                extras["serials"] = serials
+            if other:
+                extras["dbc_narration"] = other
+        reconciled = _dbc_totals_reconcile(rows, line_raw)
 
         record_locator = f"/ENVELOPE/DBC_RECORD[{record_number}]"
         document, document_warnings = build_document(
@@ -520,15 +669,16 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
                     }
                     for row_number, values in enumerate(rows, start=start_row)
                     if any(
-                        values.get(name)
-                        for name in ("DBCALTUNITS", "DBCBUYERNAME", "DBCGROSSAMT")
+                        values.get(name) for name in ("DBCALTUNITS", "DBCBUYERNAME", "DBCGROSSAMT")
                     )
                 ],
                 "dbc_source_fields_raw": [
                     {"row": row_number, "fields": values}
                     for row_number, values in enumerate(rows, start=start_row)
                 ],
-                "dbc_line_descriptions_present": False,
+                "dbc_line_descriptions_present": any(
+                    bool(line.get("description")) for line in line_raw
+                ),
                 "dbc_explicit_po_reference_present": False,
             },
             line_extras=line_extras,
@@ -538,36 +688,45 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
             uom_aliases=hints.uom_aliases,
             charge_keywords=hints.charge_keywords,
         )
-        document = document.model_copy(
-            update={
-                "needs_verification": True,
-                "reason_codes": tuple(
-                    dict.fromkeys(
-                        (
-                            *document.reason_codes,
-                            ReasonCode.ITEM_UNSURE,
-                            *(
-                                (ReasonCode.NO_PO_LINK,)
-                                if hints.doc_type is DocType.INVOICE
-                                else ()
-                            ),
-                        )
-                    )
-                ),
-            }
+        # A digital export is trusted as read when every line names its item and the
+        # voucher's own totals agree; otherwise a person checks it.
+        unnamed = not line_raw or any(not line.get("description") for line in line_raw)
+        reasons = (
+            *((ReasonCode.ITEM_UNSURE,) if unnamed else ()),
+            *(() if reconciled else (ReasonCode.LOW_CONFIDENCE_DATA,)),
+            *((ReasonCode.NO_PO_LINK,) if hints.doc_type is DocType.INVOICE else ()),
         )
+        if not reconciled:
+            warnings.append(
+                ParseWarning(
+                    code="DBC_TOTALS_UNRECONCILED",
+                    message=(
+                        "The voucher's line amounts, taxable amount and ledger amounts could "
+                        "not be reconciled with its gross amount; review the document."
+                    ),
+                    locator=record_locator,
+                )
+            )
+        if reasons:
+            document = document.model_copy(
+                update={
+                    "needs_verification": True,
+                    "reason_codes": tuple(dict.fromkeys((*document.reason_codes, *reasons))),
+                }
+            )
         documents.append(document)
         warnings.extend(document_warnings)
-        warnings.append(
-            ParseWarning(
-                code="DBC_LINE_DESCRIPTION_MISSING",
-                message=(
-                    "This DBC export has no item descriptions or item codes; automatic item "
-                    "matching is unsafe and this document requires review."
-                ),
-                locator=record_locator,
+        if line_raw and any("description" not in line for line in line_raw):
+            warnings.append(
+                ParseWarning(
+                    code="DBC_LINE_DESCRIPTION_MISSING",
+                    message=(
+                        "One or more DBC inventory rows have no item description; automatic "
+                        "item matching for those rows is unsafe and they require review."
+                    ),
+                    locator=record_locator,
+                )
             )
-        )
         warnings.append(
             ParseWarning(
                 code="DBC_PO_REFERENCE_MISSING",
@@ -590,6 +749,12 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
 
 
 def parse_xml(content: bytes, hints: ParserHints) -> ParseResult:
+    """Parse secure XML bytes, then apply the shared party and GST guards."""
+
+    return guard_result(_parse_xml(content, hints), hints)
+
+
+def _parse_xml(content: bytes, hints: ParserHints) -> ParseResult:
     """Parse secure XML bytes into zero or more canonical documents."""
 
     empty_signature = hashlib.sha256(b"xml:empty").hexdigest()
@@ -643,9 +808,7 @@ def parse_xml(content: bytes, hints: ParserHints) -> ParseResult:
                 ),
             )
 
-        direct_tags = {
-            _tag_name(child) for child in root if isinstance(child.tag, str)
-        }
+        direct_tags = {_tag_name(child) for child in root if isinstance(child.tag, str)}
         if (
             _tag_name(root) == "ENVELOPE"
             and "DBCFIXED" in direct_tags

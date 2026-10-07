@@ -15,6 +15,7 @@ from reconbench_core.align import (
     AlignmentWeights,
     align_lines,
 )
+from reconbench_core.extraction.pages import split_unconfirmed
 from reconbench_core.normalize import canonicalize_document_number, parse_decimal
 from reconbench_core.schema import (
     AlignmentState,
@@ -35,6 +36,7 @@ from reconbench_core.schema import (
 _ONE = Decimal("1")
 _ZERO = Decimal("0")
 _FOUR_PLACES = Decimal("0.0001")
+MANUAL_SELECTION_EVIDENCE = "Manually selected by the operator"
 _CONTENT_WEIGHTS = (
     Decimal("0.40"),
     Decimal("0.20"),
@@ -186,7 +188,10 @@ def _po_matches(
     )
     if exact:
         if vendor_id is None:
-            return (exact, False) if len(exact) == 1 else ((), False)
+            # Document numbers are scoped to suppliers in real purchasing
+            # systems. A globally unique candidate in today's upload pool is
+            # not proof that an unassigned invoice belongs to that supplier.
+            return (), True
         same_vendor = tuple(po for po in exact if po.vendor_id == vendor_id)
         if len(same_vendor) == 1:
             return same_vendor, False
@@ -261,10 +266,25 @@ def _links_for_matches(
     confidence: Decimal,
     config: MappingConfig,
     via_document_id: UUID | None = None,
+    held: bool = False,
 ) -> tuple[ProposedLink, ...]:
+    """Proposed links; ``held`` keeps them suggestions (an unconfirmed page split on the path)."""
+
     unique: dict[tuple[UUID, int | None], ProposedLink] = {}
     for po, level, line_no, evidence in matches:
         key = (po.document_id, line_no)
+        state = (
+            LinkState.CONFIRMED
+            if method is LinkMethod.MANUAL
+            else _confidence_state(confidence, config)
+        )
+        # A document split out of a bundle is not linked automatically until a
+        # person accepts the split (accuracy plan AC-3).
+        if state is LinkState.AUTO and (
+            held or split_unconfirmed(source.document) or split_unconfirmed(po.document)
+        ):
+            state = LinkState.SUGGESTED
+            evidence = f"{evidence}; file split not confirmed"
         unique[key] = ProposedLink(
             from_document_id=source.document_id,
             to_document_id=po.document_id,
@@ -272,11 +292,7 @@ def _links_for_matches(
             level=level,
             method=method,
             confidence=confidence,
-            state=(
-                LinkState.CONFIRMED
-                if method is LinkMethod.MANUAL
-                else _confidence_state(confidence, config)
-            ),
+            state=state,
             evidence=evidence,
             line_no=line_no,
             via_document_id=via_document_id,
@@ -526,7 +542,7 @@ def _reverse_matches(
     return (), None, None
 
 
-def _grn_matches_invoice(invoice: MappingDocument, grn: MappingDocument) -> bool:
+def _grn_reference_matches_invoice(invoice: MappingDocument, grn: MappingDocument) -> bool:
     invoice_header = invoice.document.header
     grn_header = grn.document.header
     if not isinstance(invoice_header, InvoiceHeader) or not isinstance(grn_header, GRNHeader):
@@ -554,6 +570,13 @@ def _grn_matches_invoice(invoice: MappingDocument, grn: MappingDocument) -> bool
     )
 
 
+def _grn_matches_invoice(invoice: MappingDocument, grn: MappingDocument) -> bool:
+    """Require a resolved, identical supplier before accepting a GRN reference."""
+    if invoice.vendor_id is None or grn.vendor_id is None or invoice.vendor_id != grn.vendor_id:
+        return False
+    return _grn_reference_matches_invoice(invoice, grn)
+
+
 def _via_grn_resolution(
     source: MappingDocument,
     documents: tuple[MappingDocument, ...],
@@ -562,21 +585,36 @@ def _via_grn_resolution(
     config: MappingConfig,
 ) -> tuple[tuple[ProposedLink, ...], ReasonCode | None, str | None]:
     matched_grns: list[MappingDocument] = []
+    mismatched: list[str] = []
     for peer in documents:
-        if peer.document.header.doc_type is DocType.GRN:
-            if source.document.header.doc_type is DocType.INVOICE and _grn_matches_invoice(
-                source, peer
+        if (
+            peer.document.header.doc_type is DocType.GRN
+            and source.document.header.doc_type is DocType.INVOICE
+            and _grn_reference_matches_invoice(source, peer)
+        ):
+            if (
+                source.vendor_id is None
+                or peer.vendor_id is None
+                or source.vendor_id != peer.vendor_id
             ):
+                mismatched.append(_doc_no(peer.document) or "GRN supplier")
+            else:
                 matched_grns.append(peer)
         elif (
             source.document.header.doc_type is DocType.GRN
             and peer.document.header.doc_type is DocType.INVOICE
-            and _grn_matches_invoice(peer, source)
+            and _grn_reference_matches_invoice(peer, source)
         ):
-            matched_grns.append(source)
+            if (
+                source.vendor_id is None
+                or peer.vendor_id is None
+                or source.vendor_id != peer.vendor_id
+            ):
+                mismatched.append(_doc_no(peer.document) or "invoice supplier")
+            else:
+                matched_grns.append(source)
 
     matches: list[tuple[MappingPO, LinkLevel, int | None, str]] = []
-    mismatched: list[str] = []
     for grn in sorted(matched_grns, key=lambda item: str(item.document_id)):
         grn_refs, _, _ = _header_refs(grn.document)
         grn_number = _doc_no(grn.document) or "GRN"
@@ -600,7 +638,13 @@ def _via_grn_resolution(
             linked_po = next(
                 (candidate for candidate in purchase_orders if candidate.document_id == po_id), None
             )
-            if linked_po is not None and linked_po.document_id not in source.rejected_po_ids:
+            if (
+                source.vendor_id is not None
+                and grn.vendor_id == source.vendor_id
+                and linked_po is not None
+                and linked_po.vendor_id == source.vendor_id
+                and linked_po.document_id not in source.rejected_po_ids
+            ):
                 matches.append(
                     (
                         linked_po,
@@ -616,6 +660,7 @@ def _via_grn_resolution(
         confidence=config.confidence_via_grn,
         config=config,
         via_document_id=matched_grns[0].document_id if matched_grns else None,
+        held=any(split_unconfirmed(grn.document) for grn in matched_grns),
     )
     if links:
         return links, None, None
@@ -636,13 +681,13 @@ def _manual_resolution(
         po = by_id.get(po_id)
         if po is None or po_id in source.rejected_po_ids:
             continue
-        if source.vendor_id is not None and po.vendor_id != source.vendor_id:
+        if source.vendor_id is None or po.vendor_id != source.vendor_id:
             mismatch = True
             continue
         links.extend(
             _links_for_matches(
                 source,
-                ((po, LinkLevel.HEADER, None, "Manually selected by the operator"),),
+                ((po, LinkLevel.HEADER, None, MANUAL_SELECTION_EVIDENCE),),
                 method=LinkMethod.MANUAL,
                 confidence=config.confidence_manual,
                 config=config,
@@ -1066,6 +1111,56 @@ def _content_resolution(
             remaining_grn_qty[best_po.document_id].get(po_line_no, _ZERO) + quantity
         )
     return _resolution(source, links, candidates=candidates)
+
+
+def rank_po_candidates(
+    source: MappingDocument,
+    purchase_orders: tuple[MappingPO, ...] | list[MappingPO],
+    config: MappingConfig | None = None,
+    *,
+    limit: int,
+) -> tuple[LinkCandidate, ...]:
+    """Rank eligible same-vendor POs by whole-document content score, best first.
+
+    Uses each PO's phase-A open-balance snapshot without in-run reservations, so it
+    never changes :func:`resolve_links` output. Eligibility matches content inference:
+    same vendor, open balance, PO dated on or before the source, not rejected by a person.
+    """
+
+    if limit < 1:
+        raise ValueError("candidate limit must be at least 1")
+    selected_config = config or MappingConfig()
+    source_date = _header_date(source.document)
+    if source.vendor_id is None or source_date is None:
+        return ()
+    scored: list[tuple[MappingPO, Decimal]] = []
+    for po in purchase_orders:
+        po_date = _header_date(po.document)
+        if (
+            po.vendor_id == source.vendor_id
+            and po.open_balance > _ZERO
+            and po_date is not None
+            and po_date <= source_date
+            and po.document_id not in source.rejected_po_ids
+        ):
+            score, _ = _content_score(
+                source,
+                po,
+                dict(po.open_qty_by_line),
+                dict(po.grn_support_qty_by_line),
+                selected_config,
+            )
+            scored.append((po, score))
+    scored.sort(key=lambda item: (-item[1], str(item[0].document_id)))
+    return tuple(
+        LinkCandidate(
+            po_document_id=po.document_id,
+            po_no=_doc_no(po.document) or "",
+            score=score,
+            evidence="Content score over item, quantity, rate, date, GRN, and buyer signals.",
+        )
+        for po, score in scored[:limit]
+    )
 
 
 def resolve_links(

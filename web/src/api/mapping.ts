@@ -9,9 +9,14 @@ export interface MappingCounts {
   unlinked: number;
 }
 
+/** Trust in the display name (AC-4): a person's, a checked reading, an OCR reading, or none yet. */
+export type VendorNameStatus = "manual" | "verified" | "provisional" | "pending";
+
 export interface MappingVendor {
   id: string | null;
   canonical_name: string;
+  name_status?: VendorNameStatus;
+  version?: number;
   gstins: string[];
   pan: string | null;
   anchor: string;
@@ -29,6 +34,8 @@ export interface CurrentMappingLink {
   method: string;
   confidence: string | number;
   state: "auto" | "suggested" | "confirmed" | "rejected";
+  /** Proposed by AI (H3) or confirmed from an AI proposal; never used until confirmed. */
+  ai_suggested?: boolean;
   evidence: string | null;
   level: string;
   line_no: number | null;
@@ -38,6 +45,8 @@ export interface MappingDocument {
   id: string;
   doc_type: "po" | "grn" | "invoice";
   doc_no: string | null;
+  vendor_name: string | null;
+  vendor_gstin: string | null;
   doc_date: string | null;
   grand_total: string | number | null;
   currency: string | null;
@@ -67,6 +76,9 @@ export interface MergeSuggestion {
   vendor_b_pan: string | null;
   vendor_b_gstins: string[];
   pan_conflict: boolean;
+  /** Advisory H4 opinion; it never merges or decides anything. */
+  ai_opinion?: "same" | "different" | "unsure" | null;
+  ai_reason?: string | null;
 }
 
 export interface VendorAlias {
@@ -149,6 +161,24 @@ export function addVendorAlias(vendorId: string, alias: string, csrfToken: strin
 export function deleteVendorAlias(aliasId: string, csrfToken: string): Promise<{ deleted: boolean }> {
   return requestJson<{ deleted: boolean }>(`/vendor-aliases/${encodeURIComponent(aliasId)}`, csrfToken, {
     method: "DELETE",
+  });
+}
+
+export function createMappingVendor(
+  vendor: { name: string; gstin?: string | null; pan?: string | null },
+  csrfToken: string,
+): Promise<MappingVendor> {
+  return requestJson<MappingVendor>("/vendors", csrfToken, {
+    method: "POST",
+    body: JSON.stringify({ name: vendor.name, gstin: vendor.gstin || null, pan: vendor.pan || null }),
+  });
+}
+
+export function renameMappingVendor(vendorId: string, name: string, version: number, csrfToken: string): Promise<unknown> {
+  return requestJson(`/vendors/${encodeURIComponent(vendorId)}`, csrfToken, {
+    method: "PATCH",
+    headers: { "If-Match": `"${version}"` },
+    body: JSON.stringify({ name }),
   });
 }
 
