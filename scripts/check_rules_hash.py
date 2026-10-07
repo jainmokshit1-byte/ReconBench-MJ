@@ -17,7 +17,10 @@ def calculate_rules_hash() -> str:
         CORE.rglob("*.py"), key=lambda item: item.relative_to(CORE).as_posix()
     ):
         relative = path.relative_to(CORE).as_posix().encode("utf-8")
+        # Git may check these files out with CRLF on Windows and LF on Linux.
+        # Hash normalized source bytes so the recorded rules hash is portable.
         contents = path.read_bytes()
+        contents = contents.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         digest.update(len(contents).to_bytes(8, "big"))
