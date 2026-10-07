@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
+import pytest
 from reconbench_app.ai.provider import ProviderRequest, ProviderResult, ProviderUsage
 from reconbench_app.pdf_sandbox import parse_pdf_isolated
 from reconbench_core.parsers import ParserHints
@@ -351,6 +353,7 @@ def test_short_partial_refs_do_not_count() -> None:
     assert accuracy_vision._ref_hit(["04-555"], ["PO 26-27/04-555"]) == (1, 1)
 
 
+@pytest.mark.skipif(shutil.which("tesseract") is None, reason="Tesseract is not installed")
 def test_probe_dry_run_writes_masked_images_and_sends_nothing(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

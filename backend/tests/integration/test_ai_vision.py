@@ -343,6 +343,7 @@ def _grn_answer() -> dict[str, Any]:
                 "box_2d": [180, 40, 200, 600],
                 "description": "Synthetic Laptop Model X1",
                 "quantity": "2 Nos",
+                "amount": "",
             }
         ],
         "annotations": [],
@@ -560,7 +561,7 @@ def test_grn_readings_are_shown_read_only(
     assert _prepare(world) == ["queued"]
     [request_id] = world.ai_queue.request_ids
     result = _runner(engine, keys[0], _Recorder([json.dumps(_grn_answer())])).run(request_id)
-    assert (result.state, result.apply_outcome) == ("succeeded", "applied")
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
     view, _etag = _view(world, document_id)
     assert view["state"] == "available" and view["correctable"] is False
     by_field = {item["field"]: item["value"] for item in view["suggestions"]}
