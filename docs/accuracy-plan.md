@@ -12,13 +12,14 @@ This is the single authoritative accuracy plan. The other authoritative plan is 
 |---|---|
 | Date / last decision | 20 Oct 2026 / **D78** (this consolidation; the last engineering entry is D77) |
 | Main-plan anchors | [Task 4.9](ReconBench_Implementation_Plan.md) (PDF extractor; gate ≥ 97% critical-field accuracy, no field < 95%; "blocked until real PDFs exist"), **Task 4.9b** (scanned-invoice OCR, G-30: it is **not in the main plan**; see [`gates/phase-4.md`](gates/phase-4.md) "Task 4.9b" and decision-log G-30), [Task 4.17](ReconBench_Implementation_Plan.md) (AI assist), and the [Phase 4 exit gate](ReconBench_Implementation_Plan.md) (TRD M3). G-07 is the register row for real samples, not the exit gate itself. |
-| Branch / tree | `phase2-hosted-ci`; 159 uncommitted entries (98 modified, 61 untracked) at 20 Oct; other sessions share the tree, containers and database |
+| Branch / tree | `phase2-hosted-ci`; 152 uncommitted entries remain after the two consolidation commits (159 before); other sessions share the tree, containers and database |
+| Consolidation | done 20 Oct (D79): snapshot commit tagged `pre-plan-merge-20261020`, then the five retired documents removed (§14) |
 
 **Where we are.** The rules + OCR path, QR, page split, vendor hygiene, vision reader, consensus (D42), verify screen, identity and matching v2 are built (AC-0 … AC-9a, D32–D58). The provider layer, the Qwen reader, settings, shadow store and the evaluation harness are built **in the working tree only** (D62–D67; offline suites 1090 passed per D77, not re-run for this plan). Qwen3.5-9B on the company vLLM server has been benchmarked offline in six server reads (D68–D77). With prompt `vision.prompt.v4.qwen` and the D77 cross-page conflict rule it reads **275/313 headers (87.9%)** on the 39 dev PDFs, against **242/313 (77.3%)** for Tesseract + rules on the same documents (`ev2-e5-v4-ctl.json`, repeat 0 = the 16 Oct read, D74 answers rescored under D77). Lines are weaker: amount 90/123, quantity 79/114, rate 85/118, description 47/108 (40 wrong), HSN 46/75. **No accuracy target is met.** All hard-zero metrics are 0 in every stored report, and the simulated critical false-accept count is 0.
 
 **Qwen is not live.** The running containers (images built 16 Oct 04:41) contain no D62–D77 code (no `openai_compat.py`, no `endpoint_policy.py`, migrations end at 0024, container `RULES_HASH` `43b153f7…` vs tree `1e9af32f…`); the live database is at `0024` while the tree needs `0027`; `compose.yaml` forwards no `RB_AI_VLLM_*` variable. The live app runs Gemini `ai_first` with page images on (`gemini-3.5-flash-lite`), suggestions only: 40 documents, 29 `h6_vision` requests (26 applied, 2 discarded invalid, 1 failed; 7–9 Oct), 17 H1 requests, **0 `consensus_run` rows**, 0 document versions created from an AI reader (live DB read-only check, 20 Oct). Qwen output never reaches a document value today, and Excel export on real data has never been measured.
 
-**Owner decisions recorded 20 Oct (O-1 … O-9, §9):** two-tier truth set; auto-accept only through agreement or a deterministic validator plus the lower-bound gate and a shadow period; Gemini is optional; D72 lifted for WI-V2 only; version rule through `CONSENSUS_VERSION`; Qwen down → rules + OCR with a visible flag; live rebuild only inside AC-INT1 with a tested backup.
+**Owner decisions recorded 20 Oct (O-1 … O-17, DP-L1, §9):** two-tier truth set; auto-accept only through agreement or a narrowly defined deterministic validator (GSTIN matched to the vendor master; a fully closed amount chain) plus the DP-L1 lower-bound gate (option A), a shadow period and a circuit breaker; Gemini is optional; D72 lifted for WI-V2 only; version rule through `CONSENSUS_VERSION`; Qwen down → rules + OCR with a visible flag; live rebuild only inside AC-INT1 with a tested backup.
 
 **Stage 4 ready queue (needs separate authorisation to change code, call the server, run benches or touch deployment):**
 1. **WI-BE8** cropped two-pass reading, in parallel with **WI-D5** (truth set; labelling protocol is in §7).
@@ -83,7 +84,7 @@ A target is **claimed** only when the held-out sample size is large enough (§5.
 
 **D42 (decided 8 Oct; every sub-phase implements it).** A machine-read value is verified without a person per field only if (1) two independent readers give the same normalised value (OCR/text, signed QR, XML, vision; two answers of one model never count twice), (2) every deterministic validator passes, (3) a local OCR re-read of the reader's box agrees, (4) never for handwritten/stamped marks, new vendor names, a field a person corrected, or an unconfirmed split, (5) switched on per field type only after the bench shows 0 false-safe and 0 agree-wrong-confirmed for that type, behind a workspace setting that is off by default. Two different vision LLMs are one reader kind (DP-L2: No). Consensus invariants CI-1 … CI-6 (AC-6a tests): consensus never changes a value; L0/person values untouched; policy off ⇒ same object; a vision-only value is never written; result independent of input order; a never-automatic name never gets `auto_verified`.
 
-**O-2 additions (20 Oct) in front of D42, not instead of it.** A critical field may leave review without a person only if **all** hold: (a) *Qwen and OCR agree* **or** *a deterministic validator confirms* (the validator-only path exists only for the two classes in §2.4: supplier GSTIN and arithmetic-closed amounts; it amends D42 rule 1 for those classes and still needs rules 2, 3 and 5); (b) the field type passes the lower-bound gate on **held-out** data (DP-L1, §9); (c) 0 critical wrong on that data; (d) a shadow period has passed (§6, PH3); (e) D42 rules 2–5 hold. Nothing else changes D42. *Interpretation to confirm: O-10.*
+**O-2 additions (20 Oct) in front of D42, not instead of it.** A critical field may leave review without a person only if **all** hold: (a) *Qwen and OCR agree* **or** *a deterministic validator confirms*, where the validator-only path (no OCR agreement) is allowed **only** for (i) supplier GSTIN: the checksum passes **and** it is not a buyer entity's GSTIN **and** it equals the vendor-master GSTIN of that vendor; (ii) amounts: the **full chain** closes within rounding (Σ line amounts = taxable and taxable + tax = grand total); partial closure is agreement-only. Every other case is agreement-only. The validator-only path amends D42 rule 1 for these two cases and still needs rules 2, 3 and 5 (owner decision O-10, 20 Oct); (b) the field type passes the lower-bound gate on **held-out** data (DP-L1, §9); (c) 0 critical wrong on that data; (d) a shadow period has passed (§6, PH3); (e) D42 rules 2–5 hold. Nothing else changes D42.
 
 ### 2.4 Safety gates by field class (default action per case)
 
@@ -92,10 +93,10 @@ Actions: **AA** auto-accept (may reach L1 through consensus, subject to §2.3), 
 | Class (fields) | Qwen alone | Qwen and OCR agree | Validator confirms | Readers conflict | Missing |
 |---|---|---|---|---|---|
 | Critical IDs: doc no., doc date, printed PO/GRN refs | S | AA (gated) | VA only for refs matching an open same-vendor PO/GRN (V-REFEXIST); none for doc no./date | S with both values; never AA | U |
-| Supplier GSTIN | S | AA (gated) | **VA**: checksum + not a buyer entity + state consistent + equals the linked PO's vendor GSTIN when one exists | R if a validator fails, else S | U |
+| Supplier GSTIN | S | AA (gated) | **VA** only if checksum passes **and** not the buyer entity's GSTIN **and** equals the vendor-master GSTIN for that vendor; otherwise agreement-only | R if a validator fails, else S | U |
 | Vendor name | S | S (never automatic, D42 rule 4) | — | S | U |
-| Amounts/totals (taxable, tax, grand) | S | AA (gated) | **VA**: full arithmetic tree closes ±₹1, amount-in-words equal when present | S, never AA | U |
-| Line amount / quantity / rate | S | AA for `line_amount` (D42 list), S for qty/rate until gated | VA: qty × rate ≈ amount; Σ lines = taxable before review is cleared (MG-4) | S | U |
+| Amounts/totals (taxable, tax, grand) | S | AA (gated) | **VA** only if the full chain closes within rounding: Σ lines = taxable **and** taxable + tax = grand; partial closure is agreement-only | S, never AA | U |
+| Line amount / quantity / rate | S | AA for `line_amount` (D42 list), S for qty/rate until gated | VA only through the full amount chain above; qty × rate ≈ amount alone is agreement-only; Σ lines = taxable is required before review is cleared (MG-4) | S | U |
 | **Line description** | **S** | **S** | — | S | U |
 | HSN/SAC | S | S until DP-L1 data exist | VA after WI-V1 (4/6/8-digit shape) | S | U |
 | Handwritten / stamped marks | S (annotation only, hint) | S | — | S | not scored as fields |
@@ -264,8 +265,8 @@ A value that fails its validator is excluded from the merge but kept as a visibl
 
 | Validator | Checks | Exists? | Needs D72 lifted? |
 |---|---|---|---|
-| V-GSTIN | checksum, not a buyer entity, state vs place of supply, tax type vs state | yes (`check_reading`, `values.py`, `parties.py`) | no |
-| V-ARITH | taxable + taxes ± round-off = grand (±₹1); amount in words | yes, mark-only (D63) | no |
+| V-GSTIN | checksum, not a buyer entity, equals the vendor-master GSTIN of the vendor (all three required for the validator-only path), state vs place of supply, tax type vs state | yes (`check_reading`, `values.py`, `parties.py`) | no |
+| V-ARITH | taxable + taxes ± round-off = grand (±₹1); amount in words. With V-SUMLINES it forms the **full chain** that alone permits the amount validator-only path | yes, mark-only (D63); chain gate new in WI-BE7a | no |
 | V-LINE | qty × rate ≈ amount | yes, mark-only | no |
 | V-SUMLINES | Σ line amounts = taxable (±₹1) | yes, mark-only; becomes a **gate** for clearing review (MG-4) | no |
 | V-DATE | date window (D42), invoice date ≥ PO date warning | yes, needs `as_of` | no |
@@ -457,12 +458,12 @@ Rules:
 
 ## 6. Phases
 
-Each phase lists entry and exit criteria. Interim numbers marked *proposed* are pre-registered per experiment, never fitted afterwards; the contract numbers (§2.2) are the final gate. Every phase ends with: the regression gate (§5.3), a decision-log entry, and an update of §0.
+Each phase lists entry and exit criteria. Interim numbers marked *pre-registered* were accepted by the owner on 20 Oct, before any PH2 run, and are never fitted afterwards; the contract numbers (§2.2) are the final gate. Every phase ends with: the regression gate (§5.3), a decision-log entry, and an update of §0.
 
 | Phase | Entry | Tasks | Exit criteria (numbers) |
 |---|---|---|---|
-| **PH1 Measurement and integrity** | this plan approved | WI-EV3, WI-D5 (protocol + first batch), WI-T1, WI-INT0 | (1) one gate command reproduces 302/373 (rules, `scanfix-truth-2.json` hash `470682236b6d`) and 275/313 (Qwen, `ev2-e5-v4-ctl.json` answers, `--network none`) with identical hashes; (2) MT-1 … MT-17 implemented with unit tests on synthetic truth; (3) WI-T1 closed; (4) WI-INT0 root cause written with a reproducible check; (5) labelling protocol accepted by the owner and ≥ 25 Tier H invoices double-labelled with ≥ 95% agreement on critical fields (disagreements adjudicated) |
-| **PH2 Qwen reading quality** (dev set) | PH1 gate command; server reachable; per-run approval recorded | WI-BE8, WI-V1, WI-V2, WI-Q1, WI-Q2, WI-Q3, close WI-EV2, WI-OPS1 | *proposed*: all 39 dev PDFs have a usable answer (0 lost to the output cap); dev headers ≥ 92% (≥ 288/313) with accepted-wrong 0; scan-page line amount ≥ 85% (≥ 105/123), quantity and rate ≥ 80%; WI-Q1 verdict recorded against its target; marketplace 5/5 with 0 side effects; handwritten recall reported; WI-EV2 matrix filled; arbitration `arb.v1` drafted from dev |
+| **PH1 Measurement and integrity** | this plan approved | WI-EV3, WI-D5 (protocol + first batch), WI-T1, WI-INT0 | (1) one gate command reproduces 302/373 (rules, `scanfix-truth-2.json` hash `470682236b6d`) and 275/313 (Qwen, `ev2-e5-v4-ctl.json` answers, `--network none`) with identical hashes; (2) MT-1 … MT-17 implemented with unit tests on synthetic truth; (3) WI-T1 closed; (4) WI-INT0 root cause written with a reproducible check; (5) labelling protocol accepted by the owner and the **first 25** Tier H invoices double-labelled with ≥ 95% agreement on critical fields (disagreements adjudicated); the remaining Tier H collection is staged with no date commitment (O-12) |
+| **PH2 Qwen reading quality** (dev set) | PH1 gate command; server reachable; per-run approval recorded | WI-BE8, WI-V1, WI-V2, WI-Q1, WI-Q2, WI-Q3, close WI-EV2, WI-OPS1 | **pre-registered 20 Oct**: all 39 dev PDFs have a usable answer (0 lost to the output cap); dev headers ≥ 92% (≥ 288/313) with accepted-wrong 0; scan-page line amount ≥ 85% (≥ 105/123), quantity and rate ≥ 80%; WI-Q1 verdict recorded against its target; marketplace 5/5 with 0 side effects; handwritten recall reported; WI-EV2 matrix filled; arbitration `arb.v1` drafted from dev |
 | **PH3 Reliability and deployment ladder** | AC-INT1a complete (backup, tested restore, dry-run 0024→0027 on a copy) | WI-OPS2, WI-OPS3, WI-BE9, AC-INT1b, AC-LIVE-S, WI-FE1, WI-FE3, WI-D3 | RG-1 … RG-6 verified on the running stack in shadow; WI-INT0 closed; canary running ≥ 7 days with an epoch record; shadow ≥ 14 days **and** ≥ 100 shadow comparisons (a back-fill of the 40 live documents counts); shadow writes 0 rows to documents (test); outage drill (server blocked ≥ 10 min): documents flagged, no queue pile-up, hard zeros 0 |
 | **PH4 Merge** | PH2 and PH3 exits; DP-L1 numbers decided; Tier H ≥ 80 labelled and frozen | WI-G3, WI-BE7a/b/c, WI-FE2, AC-LIVE-M | on held-out Tier H: each claimed critical field has n ≥ 73 and a 95% lower bound ≥ 95% (zero errors, or the +30 escalation); pooled critical ≥ 97%; `critical_false_accept` 0; flag-off bench hash identical; merge enabled only for field types that pass, all others stay suggestions; lines and links: target met or gap reported with n |
 | **PH5 Matching and identity** (parallel with PH2–PH4) | none | WI-D4, WI-D6, AC-8b, AC-9b, AC-10a/b | links ≥ 7/10 on dev with 0 false auto and 0 false suggestions (WI-D4); then on held-out Tier S: recall reported with counts (target 95%), false auto 0; AC-8b extras and missed duplicates at an owner-accepted level; B6/B10 closed |
@@ -648,7 +649,7 @@ Scenario tests in `tests/scenarios/test_hard_zero_guards.py`: an LLM-only value 
 
 #### WI-BE7a — Merge core (pure) with the D77 guards
 **Open (Stage 4 third)** · M · Deps: WI-EV2 decision, WI-V1 · Approval: N (code)
-`reconbench_core/extraction/llm_merge.py`: `merge_readings(ocr, readings, policy) -> MergeResult` per §4.10 with guards MG-1 … MG-9 and `arb.v1` as data. **Acceptance:** unit test per rule; property tests (no `source=AI` field with only LLM readers has confidence ≥ 0.70 or `verified`; values of manual/verified fields never change); the S08-INV pattern (all critical accepted, lines wrong) keeps its review flag; the bench `--vision-primary-sim` equals the app merge on synthetic documents.
+`reconbench_core/extraction/llm_merge.py`: `merge_readings(ocr, readings, policy) -> MergeResult` per §4.10 with guards MG-1 … MG-9 and `arb.v1` as data. The consensus side implements the narrowed validator-only path exactly as in §2.3 (GSTIN: checksum + not the buyer entity + equals the vendor-master GSTIN; amounts: Σ lines = taxable and taxable + tax = grand; anything less is agreement-only) and the O-11 circuit breaker. **Acceptance:** unit test per rule; property tests (no `source=AI` field with only LLM readers has confidence ≥ 0.70 or `verified`; values of manual/verified fields never change); the S08-INV pattern (all critical accepted, lines wrong) keeps its review flag; the bench `--vision-primary-sim` equals the app merge on synthetic documents.
 
 #### WI-BE7b — Merge job and persistence
 **Open** · M · Deps: BE7a, AC-INT1b (integration) · Approval: N
@@ -751,7 +752,14 @@ WI-D3 ─► (release tag base) before AC-INT1b ;  WI-FE1/FE3 ─► WI-FE2 ─�
 | O-7 | `audit-llm-extraction.md` is retired after its findings are merged (§4.13, §12, §13); archive copy per Option B. |
 | O-8 | Live rebuild/migration approved only inside AC-INT1: full DB backup, a tested restore, and a dry-run 0024→0027 on a copy first. No rebuild in Stages 2–3. |
 | O-9 | Carried items keep their existing defaults (B4, B12, FP DP-6/7/8, FP DP-4). |
-| Recoverability | Option A′ (docs-only commit, explicit pathspecs, tag `pre-plan-merge-20261020`) **and** Option B (copy to `work/plan-archive-20261020/`). Nothing else is committed. |
+| DP-L1 | Option (A) for first enablement: Wilson lower bound ≥ 95% with n ≥ 73 error-free per field type, 0 critical wrong, plus the O-11 circuit breaker. Option (B) (lower bound ≥ 98%, n ≥ 189 error-free, precision ≥ 99.5%) stays the target for wider auto-accept. Arithmetic corrected: the retired text asked for a 98% bound on "≥ 100 values", which is impossible (100 error-free values give 96.3%). Shadow agreement is not accuracy: correctness evidence comes only from labelled sets and verify-screen corrections. |
+| O-10 (narrowed) | The validator-only path is allowed only for (i) supplier GSTIN: checksum passes and not the buyer entity's GSTIN and equals the vendor-master GSTIN for that vendor, otherwise agreement-only; (ii) amounts: the full chain closes within rounding (Σ lines = taxable and taxable + tax = grand total), partial closure is agreement-only. It amends D42 rule 1 for these two cases only (§2.3). |
+| O-13 | Gemini is turned off through a new `vision_only` mode (WI-BE9, option B). |
+| O-14 | Shadow-only back-fill of the 40 live documents. AC-LIVE-S may turn off Gemini page-image reading (the live app is not used for real decisions yet). |
+| O-15 | The first release tag is created at AC-INT1b. |
+| O-17 | AC-8b: close the gap or accept the residual (8 extra documents, 2 missed duplicates): decide after PH4. |
+| PH2 interim targets | Dev headers ≥ 92%, scan-page line amount ≥ 85% (quantity and rate ≥ 80%), 0 documents lost to the output cap, accepted-wrong 0: pre-registered in §6 before any PH2 run. |
+| Recoverability | Option A′ (docs-only commit, explicit pathspecs, tag `pre-plan-merge-20261020`) **and** Option B (copy to `work/plan-archive-20261020/`, tarball `~/reconbench-archive/plan-archive-20261020.tar.gz`). Nothing else is committed. |
 
 ### 9.2 Old owner decisions D-1 … D-10 (status)
 
@@ -770,16 +778,10 @@ WI-D3 ─► (release tag base) before AC-INT1b ;  WI-FE1/FE3 ─► WI-FE2 ─�
 
 ### 9.3 Open decisions (each with options, recommended default and what stays blocked)
 
+DP-L1 and O-10 … O-16 were decided on 20 Oct and moved to §9.1; O-17 and the carried items remain open.
+
 | ID | Decision | Options | Recommended default | Blocked until decided |
 |---|---|---|---|---|
-| DP-L1 | Auto-accept thresholds per field type | (A) lower bound ≥ 95% on held-out, n ≥ 73 error-free (110 with one error), coverage ≥ 50%, critical wrong 0; (B) lower bound ≥ 98%, n ≥ 189 error-free; precision ≥ 99.5% | (A) for first enablement of critical IDs and totals; (B) as the later target for payment-affecting totals. **Correction:** the retired text asked for a 98% bound on "≥ 100 values", which is arithmetically impossible (100 error-free values give 96.3%; 98% needs 189). Shadow agreement is not accuracy: correctness evidence comes only from labelled sets and verify-screen corrections. | any auto-accept, AC-LIVE-M |
-| O-10 | Confirm the O-2 reading: the validator-only path (no OCR agreement) exists only for supplier GSTIN and arithmetic-closed amounts, still needs D42 rules 2, 3, 5 and the gate; it amends D42 rule 1 for those two classes | confirm / narrow to agreement-only | confirm | consensus change in WI-BE7 |
-| O-11 | Shadow period and a circuit breaker | ≥ 14 days and ≥ 100 comparisons; a person correcting an auto-accepted critical field switches that field type's auto-accept off until reviewed | accept both | AC-LIVE-M |
-| O-12 | Tier H quotas (§5.1) | adjust numbers; decide whether phone photos/low-DPI occur in production | as listed | WI-D5 collection |
-| O-13 | How Gemini is turned off (WI-BE9) | (A) per-hook switches; (B) new `vision_only` mode; (C) keep H2–H4 on Gemini | (B) | AC-INT1b wording, AC-LIVE-M |
-| O-14 | Back-fill of the 40 live documents | shadow-only back-fill; none; full re-read after merge | shadow-only back-fill, budget from the dry run, one go and a log entry | AC-LIVE-S |
-| O-15 | First release tag | create at AC-INT1b | yes | version guards (WI-D3) |
-| O-16 | Held-out policy | each look is logged; an item that influenced a rule or prompt is retired | accept | PH4 |
 | O-17 | AC-8b: close the gap or accept the residual (8 extra documents, 2 missed duplicates) | close / accept with numbers | decide after PH4 measurement | AC-8 phase closure, AC-11 |
 | DP-L4 | Approvals per run | standing approval vs one go per run | one go and a log entry per run (vLLM budgets set by the engineer; Gemini budgets by the owner) | each server run |
 | DP-L5 | Gemini tier for production | paid / not used | not used (O-3, O-6) | PH6 arms only |
@@ -804,7 +806,7 @@ Answered or superseded earlier decision points: DP-L2 No (two LLMs are one reade
 
 | ID | Attack | Finding | Fix in this plan |
 |---|---|---|---|
-| RT-1 | A wrong value silently accepted through the validator-only GSTIN path (a checksum-valid GSTIN of the ship-to or a transporter) | real risk | V-GSTIN includes role, state consistency and equality with the linked PO vendor's GSTIN; crop re-read and the lower-bound gate still apply; O-10 asks the owner to confirm the path |
+| RT-1 | A wrong value silently accepted through the validator-only GSTIN path (a checksum-valid GSTIN of the ship-to or a transporter) | real risk | the validator-only GSTIN path requires checksum, not the buyer entity, and equality with the vendor-master GSTIN (O-10, narrowed 20 Oct); crop re-read and the lower-bound gate still apply; all other cases are agreement-only |
 | RT-2 | Qwen and OCR agree and are both wrong (shared look-alike) | agree-wrong 0 in 243 on the dev set but D41 had one (Gemini vendor name) | look-alike guard stays; crop re-read; agree-wrong tracked on Tier H; DP-L1 bounds apply to accepted values |
 | RT-3 | Review cleared because the rules' lines are wrong (S08-INV) | seen (D75(e)) | MG-4 |
 | RT-4 | Order date taken as document date | seen under v5–v7 | OCR leads dates; disagreement never auto-accepts |
@@ -907,6 +909,7 @@ Every ID-bearing item of every merged document has a row. Status words: **done (
 
 - **D43.** IP lines 3 and 178 cite "decision-log D43" as the entry that wrote the implementation plan. No `D43` heading exists in the log (D42 → D44). It is a numbering gap: the plan it names was written on 8 Oct and sits in the file itself, so no content was lost. This plan does not cite D43 and does not reuse the number; old entries are not edited.
 - **AC-L phase labels.** The decision log labels work as "AC-L0 part 1" (D62: WI-G2, G1, BE1), "AC-L0 part 2" (D63: BE5, BE4), "AC-L0 part 3" (D64: BE2), "AC-L0 part 4" (D65: BE3), "AC-L0 part 5" (D66: BE6) and "AC-L1 part 1" (D67: EV1). PL §1 puts BE5, G1, G2, BE1 and EV0 in AC-L0, BE2/BE3/BE4/BE6 and WI-OPS/FE1 in AC-L1, EV1/EV2/BE8 in AC-L2, and BE7/FE2/G3 in AC-L3; D77's remaining-work table follows PL. **This plan uses the PL labels** (AC-L0 … AC-L3) and refers to work by task ID, so the D62–D67 headings are read as dates and task IDs, not as phase membership.
+- **Citation key for code comments.** About 25 files in `backend/`, `scripts/`, `Makefile` and the migrations cite "LLM plan WI-xx" or "scan fix plan WI-n" in comments and docstrings. Those IDs are unchanged: "LLM plan WI-xx" is the task of that ID in §7 and §13.5, "scan fix plan WI-n" is §13.3, and "AC-x" is §13.1. The comments are not rewritten because those files carry other sessions' uncommitted work and a comment-only commit would sweep it in; a comment sweep can follow when the code tree is committed.
 - **Reading old status lines.** AP line 3 stops at D58, PG describes the tree as of 16 Oct ("107 entries, no change after 9 Oct"), and IP §1.1 stops at D58; all three are superseded by §0 and §3.
 
 ### 13.1 AP — old `accuracy-plan.md`
@@ -1090,7 +1093,7 @@ Every ID-bearing item of every merged document has a row. Status words: **done (
 | WI-OPS1 | server checklist and smoke test | open |
 | WI-OPS2 | health, concurrency, fallback in operation | open |
 | §4 sequence and dependencies | | §8 |
-| DP-L1 | auto-accept thresholds | open, corrected arithmetic (§9.3) |
+| DP-L1 | auto-accept thresholds | decided 20 Oct: option (A) for first enablement, (B) as target; arithmetic corrected (§9.1) |
 | DP-L2 | do two LLMs count as independent | answered: No |
 | DP-L3 | GPU host | resolved (company vLLM, 16 Oct) |
 | DP-L4 | approvals | §9.3 |
@@ -1128,7 +1131,7 @@ Not merged. Its numbers are cited here as Dx §5 (per-stage attribution), §5.7 
 
 ## 14. Removed documents
 
-Removed in Stage 3 after approval of this plan. Each is archived byte for byte in `work/plan-archive-20261020/` (Option B; SHA-256 list in `SHA256SUMS.txt` in that folder) and, after the owner's yes, in a docs-only snapshot commit tagged `pre-plan-merge-20261020` (Option A′).
+Removed on 20 Oct 2026 (D79) with the owner's approval. Each is archived byte for byte in `work/plan-archive-20261020/` (Option B; SHA-256 list in `SHA256SUMS.txt`), in a tarball at `~/reconbench-archive/plan-archive-20261020.tar.gz` (outside the working tree), and in the snapshot commit `d916ec6` tagged `pre-plan-merge-20261020` (Option A′). The removal is the next commit on the same branch.
 
 | File | Git state before removal | Preserved in |
 |---|---|---|
@@ -1138,4 +1141,4 @@ Removed in Stage 3 after approval of this plan. Each is archived byte for byte i
 | `docs/progress-accuracy-plan.md` | untracked | §3, §8, §13.4 |
 | `docs/audit-llm-extraction.md` | untracked | §4.13, §12, §13.6 |
 
-The previous version of `docs/accuracy-plan.md` (this file before the rewrite) is archived in the same folder. Recovery: `git show pre-plan-merge-20261020:docs/<file>` or copy back from `work/plan-archive-20261020/`. Kept: `ReconBench_*.md`, `decision-log.md`, `gates/*`, `diagnosis-scan-extraction.md`, `schema-errata.md`, `ai-gemini-protocol.md`, `database-roles-and-seeding.md`, `dependency-review.md`, `engine-cli.md`, `index-review.md`, `schema-drift-check.md`, `schemas/*`.
+The previous version of `docs/accuracy-plan.md` (this file before the rewrite) is archived in the same folder. Recovery: `git show pre-plan-merge-20261020:docs/<file>`, or copy back from `work/plan-archive-20261020/` or the tarball. The **previous version of this file** (before the Qwen-first rewrite) exists only in the archive folder and the tarball: the snapshot commit holds the rewritten version. Kept: `ReconBench_*.md`, `decision-log.md`, `gates/*`, `diagnosis-scan-extraction.md`, `schema-errata.md`, `ai-gemini-protocol.md`, `database-roles-and-seeding.md`, `dependency-review.md`, `engine-cli.md`, `index-review.md`, `schema-drift-check.md`, `schemas/*`.

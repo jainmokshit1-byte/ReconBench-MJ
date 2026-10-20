@@ -238,3 +238,7 @@ The full parser/date/PDF focused suite after the adapter change: **81 passed**. 
 ## Compose test database check
 
 Docker reports one Compose project (`reconbench`, from the repository `compose.yaml`) with four services: API, MinIO, the Phase 1 Postgres service, and `phase4-test-db`. The test database is a separate container/service and named volume within that same Compose project, selected through the `phase4-test` profile and bound to localhost port 15433. Keeping a separate test database protects Phase 1 data; Docker Desktop may display it as its own container row, but it is not another Compose project or stack.
+
+## Accuracy work (pointer, 2026-10-20)
+
+Extraction, consensus, identity, matching-v2 and the Qwen vision path are planned and tracked in [`docs/accuracy-plan.md`](../accuracy-plan.md) (status in its section 0, tasks in section 7, traceability of the retired accuracy plans in section 13). This gate document records the Phase 4 task evidence above and was last edited on 2026-10-05; it does not reflect that work. Task 4.9 accuracy thresholds (97% overall, no field below 95%) stay in force and are measured as described in section 5 of the accuracy plan. Task 4.9b (scanned-invoice OCR, G-30) remains described above. The accuracy plan ends at AC-11, which is the Phase 4 exit gate of the main plan. Decision-log entries D32 to D79 hold the dated evidence.

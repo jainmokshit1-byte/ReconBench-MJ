@@ -28,6 +28,8 @@ The local Compose stack uses PostgreSQL 16 and MinIO as required by the Phase 1 
 
 The worker image includes OCRmyPDF and Tesseract for scanned PDFs. Scanned pages are OCR-processed in the isolated PDF worker; the uploaded PDF stays unchanged, and OCR text uses lower confidence with the normal field and arithmetic checks. The default OCR language is English (`RB_PDF_OCR_LANGUAGES=eng`); set `eng+hin` to also recognize Hindi. Non-Docker worker setups need OCRmyPDF and the matching Tesseract language data installed separately. Real vendor scans are still required to measure extraction accuracy.
 
+Accuracy work is planned in one document, [`docs/accuracy-plan.md`](docs/accuracy-plan.md). Scanned and PDF documents are read by a vision model (Qwen on the company vLLM server is the planned primary reader); the OCR and rules path stays as the independent second reader and as the fallback. The accuracy bench (`make accuracy-bench`, `make accuracy-bench-vllm`) scores readers against local, git-ignored truth data, and every change is gated on hard-zero metrics (no false Matched, no false auto-links, no auto-accepted wrong values). The vision reader, consensus checks and shadow mode exist in the working tree but are not yet in the Compose images; the plan's integration ladder (section 4.11) tracks that. The main implementation plan stays in `docs/ReconBench_Implementation_Plan.md`.
+
 ### Useful commands
 
 | Command | Purpose |
