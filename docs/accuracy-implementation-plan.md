@@ -1,6 +1,6 @@
 # Accuracy overhaul: implementation plan for AC-6 to AC-11 (and optional AC-12)
 
-Written 8 Oct 2026 (decision-log D43) from `docs/accuracy-plan.md`, decision-log D17–D42, `docs/ai-gemini-protocol.md` and the code as it stands at migration head `0020`. It turns the remaining phases of the accuracy plan into session-sized work packages for an engineer (or coding agent) who has **only this repository**. Every file, function, table, setting and command named here was checked in the repository on 8 Oct 2026 and is cited as `path:line`, or is marked **NEW** with its exact path and signature. Anything that could not be confirmed is marked **UNVERIFIED** with the check to run first. Owner decisions that are still open carry a default and the words **owner decision**.
+Written 8 Oct 2026 (decision-log D43) from `docs/accuracy-plan.md`, decision-log D17–D42, `docs/ai-gemini-protocol.md` and the code at initial migration head `0020`. Session updates through matching provenance revision `0024` are recorded in D57; the AC-9a direct invoice↔GRN anchor follow-up is in D58. It turns the remaining phases of the accuracy plan into session-sized work packages for an engineer (or coding agent) who has **only this repository**. Every file, function, table, setting and command named here was checked in the repository on 8 Oct 2026 and is cited as `path:line`, or is marked **NEW** with its exact path and signature. Anything that could not be confirmed is marked **UNVERIFIED** with the check to run first. Owner decisions that are still open carry a default and the words **owner decision**.
 
 No real document values appear in this plan. Examples use the synthetic fixtures in `scripts/vision_fixtures.py` or obviously invented values.
 
@@ -39,7 +39,7 @@ No real document values appear in this plan. Examples use the synthetic fixtures
 
 Every block below was executed on this machine on 8 Oct 2026 with the stated result, except where marked **NEW** (built only from verified pieces) or **not run during planning**.
 
-**CHK-PY** (static checks; verified: ruff "All checks passed!", mypy "no issues found in 35 source files", lint-imports "Contracts: 3 kept, 0 broken", purity passed, rules hash verified, engine version "0.1.1 → 0.1.4", golden self-check passed):
+**CHK-PY** (initial baseline: ruff passed, strict core mypy passed, lint-imports "Contracts: 3 kept, 0 broken", purity passed, rules hash verified, engine-version and synthetic golden self-check passed; latest outcomes are recorded in D57):
 ```powershell
 Set-Location C:\Users\jainm\Desktop\reconbench\backend
 .\.venv\Scripts\ruff.exe check reconbench_core reconbench_app tests ..\scripts
@@ -54,11 +54,10 @@ $env:PYTHONIOENCODING = "utf-8"; backend\.venv\Scripts\python.exe scripts\check_
 backend\.venv\Scripts\python.exe scripts\golden_run.py --self-check
 ```
 
-**TEST-OFFLINE** (verified: `682 passed in 86.44s`):
+**TEST-OFFLINE** (latest AC-9a result: `774 passed in 96.66s`; B1 property regression is fixed):
 ```powershell
 backend\.venv\Scripts\python.exe -m pytest backend\tests\unit backend\tests\property backend\tests\scenarios backend\tests\parsers -q -p no:cacheprovider
 ```
-Until AC-9a, Hypothesis may draw the known counterexample of `test_po_canonicalization_is_idempotent` (`backend/tests/unit/test_phase4_normalize.py:43-53`); report that single failure as pre-existing and do not fix it outside AC-9a.
 
 **RULES-HASH-UPDATE** (**NEW** composition of `scripts/check_rules_hash.py:14-25`; the file is 64 hex characters plus LF):
 ```powershell
@@ -66,7 +65,7 @@ backend\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'scripts'); 
 backend\.venv\Scripts\python.exe scripts\check_rules_hash.py
 ```
 
-**PG-UP** (disposable integration database on `127.0.0.1:15499`; verified: migrations 0001→0020, seed counts workspace 1 / reason_code 28 / ai_setting 0, queue schema applied, `test_kpi_summary.py` 1 passed):
+**PG-UP** (disposable integration database on `127.0.0.1:15499`; verified in this working tree through migration `0024`, seed and queue schema outcomes are recorded in D57):
 ```powershell
 Set-Location C:\Users\jainm\Desktop\reconbench
 docker rm -f rb-ephemeral-pg 2>$null | Out-Null
@@ -92,7 +91,7 @@ Groups: (1) `backend\tests\integration\test_phase2_database.py backend\tests\int
 
 **PG-DOWN**: `docker stop rb-ephemeral-pg | Out-Null` (the container was started with `--rm`).
 
-**PG-SAFETY** (migration safety, drift, catalog, indexes, decisions, table count on a **second fresh cluster** on `127.0.0.1:15497`, because database roles are cluster-wide; verified at head 0020: "Migration safety passed: cloned 0019 and upgraded the copy to 0020", drift "no metadata drift" and "Catalog contract: all explicit checks passed", catalog/indexes/decisions/table count passed). Replace `<PREVIOUS>` with the revision before the new head:
+**PG-SAFETY** (migration safety, drift, catalog, indexes, decisions, table count on a **second fresh cluster** on `127.0.0.1:15497`, because database roles are cluster-wide; latest outcome at head `0024` is recorded in D57). Replace `<PREVIOUS>` with the revision before the new head:
 ```powershell
 Set-Location C:\Users\jainm\Desktop\reconbench
 docker rm -f rb-safety-pg 2>$null | Out-Null
@@ -167,16 +166,16 @@ docker run --rm -e BENCH_GEMINI_KEY -e RB_BENCH_VISION_MODEL=gemini-3.5-flash-li
 
 | Item | Where | Rule |
 |---|---|---|
-| `RULES_HASH` | `backend/reconbench_core/RULES_HASH` (now `b724a4bb…`) | Run RULES-HASH-UPDATE after **any** change to a `.py` file under `backend/reconbench_core` (`scripts/check_rules_hash.py:14-25`). |
-| `ENGINE_VERSION` | `backend/reconbench_core/version.py:3` (now `0.1.4`) | Bump the patch number once in a phase that changes files in the rule paths of `scripts/check_engine_version.py:13-20` (`backend/reconbench_app/db/seed_data.py`, core `align`, `mapping`, `normalize`, `recon`, `schema`) in a way that can change mapping or reconciliation output. Extraction- or parser-only phases do not bump it (D35, D37). The script passes against `HEAD` today (HEAD has 0.1.1); the bump is the project convention, recorded in the D-entry. A bump invalidates the bench reader cache. |
+| `RULES_HASH` | `backend/reconbench_core/RULES_HASH` (D58: `8a1b2970…`) | Run RULES-HASH-UPDATE after **any** change to a `.py` file under `backend/reconbench_core` (`scripts/check_rules_hash.py:14-25`). |
+| `ENGINE_VERSION` | `backend/reconbench_core/version.py:3` (now `0.1.7`) | Bump the patch number once in a phase that changes files in the rule paths of `scripts/check_engine_version.py:13-20` (`backend/reconbench_app/db/seed_data.py`, core `align`, `mapping`, `normalize`, `recon`, `schema`) in a way that can change mapping or reconciliation output. Extraction- or parser-only phases do not bump it (D35, D37). D57–D58 verify the `0.1.4 → 0.1.7` patch-series update. A bump invalidates the bench reader cache. |
 | Check registry versions | `backend/reconbench_core/recon/registry.py:22-60` | Bump a check's `version` when its semantics change (changes `rules_hash`, so earlier runs show as stale). |
-| `PARSER_VERSION` | `backend/reconbench_app/ingestion.py:76` (`"phase4-parser-4"`) | Bump when the stored parser output for the same file changes (AC-8b). |
+| `PARSER_VERSION` | `backend/reconbench_app/ingestion.py:87` (`"phase4-parser-6"`) | Bump when the stored parser output for the same file changes. |
 | Vision contract | `vision.schema.v3` (`backend/reconbench_app/ai/contracts.py:38`), `vision.prompt.v3` (`backend/reconbench_app/ai/prompts.py:35`), `image_mask.v1` (`backend/reconbench_app/ai/redaction.py:152`), `vision.render.v1` (`backend/reconbench_app/extraction/vision.py:47-53`) | **Must not change in any phase of this plan.** Each change invalidates every cached answer and requires consent again (D38, D40). |
 | Consent fingerprint | `consent_fingerprint` (`backend/reconbench_app/ai/consent.py:110-129`) | Must stay byte-identical for every workspace whose new toggle (AC-6c) is off; a test proves it. |
 
 ### 0.5 Decision-log entries
 
-Append at the end of `docs/decision-log.md` (after D42/D43). Number in order of execution: AC-6a takes **D44**, the next phase **D45**, and so on; never renumber. Template:
+Append at the end of `docs/decision-log.md` (after D42/D43). Number in order of execution: AC-6a is **D44**, AC-6b is **D45**, AC-6c is **D46**, and so on; never renumber. Template:
 
 ```markdown
 ## D<nn> — <phase id> <short title> (<day> <Mon> 2026)
@@ -232,7 +231,16 @@ Then change line 3 of `docs/accuracy-plan.md` to name the finished phase (for ex
 | AC-4 vendor hygiene | done | D36; migration 0019, `plan_vendor_anchors` |
 | AC-5 / AC-5b vision reader | done | D37, D38, D40, D41; hook `h6_vision`, migration 0020, suggestions only |
 | D-2 | decided | D42 (five rules, below) |
-| AC-6 … AC-11, AC-12 | not started | this plan |
+| AC-6a consensus core + shadow bench | done | D44; pure consensus, shadow block in `before-ac6b.json` |
+| AC-6b crop reread, provenance and dark consensus job | done | D45; migration 0021, `after-ac6b.json` |
+| AC-6c verify loop, per-field setting and consent | done | D46/D47; migration 0022, `after-ac6c.json`; failure-directed local crop evidence; five D42 field types remain opt-in |
+| AC-7a verify-screen backend | done | D48 fixes B8; D49 adds PO/GRN manual edit-and-save through the existing correction route with typed schema fields and dirty-scope/vendor-link follow-ups. D50 adds a versioned local correction patch and a synthetic-tested Truth v2 merger requiring explicit document and line mappings; it writes a new output and refuses to overwrite. H1 remains invoice-only; no migration or new correction route. |
+| AC-7b verify-screen UI | implemented | D50 adds verify-first field filtering, PDF source-page jumps/highlights, current-vs-suggested choices, keyboard-accessible controls, vendor-assignment link, and correction-patch download. Existing batch-row split-confirm controls remain the split decision surface. The plan's under-30-second owner usability target was not human-timed. |
+| AC-8a identity/duplicate core | done | D51; exact complete line-amount duplicate suspicion and aged `GRN_PENDING` fix |
+| AC-8b app identity and re-scan guard | in progress | D52–D55; migration 0023 stores source SHA/locator and ordered page dHashes/content fingerprints; D19 confidence guard, exact same-type SHA+locator fallback before bounded page-hash comparison, and exact fully verified natural-key fallback implemented. Benchmark scoring counts `DUP_SUSPECTED` as a review flag. Benchmark: 34 system documents, 8 extra (3 GRN, 3 PO, 2 invoice), 0 wrong merges; duplicates 0 caught / 2 missed. AC-8 exit criteria remain open. |
+| AC-9a matching v2 core | implemented; exit gate open | D57–D58; scoring, provenance checks, anchors, date/variance explanations and period assignment are implemented. Direct invoice↔GRN identifier anchors can stand alone as edges; an invoice→PO edge is inherited only through an existing GRN→PO relation, otherwise normal PO content matching continues. Unverified anchors stay suggestions and invoice GRN-number references still require corroboration. Offline link recall remains 3/10 against the written ≥95% target, so the gate is unmet. AC-8b remains open. |
+| AC-9b matching v2 app/UI | not started | One-click confirmation remains outside this session. |
+| AC-10, AC-11, AC-12 | not started | later phases |
 
 D42 (the rule every AC-6 sub-phase implements): a machine-read value may be verified without a person **per field**, only if (1) two independent readers give the same normalised value (OCR/text layer, signed e-invoice QR, XML, vision; two answers of one model never count twice; a signed QR is L0 on its own), (2) every deterministic validator passes for the field and the document, (3) a local OCR re-read of the reader's box agrees (a box in a mask, off the page or empty fails), (4) never for handwritten or stamped marks, new vendor names, a field a person corrected, or an unconfirmed page split, and (5) it is switched on per field type only after the bench shows 0 false-safe and 0 agree-wrong-confirmed for that type, behind a workspace setting that is off by default.
 
@@ -260,22 +268,22 @@ D42 (the rule every AC-6 sub-phase implements): a machine-read value may be veri
 ### 1.3 Code baseline
 
 - Offline suites: 682 passed (TEST-OFFLINE). Web: 30 tests passed; typecheck and lint pass. Static checks pass (CHK-PY), golden self-check passes; the golden set itself has no cases (`golden/` holds only `README.md`), so "zero golden diff" is vacuous (D18).
-- Schema at `0020`: 46 application tables, 38 enums, 24 triggers, 154 foreign keys, 250 explicit ACL entries, 7 default privileges (`check_schema_drift.py` output).
+- Schema at `0024`: 49 application tables, 38 enums, 27 triggers, 164 foreign keys, 258 explicit ACL entries, 7 default privileges (`schema_contract.json`; counts in D57).
 - Append-only tables (trigger `forbid_mutation`, `0014_immutability_roles.py:16-31`): `document_version`, `doc_line`, `field_evidence`, `link`, `config_version`, `recon_case`, `recon_line_result`, `run_manifest`, `case_action`, `audit_log`. New evidence is always a new row; a changed document is always a new `document_version`.
 
 ### 1.4 Known open bugs and where each is fixed
 
 | # | Bug | Evidence (verified) | Fixed in |
 |---|---|---|---|
-| B1 | `canonicalize_po_number` is not idempotent when the joined result is all digits with a leading zero: `"0/0"` → `"00"` → `"0"`, `"0-12"` → `"012"` → `"12"`; mixed results such as `"PO/0/142"` are stable | `backend/reconbench_core/normalize/text.py:143-153`; property test `backend/tests/unit/test_phase4_normalize.py:43-53` fails only when Hypothesis draws such a case | AC-9a |
+| B1 | `canonicalize_po_number` was not idempotent when the joined result was all digits with a leading zero: `"0/0"` → `"00"` → `"0"`, `"0-12"` → `"012"` → `"12"`; mixed results such as `"PO/0/142"` are stable | `backend/reconbench_core/normalize/text.py`; property regression in `backend/tests/unit/test_phase4_normalize.py:43-53` | Fixed in AC-9a (D57) |
 | B2 | An aged GRN_PENDING invoice whose status is not `pending` keeps `aged=true`, violating `recon_case_aged_ck` (`NOT aged OR status='exception'`) and failing the whole run | `backend/reconbench_core/recon/engine.py:1745-1753`; `backend/reconbench_app/db/metadata.py:1703`; D22 | AC-8a |
 | B3 | `ai_request.ai_cache_id` is NULL for answered (non-cached) requests | **By design, not a bug:** `ai_cache_id IS NOT NULL` marks a cache hit, which budgets count as zero (`backend/reconbench_app/ai/ledger.py:43-50`, `record_cache_hit` at `:412-432`). A fresh answer is linked through `ai_request.cache_key` (set at `backend/reconbench_app/ai/worker/runner.py:173-177`, indexed by `ai_request_cache_ix`, `metadata.py:3026-3032`) = `ai_cache.cache_key` within the workspace, as `_h1_review` already does (`backend/reconbench_app/ingestion.py:4156-4162`). Setting `ai_cache_id` on fresh answers would make them free in the budget. | No change; AC-6b reads answers by `cache_key`; D44 records the explanation |
 | B4 | The configured payment-terms list is not applied to the due date; `_payment_due` reads only the PO's printed terms | `backend/reconbench_core/recon/engine.py:489-498`; D27 | **Owner decision** (not accuracy); carried to the AC-11 exit gate |
 | B5 | Hosted CI migration safety failed because CI built `0017` while the head is `0020` and the check needs head − 1 | `.github/workflows/ci.yml:279`; `scripts/check_migration_safety.py:53-66` | Fixed 2026-10-08: CI builds `0019`, the down-revision of head `0020`; repeat this update for each new migration |
 | B6 | A confirmed rules `content` link becomes `suggested` again after a re-run with a changed input hash | `backend/reconbench_app/mapping_service.py:2576-2622` with `_matches` comparing `state` (`:2663-2672`); confirm keeps the rules method (`:2088-2108`); D20 | AC-9b |
-| B7 | An OCR-read, unverified PO reference that equals a PO number of the same vendor creates an **auto** labeled link (confidence 0.99 ≥ 0.95) | `backend/reconbench_core/mapping/links.py:305-403` (no check of the reference's confidence) with `_confidence_state` (`:251-252`) | AC-9a |
-| B8 | Corrections exist only for invoices; an invoice correction re-runs vendor resolution (and with it link mapping) only when the vendor name or GSTIN changed | `backend/reconbench_app/ingestion.py:3529-3533`, `:3983-3990`; D21 open | AC-7a |
-| B9 | A lower-quality re-scan can replace a clean current version (D19 open); re-scans with a misread number or vendor become new documents (R9) | `backend/reconbench_app/ingestion.py:2319-2563`, `document_natural_key` at `:4943-4963` | AC-8b |
+| B7 | An OCR-read, unverified PO reference that equals a PO number of the same vendor creates an **auto** labeled link (confidence 0.99 ≥ 0.95) | `backend/reconbench_core/mapping/links.py` and `_confidence_state` | Fixed in AC-9a (D57): exact reference alone stays suggested; system-check verification requires same-vendor open PO, independent evidence and confidence threshold |
+| B8 | Invoice corrections re-ran vendor resolution (and link mapping) only when vendor name or GSTIN changed | `backend/reconbench_app/ingestion.py:3483-3536`, `:3758`, `:3984-3992`; D21 | Fixed in AC-7a for any changed invoice correction (D48); D49 adds typed PO/GRN manual corrections and their existing vendor/link/ledger follow-ups. H1 extraction eligibility stays invoice-only. |
+| B9 | A lower-quality re-scan can replace a clean current version; re-scans with a misread number or vendor can become new documents | `backend/reconbench_app/ingestion.py:_upsert_document`, `backend/reconbench_app/document_identity.py` | AC-8b implements the D19 guard, type-scoped exact SHA+locator precedence and verified natural-key recovery; D55 benchmark follow-up still shows 8 extra documents and 2 duplicate misses |
 | B10 | The manual "change" link evidence text differs from the resolver's manual evidence text | `backend/reconbench_app/mapping_service.py:2198` vs `backend/reconbench_core/mapping/links.py:39`; D20 | AC-9b |
 | B11 | Same-type scanned documents in one file split only on "Page 1 of N" | D35 open | Not planned here (§5, Q-14) |
 | B12 | Vendor Summary sheet counts Needs Review inside Exceptions; auth tests not in hosted CI; 10k-row frame budget flaky locally | D28, D29 | Carried to the AC-11 exit gate (not accuracy) |
@@ -297,16 +305,16 @@ AC-8a ──────┴──► AC-8b ──► AC-9a ──► AC-9b ─�
 |---|---|---|---|---|---|---|---|
 | 1 | AC-6a consensus core + shadow bench | large | 1 | max | none | — | AC-8a |
 | 2 | AC-6b crop re-read, provenance, consensus job (dark) | large | 1 (split point given) | max | `0021_consensus` | AC-6a | AC-8a |
-| 3 | AC-6c verify loop, auto-verify setting, consent | medium–large | 1 | high | none | AC-6b | AC-7a, AC-8a |
+| 3 | AC-6c verify loop, auto-verify setting, consent | medium–large | 1 | high | `0022_auto_verify` (plan deviation: persisted opt-in and result-version link need schema) | AC-6b | AC-7a, AC-8a |
 | 4 | AC-7a verify screen backend | large | 1 | high | none | AC-6b | AC-6c, AC-8a |
 | 5 | AC-7b verify screen UI | medium | 1 | medium | none | AC-7a | AC-8a/8b |
 | 6 | AC-8a identity and duplicate rules (core) + aged fix | medium | 1 | high | none | — (bench changes merge after AC-6a) | AC-6x, AC-7x |
-| 7 | AC-8b identity in the app, re-scan guard, page hashes | medium–large | 1 | high | `0022_document_identity` | AC-8a, AC-6b | AC-7b |
-| 8 | AC-9a matching v2 (core) | large | 1 | max | none | AC-8a, AC-6b | — |
+| 7 | AC-8b identity in the app, re-scan guard, page hashes | medium–large | 1 | high | `0023_document_identity` | AC-8a, AC-6b | AC-7b |
+| 8 | AC-9a matching v2 (core) | large | 1 | max | `0024_matching_provenance` | AC-8a, AC-6b | — |
 | 9 | AC-9b matching v2 (app, UI) | large | 1 | high | none | AC-9a, AC-8b | — |
-| 10 | AC-10 learning loop | medium–large | 1 | high | `0023_vendor_profile` | AC-9b, AC-6c | — |
+| 10 | AC-10 learning loop | medium–large | 1 | high | `0025_vendor_profile` | AC-9b, AC-6c | — |
 | 11 | AC-11 real-set E2E + Phase 4 exit gate | medium + owner runs | 1 + owner | high | none | all of the above | — |
-| opt | AC-12 GSTR-2B cross-check | medium–large | 1–2 | high | next free (`0024_gstr2b` in this order) | AC-6b, **D-10** | after AC-6b |
+| opt | AC-12 GSTR-2B cross-check | medium–large | 1–2 | high | next free (`0026_gstr2b` in this order) | AC-6b, **D-10** | after AC-6b |
 
 "Parallel" means the phases touch different files and their order does not matter; they still run in separate sessions on the same working tree. **Migration numbers assume this order.** If phases run in another order, use the next free revision number (current head + 1) and keep §0.7 steps 5–6 consistent. Total: 11 sessions for AC-6a…AC-11 (plus owner runs in AC-11), 1–2 for optional AC-12.
 
@@ -525,7 +533,7 @@ extras   = {**header.extras, "review_fields": review,
 
 Invariants (each has a test below): **I1** consensus never changes a value — only `confidence`, `extras.review_fields`, `extras.consensus`, `needs_verification` and `reason_codes`; **I2** L0 fields and person-entered values are never touched; **I3** with `auto_verify=False` and `reopen=False` the result's document is the input object and `changed` is `False`; **I4** a value read only by vision is never written; **I5** the result does not depend on the order of `check.fields` or `check.lines`; **I6** a never-automatic name never gets `auto_verified=True`.
 
-`crop_needs(result)`: one `CropNeed` for each decision with `rule is D42` and `reason == "crop_missing"` whose vision reading has a page and a box; `mode="line"` for header keys and `"block"` for line keys; `value` = the document value.
+`crop_needs(result)`: one `CropNeed` for each decision with rule `D42`, `CONFLICT` or `REOPEN` and a reason in `{"crop_missing", "validator_failed", "hard_validator", "readers_disagree", "vision_disagrees_with_verified"}` whose vision reading has a page and a box; validator failures and reader disagreements are reread for evidence but remain failures after the reread. Use `mode="block"` for line keys and summary-total header keys (`taxable_total`, `cgst`, `sgst`, `igst`, `round_off`, `grand_total`), and `mode="line"` for other header keys; `value` = the document value.
 
 `crop_outcome(kind, value, text, mode=...)`: collapse whitespace; empty → `EMPTY`. Candidates: `"money"`/`"number"`: `parse_money` / `parse_quantity` (`vision.py:348-372`) of every token and of every pair of adjacent tokens joined without a space (OCR may split a number); in `"block"` mode, ignore the first token when it is an integer of at most three digits (a row's serial number). `"date"`: values of `find_dates(text)` (`values.py:155-187`). `"gstin"`: `[r.value for r in gstins_in(text) if not r.repaired]` (`values.py:261-276`). `"doc_no"`/`"ref"`: every token, every adjacent pair joined, and the whole compacted text. `"refs"`: every item of the value must be found as for `"ref"`. Result `AGREE` when `values_agree(kind, value, candidate)` for some candidate, else `DISAGREE`. `MASKED` and `UNAVAILABLE` are set only by the caller (AC-6b).
 
@@ -598,7 +606,7 @@ The block contains counts and labels only.
 20. `test_decide_is_order_independent` — Hypothesis shuffles `check.fields` and `check.lines`; identical `decisions_json()` (I5).
 21. `test_crop_outcome_candidates` — parametrised over money, number, date, gstin, doc_no and refs; the serial-number skip in `"block"` mode; `EMPTY`.
 22. `test_hints_carry_annotations_and_marketplace_orders_but_no_fields`.
-23. `test_crop_needs_lists_only_d42_keys_waiting_for_a_crop`.
+23. `test_crop_needs_targets_failed_checks_and_selects_summary_or_row_geometry` — includes line arithmetic failure and verifies block mode for line rows; `test_validator_failure_stays_blocked_after_targeted_crop_agrees` covers GSTIN checksum failure, while `test_reader_conflict_gets_crop_evidence_but_stays_conflicted` keeps disagreement at L3.
 24. `test_decisions_json_is_stable_and_serialisable` (`json.dumps` works; same output twice).
 
 **NEW** `backend/tests/unit/test_accuracy_consensus.py` (reuse the `_target`/`_prepare`/recorded-answer pattern of `backend/tests/unit/test_accuracy_vision.py:35-142` with `synthetic_invoice_pdf()` and `recorded_response()`):

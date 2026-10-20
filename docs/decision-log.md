@@ -771,3 +771,852 @@ The owner asked for a recommendation and delegated the choice. **Decision: yes, 
 5. **Gate by evidence.** Automatic confirmation is switched on per field type only after the accuracy bench shows 0 false-safe and 0 agree-wrong-confirmed for that field type on the truth set; it ships behind a workspace setting that is off by default. The 1 agree-wrong field in D41 is exactly the case rules 2–3 must catch.
 
 This replaces the "suggestion only" rule of D11/D21 for fields that meet all five rules (D18 → D18b in AC-6).
+
+## D44 — AC-6a consensus core and shadow bench (8 Oct 2026)
+
+AC-6a adds a pure per-field consensus engine and a shadow benchmark. It classifies each reading without replacing extracted values; automatic confirmation and reopening remain caller-controlled. The shadow policy measured the upper bound with crop checks disabled, while D-2 still requires a matching local crop reread before any later confirmation.
+
+| Trust level | Rule |
+|---|---|
+| L0 | Manual or structured values, and signed QR values, are authoritative. |
+| L1 | Existing verified rule values, or two independent agreeing readers after deterministic validators pass (and crop agreement when required). |
+| L2 | Vision-only values, a single reader, fields excluded from automatic confirmation, or a failed/missing crop or non-hard validator. |
+| L3 | Reader disagreement, or vision disagreeing with an already verified field; reopening remains policy-controlled. |
+| Rejected | A hard validator fails, including GSTIN checksum, buyer-entity or GST-type guards. |
+
+Deterministic validators: `doc_no_shape`, `lookalike`, `date_window`, `gstin_checksum`, `buyer_entity`, `gst_type`, `gst_structure`, `totals_arithmetic`, `non_negative`, `reference_shape`, `line_arithmetic`, `positive`, and `split_unconfirmed`. Never-automatic fields stay excluded. The cache link finding B3 is resolved as designed: `ai_request.ai_cache_id` marks a cache hit; a fresh answer is found through the workspace-scoped `cache_key` shared with `ai_cache`.
+
+Bench (`before-ac6b.json`, the AC-6a shadow report `31cb1ec49644`):
+
+| Field type | L1 | Correct | Wrong | Gate |
+|---|---:|---:|---:|---|
+| amount | 79 | 0 | 0 | no_evidence |
+| doc_date | 29 | 2 | 0 | pass |
+| doc_no | 25 | 1 | 0 | pass |
+| gstin | 62 | 2 | 0 | pass |
+| line_amount | 86 | 5 | 0 | pass |
+| line_quantity | 63 | 0 | 0 | no_evidence |
+| line_rate | 63 | 0 | 0 | no_evidence |
+| reference | 30 | 2 | 0 | pass |
+
+Reopened fields: 13 total, 1 true OCR-wrong catch and 12 OCR-right false alarms; shadow false-safe: 0. The hard metrics were all zero. The main report hash remained `31cb1ec49644`; the consensus block is counts and labels only.
+
+Checks: the AC-6a offline suite and static checks passed; shadow bench passed with 35 cache hits. The AC-6b session reran the combined offline suite (721 passed) and the final benchmark twice; see D45 for the complete app and migration checks.
+
+Open:
+- AC-6c still needs the workspace setting and verify-loop behavior before any field type can be automatically confirmed.
+
+## D45 — AC-6b crop reread, provenance and dark consensus job (8 Oct 2026)
+
+AC-6b queues a dark consensus job only after a vision answer is accepted. The job rereads only the masked page crops in the isolated local OCR process, stores per-field reader/crop/validator provenance in an append-only decision table, and records a run summary. It does not write document values, mark fields verified or reopen them; transient page bytes and the cached answer remain available only until the run finishes or fails, then are purged.
+
+| Decision | Choice |
+|---|---|
+| Consensus activation | Follow-up job on the parse queue; use the stored answer by `cache_key`, with no new provider call. |
+| Crop check | Missing, masked, empty, unavailable and disagreeing rereads cannot satisfy D-2; a crop is local and runs in the PDF sandbox child. |
+| Application | `auto_verify=False`, `reopen=False`; provenance is recorded without changing the document/version. |
+| Provenance | `consensus_run` tracks queued/succeeded/stale/failed status; `consensus_decision` is append-only and inaccessible to the report role. |
+
+Bench (`before-ac6b.json` → `after-ac6b.json`, report `3fe1aca30bf7`; repeat `after-ac6b-repeat.json` matched):
+
+| Measure | Before | After |
+|---|---:|---:|
+| False-safe / false auto-links / false Matched / wrong vendors | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Consensus hash | `b69f7a772db5` | `b69f7a772db5` |
+| Vision hash | `f57033ecdc94` | `f57033ecdc94` |
+| Shadow false-safe | 0 | 0 |
+| Reopened (true catches / false alarms) | 1 / 12 | 1 / 12 |
+
+All field-type consensus counts and gates matched the AC-6a shadow report. Main extraction, document, vision and consensus sections are identical to the before report; the main report hash changed because the crop reread additions changed only the reader-source fingerprint in `meta` (the cold run read 35 files, and the repeat used all 35 cache entries). The hard gate passed.
+
+Migration `0021_consensus` adds 2 tables, one append-only trigger, and the required workspace-first indexes. Schema contract checks report 48 application tables, 38 enums, 25 triggers, 161 foreign keys, 256 explicit ACL entries and 7 default privileges; the queued schema has 48 application tables plus 4 Procrastinate tables.
+
+Checks: offline unit/property/scenario/parser suites 721 passed; AI vision and AI runner integration 36 passed; migration acceptance 3 passed; migration-safety clone 0020 → 0021, Alembic drift, catalog, indexes, decisions, seeding, queue schema and table-count checks passed; ruff, format, mypy, import contracts, core purity, rules hash, engine version and golden self-check passed. No provider calls. Disposable PostgreSQL containers were stopped after the checks.
+
+Follow-up:
+- AC-6c's opt-in verification setting and targeted verify loop are completed in D46; the workspace toggle still defaults off.
+
+## D46 — AC-6c gated verify loop and workspace consent (8 Oct 2026)
+
+AC-6c adds an opt-in workspace allowlist for the five field types whose D42 benchmark gates pass, then applies only consensus outcomes that also pass independent-reader, validator, crop, hand-mark and current-consent checks. Eligible changes append a same-value derived document version with evidence provenance and link it to the consensus run; stale consent cannot apply, and field values are never edited. The masked-crop reread allows at most two rounds in the isolated local OCR child, while empty selection preserves the legacy consent fingerprint byte-for-byte.
+
+| Decision | Choice |
+|---|---|
+| Field allowlist | `doc_date`, `doc_no`, `gstin`, `line_amount`, `reference`; empty by default |
+| Consent | Existing `consent.v1` text/hash when off; selection uses field-specific `consent.v2` and must match at commit |
+| Applied version | Append a derived immutable version with unchanged values; retain evidence and source provenance; no page-image bytes |
+| Schema | Migration `0022_auto_verify` adds the allowlist and consensus result-version link; implementation-plan deviation because no existing persistence slot represented either |
+
+Offline benchmark (`after-ac6c.json`, report `baf82b8de05a`; 35 files, 51 parsed documents; hard gate passed, all four hard counters 0):
+
+| D42 field type | L1 candidates | Correct | Wrong | Gate |
+|---|---:|---:|---:|---|
+| `doc_date` | 29 | 2 | 0 | pass |
+| `doc_no` | 25 | 1 | 0 | pass |
+| `gstin` | 62 | 2 | 0 | pass |
+| `line_amount` | 86 | 5 | 0 | pass |
+| `reference` | 30 | 2 | 0 | pass |
+
+Checks: offline unit/property/scenario/parser suites 724 passed; integration groups 45 + 3 + 22 + 76 + 9 passed; migration safety cloned `0021` and upgraded to `0022`; fresh upgrade, Alembic drift, catalog, indexes, decisions, seed, queue schema and table-count checks passed (48 application tables, 162 foreign keys; queued count 48 + 4); Ruff, format, strict mypy, import contracts, core purity, rules hash, engine version, golden self-check, OpenAPI generation, web typecheck/lint and 30 web tests passed. No provider calls. Not run: browser E2E, owner-only provider benchmark, authentication tests requiring a separate cluster, and infrastructure-ready tests requiring S3 credentials.
+
+Next: AC-7a verify-screen backend.
+
+## D47 — AC-6 re-audit: failure-directed local crop evidence (8 Oct 2026)
+
+The requested AC-6 re-audit found that `crop_needs` only selected D42 candidates missing a crop check. That skipped targeted rereads for arithmetic/hard-validator failures and reader disagreements (which return before validator checks). It also used line OCR mode for line-cell boxes, allowing a short row serial to be parsed as the field value. The selection now includes those failed checks with a checked vision box, and their crop plus each attempt is persisted as evidence. A crop cannot clear a failed validator or a reader conflict, so neither path becomes L1/auto-verified from the reread alone. Line-cell boxes use block parsing, which ignores a leading short integer; summary-total boxes retain block mode.
+
+Provider scope: the owner reaffirmed **D45 local-only**. Consensus reuses the accepted, stored vision answer and does not issue an additional vision-provider crop call. `docs/accuracy-plan.md` §3.3 now records this phase boundary. This keeps each additional read within the isolated local OCR path and existing workspace page-image consent.
+
+Checks: focused consensus crop/core tests 40 passed; full offline unit/property/scenario/parser suite 727 passed; AC-5/AC-6 vision integration tests 13 passed on a fresh disposable PostgreSQL database migrated through `0022`; Ruff, format, strict core mypy (36 files), import contracts, core purity, rules hash, engine-version and golden self-check passed. No migration or API change was made. No live provider call or real document was used.
+
+Offline bench ran twice with `--network none`: both report hashes `baf82b8de05a5e0d467ec827f53d076ac22de72d783621388dc6908da6b7bc33`, vision hashes `f57033ecdc9493b655f5e1f7f493c8f091d0f2f102abfddde0b775e92399c80e`, and consensus hashes `b69f7a772db5779a78ae49e4a35bdc5231d7fdbad8f9b6d81d2040e3792df184` matched. Hard gate passed; false-safe, false-auto-link, false-matched and wrong-vendor counts were all 0. The benchmark's upper-bound shadow block does not require crops, so its consensus hash is expected to remain unchanged by the application reread fix.
+
+## D48 — AC-7a backend: invoice correction refresh (8 Oct 2026)
+
+AC-7a has no endpoint-by-endpoint contract in the implementation plan, so this session implemented only its explicit B8 backend scope. Any changed invoice header, line, or line removal now queues the existing `resolve_vendors` job in the correction transaction; that job continues through the existing vendor-resolution and link-mapping chain even when vendor name and GSTIN did not change. The endpoint contract and schema are unchanged.
+
+| Decision | Choice |
+|---|---|
+| AC-7a scope | Fix B8 for existing invoice corrections only; do not add undocumented endpoints or PO/GRN correction behavior. |
+| Existing backend surfaces | Document details expose the current version, verification metadata and field evidence; existing raw-file and AI-suggestion routes provide source/PDF evidence; split confirmation and vendor assignment already have routes. Keep those contracts as-is. |
+| PO/GRN corrections | Remain open pending Product decision D13/D21. D21 says follow-up equivalence for vendor resolution, `link_vendor`, `recompute_po`, and dirty scopes cannot yet be claimed. |
+| Provider calls | None; `RB_AI_EXTERNAL_CALLS=disabled`. D45's local-only verify-loop boundary is unchanged. |
+
+Bench (`after-ac6c.json` → `after-ac7a.json`, report `baf82b8de05a`; same report hash as the D47 baseline):
+
+| Measure | Before | After |
+|---|---:|---:|
+| Parsed / missed / spurious documents | 51 / 0 / 0 | 51 / 0 / 0 |
+| Header correct; lines found / expected; auto-verified | 302/373; 96/141; 18/51 | 302/373; 96/141; 18/51 |
+| Vision cached documents / pages | 39 / 67 | 39 / 67 |
+| **False-safe / false auto-links / false Matched / wrong vendors** | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+
+The offline bench used `--network none`; reader cache hits/read files were 35/0 and the gate passed. It emitted only aggregate counts and labels.
+
+Checks: full offline unit/property/scenario/parser suite 727 passed; `test_ingestion.py` 2, `test_ai_h1.py` 14, `test_ai_vision.py` 13, `test_page_split.py` 3 and `test_ac4_vendor_hygiene.py` 6 passed on disposable PostgreSQL at port 15499, migrated through `0022`; Ruff, format, strict core mypy (36 files), import contracts, core purity, rules hash, engine version, golden self-check and `git diff --check` passed. `ingestion.py` strict mypy remains at its recorded baseline of 33 errors. No migration or API contract change was made.
+
+Not run: migration-safety checks (no migration); OpenAPI generation and web checks/E2E (no contract or UI change; AC-7b); authentication and infrastructure-ready tests (separate cluster / S3 credentials, unrelated to this correction path). No provider test was run.
+
+Open:
+- PO/GRN correction behavior still needs Product's D13/D21 decision. D21 specifically leaves editor/correction support open because the corresponding re-resolution and dirty-scope behavior has not been decided or proven.
+- No additional AC-7-specific backend route contract is written for field selection/crop highlighting or local truth export; define that contract before changing backend behavior. AC-7b UI remains unstarted, and this slice does not establish the complete verify-screen acceptance criteria.
+
+## D49 — PO/GRN manual correction and save (8 Oct 2026)
+
+The owner decided PO and GRN documents must have an edit-and-save option. This resolves D48's open Product decision for manual correction support only. It does not change D13/D21's H1 eligibility or PO/GRN extraction allowlists; vision readings remain suggestions until a person saves a correction.
+
+| Decision | Choice |
+|---|---|
+| Route | Extend the existing `PUT /documents/{id}/correction`; keep If-Match and append-only `document_version` behavior. The separate manual-invoice route retains its invoice-only request body. |
+| Editable headers | Shared `DocumentHeader` values; PO adds `revision`, `status`, `ship_to`, `payment_terms`, and `delivery_date`; GRN adds `po_refs`, `challan_no`, and `supplier_invoice_no`. The allowlists follow the canonical header models and persisted columns. |
+| Editable lines | Type-specific canonical `DocLine` values. Internal normalized columns and `extras` are not correction inputs. Changed values receive manual field evidence and an audit record. Existing invoice arithmetic QA remains invoice-only. |
+| Follow-up | Changed corrections queue the existing vendor-resolution/link-mapping chain. A PO correction increments its mapping input sequence and marks its PO ledger scope dirty for recompute. A GRN correction marks currently linked deterministic PO scopes dirty; the existing mapping job handles changed links, pending recomputes, and GRN rechecks. |
+| AI boundary | No new provider call or H1 wiring. D45's local-only verify-loop decision remains unchanged; `RB_AI_EXTERNAL_CALLS=disabled`. |
+| Remaining AC-7a scope | The high-level plan mentions exporting corrections into local truth, but no backend endpoint, format, destination, or inclusion contract is written. AC-7a stays partial until that contract is defined. AC-7b remains unstarted. |
+
+Synthetic integration: `test_ingestion.py` 3 passed and `test_ai_vision.py` 13 passed after the final correction-body split; the related integration batch (`test_ingestion.py`, `test_ai_h1.py`, `test_ai_vision.py`, `test_page_split.py`, `test_ac4_vendor_hygiene.py`) passed 39 tests after updating the PO/GRN `correctable` expectation. Full offline unit/property/scenario/parser suite: 727 passed. No provider call or real document was used in tests.
+
+Offline benchmark (`--network none`, `after-ac7a.json`): report hash `baf82b8de05a`; parsed/missed/spurious 51/0/0; hard metrics false-safe/false-auto-link/false-matched/wrong-vendor 0/0/0/0; gate passed; 35 cache hits and 0 source files read. The cached vision block had 39 missing readings after the code fingerprint changed; nothing was sent to a provider. Only aggregate counts and labels were inspected.
+
+Static checks: Ruff and formatting passed; strict core mypy passed for 36 files; import contracts, core purity, rules hash, engine version, golden self-check, OpenAPI export, generated API bindings, web typecheck, and `git diff --check` passed. Strict mypy on the edited app modules still reports the existing 33 `ingestion.py` errors and one existing API upload stream typing error; no new correction-field error was reported. No migration was added.
+
+Not run: migration-safety checks (no migration), UI tests/E2E (AC-7b is out of scope), authentication tests (separate database cluster), and infrastructure-ready tests (S3 credentials). The disposable PostgreSQL integration cluster used only port 15499 and was stopped after checks.
+
+## D50 — AC-7 verify workspace and local truth correction export (8 Oct 2026)
+
+The owner asked to complete the remaining AC-7 work after deciding PO/GRN edit-and-save in D49. The plan states the verify-screen behavior at a high level but gives no endpoint-by-endpoint contract for local truth export. This entry records the narrow implementation contract used to complete that planned path; it does not extend PO/GRN H1 eligibility or authorize new provider behavior.
+
+| Decision | Choice |
+|---|---|
+| Review flow | The preview opens on documents needing verification and uses persisted review fields or non-manual evidence to choose visible fields. “Show all fields” remains available. Saved verified documents leave the pending list. |
+| Source evidence | A cited field action selects its evidence page; the PDF viewer moves to that page and overlays a bounded box for stored PDF-point or normalized vision coordinates. Missing page evidence is called out. |
+| Conflicts and keyboard use | Current and suggested values have separate actions. Choosing a suggestion only changes the draft; the existing versioned correction save persists it. Controls remain keyboard-focusable. |
+| Split and vendor-pending | Existing batch page-split confirmation remains the split surface. Unassigned documents link to the existing mapping flow. No new split or vendor API was added. |
+| Export patch | The browser downloads `reconbench-accuracy-corrections/v1`. It includes only saved, verified, manually evidenced values supported by the benchmark contract: the 11 scored header fields and description/quantity/rate/amount line fields. AI suggestions without a saved manual correction are not exported. |
+| Truth mapping | `scripts/merge_accuracy_corrections.py` requires an explicit application-document ID → Truth v2 document ID mapping. For line fields, each application line number must also map to a 1-based Truth line-array position, or explicitly to `append`; no line correspondence is guessed. |
+| Truth destination | The merger validates document type and allowed fields, rejects missing/ambiguous mappings, and writes a new output path. It refuses an output equal to the source or an already-existing output. The source Truth v2 file is left unchanged. |
+| API/schema | No new route, database field, or migration was needed. The existing correction endpoint remains the save path. OpenAPI, generated bindings, and published result schemas regenerate byte-identically. |
+| AI boundary | D45's local-only decision remains. `RB_AI_EXTERNAL_CALLS=disabled`; no provider call is made by the verify UI, patch merger, tests, or offline benchmark. |
+
+The mapping JSON shape is `{"<app-document-id>": {"truth_document_id": "<truth-document-id>", "lines": {"1": 1, "2": "append"}}}`. Line-map values are 1-based positions in the selected Truth document's `lines` array, or the literal `append` for a new line. Run the merger with `--truth <existing-truth-v2.json> --corrections <downloaded-patch.json> --mapping <explicit-mapping.json> --output <new-truth-v2.json>`; the output path must not already exist.
+
+The local export is a field-value correction patch. It does not encode deleted Truth lines; those still need a deliberate Truth edit. The plan's “under 30 seconds” owner usability target was not human-timed in this synthetic-only session, so this implementation does not claim that measurement.
+
+Checks: the synthetic merger suite passes 9/9; full offline unit/property/scenario/parser suite 736 passed; relevant integration batch (`test_ingestion.py`, `test_ai_h1.py`, `test_ai_vision.py`, `test_page_split.py`, `test_ac4_vendor_hygiene.py`) 39 passed on a disposable PostgreSQL instance bound only to `127.0.0.1:15499`, which was stopped after the run. Web typecheck, lint/money-safety, full Vitest 37/37, and production build passed; Playwright 13/13 passed with mocked APIs. Ruff, formatting for the new Python files, strict core mypy (36 files), import contracts (3 kept), core purity, rules hash, engine-version check, synthetic golden self-check, OpenAPI/schema generation, and `git diff --check` passed.
+
+Offline benchmark (`--network none`, report `after-ac7-20261008-final-review.json`): parsed/missed/spurious 51/0/0; hard counters false-safe/false-auto-link/false-matched/wrong-vendor 0/0/0/0; gate passed; cache hits/files read 35/0. Only aggregate counts and labels were read from the report.
+
+Not run: migration-safety checks because AC-7 adds no migration; provider-specific tests because provider calls are prohibited here; authentication tests (separate database cluster) and infrastructure-ready tests (S3 credentials). The plan's human timing target remains owner validation. The build reports its existing large PDF-related chunk warning; the build itself passes.
+
+## D51 — AC-8a core identity and duplicate rules, plus aged fix (8 Oct 2026)
+
+Core duplicate suspicion now uses invoice grand total within ₹1 and the configured date window (`duplicate_suspect_days`, default 3), followed by either an invoice number equal after look-alike folding and existing canonicalization, or an identical complete multiset of line amounts. The supplier/vendor anchor is not required, so the fingerprint can still catch a copy with a misread vendor; a suspected duplicate remains in Review and continues consuming balance. An aged `GRN_PENDING` case is promoted to `exception` even when another review reason would otherwise leave it in `needs_review`, satisfying `recon_case_aged_ck` while retaining its reason codes. Exact duplicate blocking remains unchanged.
+
+| Decision | Choice |
+|---|---|
+| Line fingerprint | Compare sorted, complete line-amount multisets; amount uses the printed amount or quantity × rate. Incomplete or empty line sets do not provide this signal. |
+| Date window | Reuse `duplicate_suspect_days` (default 3); do not introduce a second window. The prior edit-distance setting remains in the config contract but does not control this fingerprint rule. |
+| App identity and re-scan policy | Deferred to AC-8b. No page hashes, migration, or overwrite/conflict behavior was added; D19's open lower-quality re-scan policy remains unresolved. |
+| Aged `GRN_PENDING` | Any such case with `aged=true` has status `exception`; existing reason codes remain available for review context. |
+
+Offline benchmark (`--network none`, `before-ac8a-session-20261008.json` → `after-ac8a-session-20261008.json`, report `5d86b53363eb`):
+
+| Measure | Before | After |
+|---|---:|---:|
+| Parsed / missed / spurious | 51 / 0 / 0 | 51 / 0 / 0 |
+| System documents / extra / wrong merges | 28 / 2 / 0 | 28 / 2 / 0 |
+| Duplicates caught / missed / false | 0 / 2 / 0 | 0 / 2 / 0 |
+| **False-safe / false auto-links / false Matched / wrong vendors** | **0 / 0 / 0 / 0** | **0 / 0 / 0 / 0** |
+
+The hard gate passed. Benchmark outcomes are unchanged; engine version is `0.1.5`. The version change caused 0 cache hits and 35 source files read. Only aggregate counts and labels were used; no provider calls ran.
+
+Checks: focused AC-8a unit/property tests 35 passed; final unit/property/scenario/parser suite 738 passed in 86.17s; Ruff clean, changed Python files formatted, strict core mypy 36 files with no issues, import contracts 3 kept / 0 broken, core purity passed, rules hash `b39481831e08c92eaab1f3934ba27316f677f6d0b4dc943ccec4d998e709183c` verified, engine version check passed (`0.1.4` → `0.1.5`), and golden self-check passed (0 stored cases; synthetic harness check passed). No migration safety or PostgreSQL integration checks were run because this slice changes only pure core and synthetic tests; no web checks or E2E were run because app/API/UI code is unchanged. Provider tests were not run because provider calls are prohibited.
+
+Open:
+- The offline benchmark still reports 2 missed duplicate copies (0 caught, 0 false). AC-8b remains not started; re-evaluate the end-to-end identity/duplicate metric after app identity integration.
+- D19's re-scan overwrite/conflict decision remains open and is not resolved by AC-8a.
+
+## D52 — AC-8b exact document identity and re-scan guard (8 Oct 2026)
+
+The owner approved an exact re-scan rule: a match requires identical ordered 64-bit page dHashes and an identical content fingerprint (document type, date, total, complete sorted line-amount multiset, and supplier PAN only when verified); if that pair cannot be built, only exact source SHA plus source-page locator matches. D19's proposal is adopted: compare the minimum confidence among verified fields, persist a lower-confidence parse as an alternative version, and leave the current pointer unchanged. Migration `0023_document_identity` persists this evidence per immutable version and backfills prior versions with source SHA and locator only; no image bytes or extracted page text are stored.
+
+| Decision | Choice |
+|---|---|
+| Verified natural key | Use verified document number, date and supplier identity for the document key; it does not bypass the exact-evidence rescan match. On key collision with non-matching evidence, create a disambiguated key rather than merging. |
+| Re-scan match | Exact ordered page dHashes plus exact content fingerprint. If either cannot be built, fall back to exact file SHA plus source-page locator. |
+| Content fingerprint | Document type, date, grand total and complete sorted line-amount multiset; derive a line amount from printed amount or quantity × rate. Include supplier PAN only when its GSTIN is verified. |
+| D19 current-version guard | Score is the minimum confidence among verified fields. A lower score or no verified fields is stored as an alternative and cannot replace the current version; equal or higher can become current. |
+| Page hashes | Render in the bounded PDF child and retain only the 64-bit dHash per page in page order. Parser version is `phase4-parser-5`. |
+| AC-8 status | Implementation and migration are in place, but phase remains open because the benchmark's zero-extra-document target is not met. AC-9 remains not started. |
+
+Offline benchmark (`--network none`, `after-ac8b-20261008.json`, report `1623bc6dcae4`; engine `0.1.5`): files read / parsed / missed / spurious `35 / 51 / 0 / 0`; system documents / extra / wrong merges `42 / 16 / 0`; duplicates caught / missed / false `8 / 2 / 0`; hard metrics false-safe / false-auto-links / false-Matched / wrong vendors `0 / 0 / 0 / 0`; gate passed. Compared with D51's `28 / 2 / 0` identity counts and `0 / 2 / 0` duplicate counts, the exact rule avoids false merges but leaves 16 extra documents. Only aggregate counts and labels were read from the report.
+
+Checks: offline unit/property/scenario/parser suite 745 passed in 95.20s; document-identity unit tests 7 passed; AC-8b rescan integration 1 passed; Phase 4.11/4.13 head acceptance 3 passed; synthetic legacy identity backfill passed. The broader `test_ingestion.py` run had 3 passed and 1 failed at its existing order-invariance assertion: one synthetic case had `DUP_SUSPECTED` and the other did not; its AC-8a behavior and expectation were left unchanged. Migration safety cloned `0022` and upgraded to `0023`; fresh upgrade, Alembic drift, catalog, index, decision, seed, queue schema and table-count checks passed (49 application tables, 27 triggers, 164 foreign keys, 258 explicit ACL entries). Ruff passed; edited Python format check passed; strict core mypy passed (36 files); new `document_identity.py` has 0 strict errors; `ingestion.py` remains at its baseline 33 errors and `pdf_sandbox.py` at its baseline 9; import contracts 3 kept / 0 broken, core purity, rules hash `13e26fe7…`, engine-version check, golden self-check and `git diff --check` passed. No provider calls or real-document fixtures were used.
+
+Not run: API/OpenAPI, web, UI E2E and other unrelated integration groups because AC-8b adds no API or UI contract; provider-specific tests because provider calls are prohibited; authentication and infrastructure-ready suites because they require a separate cluster and S3 credentials.
+
+Open:
+- The approved exact fingerprint rule leaves 16 extra documents in the benchmark (duplicates caught 8, missed 2, false 0). Keep AC-8b open and resolve this measured gap before treating its zero-extra-document target as met; do not weaken the approved rule implicitly.
+
+## D53 — AC-8b exact-match follow-up (8 Oct 2026)
+
+End-to-end review found that the database SHA+source-locator fallback could select an existing document of another type, while the deterministic rescan key includes document type. The app lookup now scopes all identity candidates to the parsed document type, with a synthetic regression test covering a type change at the same source SHA and locator. Synthetic integration coverage now also proves that the isolated PDF page hash reaches the immutable identity row. Two stale integration-test assumptions were corrected: a shell document is located through its current version's source file, and the ingestion-order comparison checks the shared financial fields plus the expected single `DUP_SUSPECTED` signal. The benchmark cache fingerprint now includes `document_identity.py`, the module that implements page dHash. The approved hash/content equality and D19 confidence rules are unchanged.
+
+| Decision | Choice |
+|---|---|
+| SHA+locator fallback | Require the same workspace and document type in addition to exact source SHA and locator. |
+| AC-8 closure | Keep AC-8 open until the benchmark reaches the written zero-extra-document target and duplicate misses are resolved. |
+
+Offline benchmark (`after-ac8b-20261008.json` → `after-ac8b-followup-final-20261008.json`, report `9a3ada7f26ef`; 0 cache hits, all 35 files read in 185.2 seconds):
+
+| Measure | Before | After |
+|---|---:|---:|
+| System documents / extra / wrong merges | 42 / 16 / 0 | 42 / 16 / 0 |
+| Duplicates caught / missed / false | 8 / 2 / 0 | 8 / 2 / 0 |
+| **False-safe / false auto-links / false Matched / wrong vendors** | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+
+Checks: focused AC-8b PostgreSQL regression 1 passed (3 deselected); full `test_ingestion.py` 4 passed, including synthetic PDF hash persistence; offline unit/property/scenario/parser suite 745 passed in 97.41s; Ruff and formatting passed; migration 0023 upgrade, seed and queue schema passed on disposable port 15499. Strict app mypy reported 34 errors in `ingestion.py` (the plan records 33 as its baseline; none point into the changed identity-query lines). No real documents were used or opened; provider calls were disabled. The benchmark ran with `--network none`; only aggregate output was read.
+
+Open:
+- Benchmark identity remains 16 extra documents and duplicate detection misses 2; the plan's AC-8 exit criteria are unmet. Meeting zero extras may require improving how exact evidence is produced or an explicit owner decision to revise the approved exact-match policy. Do not silently relax it.
+
+## D54 — AC-8 identity completion follow-up (8 Oct 2026)
+
+At the owner's request to finish AC-8, a bounded recovery path was evaluated against the offline benchmark. The implementation now groups a re-scan when its complete content fingerprint is exact and each ordered page dHash is within 16 bits, or when document type, canonical document number, date and supplier identity all match as verified fields. Natural-key recovery runs only when the evidence query has no candidate; multiple evidence candidates remain ambiguous and are not merged. Incomplete evidence still requires exact source SHA plus locator. The D19 current-version guard is unchanged: lower-confidence parses remain alternatives.
+
+The approved exact-dHash policy alone produced 42 system documents / 16 extra / 0 wrong merges and 8 duplicate copies caught / 2 missed / 0 false. A 4-bit bound did not change counts; 16 bits reduced this to 40 / 14 / 0; 32 bits added no further reduction. Adding exact fully verified natural-key recovery produced the best measured result: 34 system documents / 8 extra / 0 wrong merges, with extras by type `GRN 3 / PO 3 / invoice 2`; duplicate copies caught / missed / false were `0 / 2 / 0`. Hard metrics stayed `FALSE_SAFE 0 / FALSE_AUTO_LINKS 0 / FALSE_MATCHED 0 / WRONG_VENDORS_CREATED 0`; benchmark gate passed. This revises D52's exact-evidence-only rescan policy, while preserving its verified-field and D19 confidence guards.
+
+Final offline run used `--network none`, report `after-ac8-verified-key-breakdown-20261008.json`, hash `fbd207468f84`; 35 files read, 51 parsed, 0 missed and 0 spurious. Only aggregate counts and labels were read. No real samples, truth contents, cache contents, images or cached readings were opened, and provider calls stayed disabled.
+
+Checks: synthetic identity/benchmark unit tests 18 passed; full `test_ingestion.py` 4 passed on disposable PostgreSQL 16.15 at `127.0.0.1:15499`, with migration 0023, seed and queue schema setup successful; the container was stopped afterward. Offline unit/property/scenario/parser suite: 748 passed, with the single known B1 Hypothesis counterexample (`canonicalize_po_number("0/0")` is not idempotent) assigned to AC-9a; it was not changed. Ruff and touched-file formatting passed; strict core mypy passed (36 files); `ingestion.py` reported 33 pre-existing strict errors (baseline 33); import contracts 3 kept / 0 broken; core purity, rules hash, engine-version, synthetic golden self-check and `git diff --check` passed. No schema changed in this follow-up, so PG-SAFETY was not rerun. API, web, E2E, authentication, infrastructure-ready and provider-specific checks were not run because AC-8 changes no API/UI contract, those suites need separate services/credentials, or external calls are prohibited.
+
+Open:
+- The written AC-8 zero-extra-document target and duplicate-miss target remain unmet. The 8 extra documents have no unique fully verified identity under this policy, and the benchmark still has 2 missed duplicate copies. AC-8 remains open pending the owner's choice to accept and carry this measured gap to AC-11 or require further matching changes; AC-9 has not started.
+
+## D55 — AC-8 final lookup-order and scoring audit (8 Oct 2026)
+
+The final app audit found that bounded page-hash recovery could be tried before exact source SHA + locator recovery for legacy identity rows without captured page hashes. The app and synthetic benchmark now try exact content/page-hash equality first, exact same-type/source proof for legacy rows second, then bounded page-hash recovery. Benchmark scoring also counts `DUP_SUSPECTED` as a duplicate review flag, matching the AC-8 criterion that real duplicates be flagged; a synthetic regression test covers the score. No identity thresholds or D19 rules changed.
+
+Offline benchmark (`after-ac8-source-order-20261008.json`, report hash `fbd207468f84`; 35 files, 51 parsed; `--network none`; only aggregate counts and labels read):
+
+| Measure | Result |
+|---|---:|
+| System documents / extra / wrong merges | 34 / 8 / 0 |
+| Extra documents by type | GRN 3 / PO 3 / invoice 2 |
+| Duplicate copies caught / missed / false | 0 / 2 / 0 |
+| False-safe / false auto-links / false Matched / wrong vendors | 0 / 0 / 0 / 0 |
+
+Checks: focused synthetic unit/property suite 54 passed; full offline unit/property/scenario/parser suite 749 passed and 1 failed on the pre-existing B1 Hypothesis counterexample assigned to AC-9a (`canonicalize_po_number("0/0")`); synthetic PostgreSQL ingestion integration 4 passed on disposable port 15499. Ruff passed; formatting passed for all 4 touched Python files; strict core mypy passed (36 files); `ingestion.py` strict mypy remains at its 33-error baseline; import contracts 3 kept / 0 broken; core purity, rules hash `13e26fe7…`, engine-version check, synthetic golden self-check and `git diff --check` passed. Golden self-check had no cases (`unverified_no_cases`); its synthetic false-Matched detector passed. No provider calls or real-document fixtures were used. The PostgreSQL container was stopped after the check.
+
+Open:
+- Source-proof precedence is fixed, but benchmark identity and duplicate aggregates are unchanged: 8 extra documents and 2 duplicate misses. The authorized evidence rules do not identify these cases safely from the permitted aggregate-only report. AC-8 stays open because its zero-extra and duplicate-flag targets are unmet; AC-9 has not started. No AC-8c, migration, or later-phase work was started.
+
+## D56 — AC-9a scope audit and offline baseline (8 Oct 2026)
+
+Before code changes, the core matching entry point, app/CLI/benchmark callers, alignment rules, reference trust model and synthetic matching tests were traced. No AC-9a code was changed: the repo has no default GRN-to-invoice date window, no weights for the newly listed vendor/amount/strong-token/anchor signals, and no explicit verified flag in the pure `FieldValue`/`MappingDocument` model for deciding which reference anchors may auto-link. Existing `step3_min_score=0.80`, `step3_min_lead=0.15` and the six legacy Step 3 weights are documented; the existing `total_vs_expected` tolerance (1% or INR 10 in OR mode) belongs to reconciliation and is not passed into `MappingConfig`. AC-8b remains open; its unresolved identity behavior is not used by the current pure `resolve_links` path.
+
+| Decision | Choice |
+|---|---|
+| Session scope | AC-9a only, as explicitly directed; the dependency table lists AC-8a + AC-6b while the diagram also places AC-8b before AC-9a. No AC-8b status or policy was changed. |
+| D-6 | Preserve suggestion-only policy for new multi-signal matches; no new auto-link rule. |
+| AC-9a tuning | Await owner decisions on the date-window default, new-signal scoring/tolerance policy, and the core evidence that qualifies an anchor for auto-link. |
+
+Bench (`before-ac9a-session-20261008.json`, `--network none`; aggregate counts only):
+
+| Measure | Result |
+|---|---:|
+| Expected / found auto / found suggested / missed links | 10 / 1 / 6 / 3 |
+| Link recall / false suggestions / false auto-links | 7/10 (70%) / 0 / 0 |
+| **False-safe / false auto-links / false Matched / wrong vendors** | **0 / 0 / 0 / 0** |
+| Hard-metric gate | PASS |
+
+Checks: baseline offline benchmark passed; no static checks or tests run because matching implementation is paused pending the required owner decisions. AC-8b's documented truth coverage remains two complete sets, so this baseline does not establish the written 95% link-recall target.
+
+Open:
+- Set the AC-9 matching date window, amount tolerance and scoring treatment for added signals, and verified-anchor evidence rule before implementing matching v2.
+- AC-8b remains open; AC-9b has not started.
+
+## D57 — AC-9a matching v2 core (8 Oct 2026)
+
+Implemented the pure matching core and persisted the provenance needed to distinguish extracted references from verified references. Same-vendor identity is a gate, not a score; reference, part/model and amount use 40/35/25 weights normalized over available signals, with description as a lower-credit line-identity fallback. The expected amount is GRN accepted quantity × PO rate; 1% OR ₹10 grants full amount credit (the ₹10 floor only when the full invoice is covered), and score decays continuously outside that band. Quantity, price and date remain separate checks. Period-wide maximum-weight assignment respects open quantity and value ceilings; fully billed lines remain candidates and fail the open-quantity check.
+
+Date checks use invoice-to-PO proximity: 0–7 days normal, 8–15 review/lower confidence, and over 15 strong mismatch/manual verification. An invoice dated before its PO is flagged; invoice-versus-GRN order is not flagged. Date proximity and open GRN quantity are tie-breakers only inside the existing 0.15 lead margin. Verified OCR/ERP references require exact normalized same-vendor open PO identity (or an existing same-vendor GRN→PO relation), an independent part/model or full-credit amount signal, and confidence ≥ 0.85; this reuses D42's clear-reference floor. User-entered values are verified independent of confidence; handwritten references are never verified from confidence alone. New multi-signal links stay suggestions (D-6). B1 canonicalization is now idempotent; B7's unverified OCR reference alone stays a suggestion. AC-8b remains open and AC-9b was not started.
+
+Invoice↔GRN matching covers same-vendor invoice number to GRN supplier-invoice number or challan, plus invoice challan to GRN challan. The GRN's own PO link remains the path to a PO; the invoice's GRN number is corroboration only.
+
+| Decision | Choice |
+|---|---|
+| Signal roles | Same vendor is a candidate gate; reference/marketplace order, part/model and amount are the only weighted signals (40/35/25); amount never retrieves candidates. |
+| Tolerance and checks | Existing 1% OR ₹10 full-credit band; ₹10 floor only for full-invoice coverage; continuous amount decay; quantity and price variances shown separately and sum to amount delta. |
+| Date policy | 0–7 / 8–15 / >15 bands as above; invoice-before-PO is a red flag; no invoice-before-GRN flag; dates and open GRN quantity only break close ties. |
+| Anchor trust | Persist `origin`, nullable machine confidence, verification state, verifier and time in migration `0024_matching_provenance`; manual/user verification is confidence-independent; system-check is exact, same-vendor, open and independently corroborated. |
+| D-6 | Only verified deterministic anchors may auto-link. Multi-signal matches remain suggestions; no new auto-link threshold. |
+| Scope | AC-9a core only. AC-8b was not marked complete or changed; AC-9b, AC-10 and AC-11 were not started. |
+
+Bench (`after-ac9a-20261008-final.json`, `--network none`; report `07703f906e1b`, engine `0.1.6`; aggregate counts only):
+
+| Measure | Result |
+|---|---:|
+| Expected / found auto / found suggested / missed links | 10 / 0 / 3 / 7 |
+| Link recall / false suggestions / false auto-links | 3/10 (30%) / 0 / 0 |
+| **False-safe / false auto-links / false Matched / wrong vendors** | **0 / 0 / 0 / 0** |
+| Identity extra / wrong merges | 8 / 0 |
+| Duplicate copies caught / missed / false | 0 / 2 / 0 |
+| Hard-metric gate | PASS; written ≥95% link-recall target remains unmet |
+
+Checks: focused synthetic mapping/normalization/identity suite 100 passed; full offline unit/property/scenario/parser suite 772 passed; ingestion integration 4 passed and `test_phase4_task_411_413.py` 3 passed on disposable PostgreSQL 16.15 at `127.0.0.1:15499`. PG-SAFETY at `0024` passed migration safety, drift, catalog, index, decision, seed, queue-schema and table-count checks; schema contract counts remain 49 application tables, 38 enums, 27 triggers, 164 foreign keys, 258 explicit ACL entries and 7 default privileges. Other integration groups previously passed: 47, 22 and 76 tests. Group 5 had 7 passed and 2 `test_page_split.py` failures: `MultipleResultsFound` in `_current()` with duplicate PO rows, an existing AC-8b identity/split issue outside this session's scope. Ruff and touched-file formatting passed; strict core mypy passed (36 files); explicit app mypy has only the existing 33 `ingestion.py` baseline errors; import contracts 3 kept / 0 broken; purity passed; rules hash `ebc72906a13fe072ee07d288963a1b4156981c72e33e6d7a288439396290c2b0` verified; engine bump `0.1.4 → 0.1.6` verified; golden self-check passed with 0 cases (`unverified_no_cases`); `git diff --check` passed. Tests used `RB_AI_EXTERNAL_CALLS=disabled`; no provider calls or private benchmark cases were inspected. Web/API/E2E checks were not run because AC-9a changes no UI/API contract. Authentication and infrastructure-ready checks were not run because they require a separate database cluster and S3 credentials.
+
+Open:
+- The written ≥95% link-recall target is unmet (30%). Only aggregate benchmark counts were consulted; do not infer private benchmark cases. No case-directed tuning was made.
+- AC-8b remains open; AC-9b has not started.
+- One earlier schema-drift command accidentally used the configured default database URL before the disposable-URL guard was corrected. It was read-only and ran no migration or DDL/DML; all later PostgreSQL checks used disposable ports 15497/15499.
+
+## D58 — AC-9a direct invoice↔GRN anchors (9 Oct 2026)
+
+Core review found that `_via_grn_resolution` recognized the written same-vendor invoice-number↔GRN supplier-invoice/challan anchors, but discarded them unless part or amount also matched, and required a GRN→PO relation even to emit an invoice↔GRN edge. Direct identifier anchors now produce an explainable invoice↔GRN edge on their own; an invoice→PO edge is inherited only when that GRN already has a GRN→PO relation, while normal PO content matching still runs if it does not. Unverified identifiers remain suggestions; verified direct identifier pairs may auto-link under D-6. An invoice's GRN-number reference remains corroboration only and still needs an independent part or amount signal. The amount/date/identity thresholds and AC-8b behavior are unchanged.
+
+| Decision | Choice |
+|---|---|
+| Direct invoice↔GRN identifiers | Same-vendor supplier-invoice number or challan equality is sufficient for an invoice↔GRN edge; verified matching fields can auto-link under the existing D-6 rule. Reuse a GRN→PO relation only when deriving invoice→PO; otherwise retain PO content suggestions. |
+| Invoice GRN-number reference | Corroboration only; never creates an edge without independent part or amount evidence. |
+| Scope | AC-9a pure core only; no app/API/UI or schema change. AC-8b remains open; AC-9b, AC-10 and AC-11 were not started. |
+
+Bench (`after-ac9a-grn-anchor-final-20261009.json`, `--network none`; report `9cd8137fd7c1`, engine `0.1.7`; aggregate counts only):
+
+| Measure | Result |
+|---|---:|
+| Files read / parsed / missed / spurious | 35 / 51 / 0 / 0 |
+| Expected / found auto / found suggested / missed links | 10 / 0 / 3 / 7 |
+| Link recall / false suggestions / false auto-links | 3/10 (30%) / 0 / 0 |
+| **False-safe / false auto-links / false Matched / wrong vendors** | **0 / 0 / 0 / 0** |
+| Hard-metric gate | PASS; written ≥95% link-recall target remains unmet |
+
+Checks: focused synthetic mapping suite 48 passed; full offline unit/property/scenario/parser suite 774 passed in 95.90s with `RB_AI_EXTERNAL_CALLS=disabled`. Ruff check and changed-file formatting passed; strict core mypy passed (36 files); import contracts 3 kept / 0 broken; core purity passed; rules hash `8a1b2970cfbd07b2c4ec56501766c102f506c8583d535313d9db2f98fdeaaf1a` verified; engine version check passed (`0.1.4 → 0.1.7`); golden self-check passed with 0 cases (`unverified_no_cases`) and its synthetic false-Matched detector passed. The final `git diff --check` passed (only repository line-ending warnings). No migration or app/database change was made, so PostgreSQL and app integration groups were not rerun. No provider calls or private benchmark cases were inspected.
+
+Open:
+- Link recall remains 30% against the written ≥95% target. The permitted aggregate-only benchmark output does not identify which candidate-generation evidence is missing, so no further case-directed tuning was made.
+- AC-8b remains open; AC-9b has not started.
+
+## D59 — Scan fix WI-1, WI-3 and WI-2 steps 1/3/5 (9 Oct 2026)
+
+Plan: `docs/accuracy-fix-plan-scan-extraction.md`. Upload and the bench now build parser hints through one function (`parser_hints_from_config`); the bench takes `--buyer-entities {truth,config,none}` (default `truth`), `--einvoice-key-file`, defaults to `--workers 1`, and counts sandbox timeouts (never cached). `RB_EXTRACTION_ENGINE` is an app setting checked at startup. `scripts/accuracy_attribution.py` (`make accuracy-attribution REPORT=…`) replaces the `work/diag-scan` prototypes and reads only the cache. `scripts/measure_extraction.py` is deprecated (exit 2; deletion is DP-3).
+
+| Decision | Choice |
+|---|---|
+| Party role without buyer entities | One unlabelled GSTIN, or an unlabelled vendor beside another unlabelled GSTIN: vendor GSTIN `UNVERIFIED`, capped at 0.60 (layout and core text paths). A labelled Bill-To GSTIN establishes the vendor by elimination; with configured entities the old checksum rule is unchanged. |
+| Empty buyer entities | `BUYER_ENTITIES_NOT_CONFIGURED` warning and `vendor_gstin` in `review_fields` for PDF documents that read a vendor GSTIN; Settings shows a non-blocking readiness note linking to Buyer entities. |
+| Tests | `make test` now includes `backend/tests/parsers`; `tests/support/layouts.py` builds synthetic layouts; `tests/scenarios/test_hard_zero_guards.py` pins the hard-zero rules. |
+
+Frozen baseline (`baseline-scanfix.json`, fresh worker-image reads, `--buyer-entities truth`): report `280fdebc96af`, engine `0.1.7`, extraction code `2ccc292e18ba`, truth `f25da17cbc5f`, timeouts 0. Segmentation, extraction, vendors, links, recon, hard and per-document blocks are identical to `after-ac9a-grn-anchor-final-20261009.json`, so the §0.4 table stands: header 302/373, lines 96/141, links 3/10, hard 0/0/0/0. Attribution (`baseline-scanfix-attribution.json`): scan-page docs 33, header 224/283 (A 9 / B 45 / C 0 / D 0 / E 5), line amount 78/111. Rules hash updated to `88fdcadf15b8…`.
+
+Open:
+- The `--buyer-entities none` / `config` runs (WI-1 (d), WI-3 bench acceptance) are not run yet.
+- Guard found a gap: consensus `rules_readings` counts a `FieldSource.AI` value as an OCR reading, so with auto-verify on and no crop required a vision-written value verifies against its own vision reading. The guard is `xfail(strict=True)` until consensus is fixed.
+
+## D60 — WI-3: vendor name without buyer entities (9 Oct 2026)
+
+Cause: with `--buyer-entities none`, the layout reader took a PO or GRN's "for <Company>" line (the issuer, so the buyer) as the vendor name. A verified supplier GSTIN on one PO then created a vendor and named it after the buyer (anchor uses any non-empty name as provisional, so a confidence cap alone could not fix it).
+
+| Decision | Choice |
+|---|---|
+| PO/GRN, empty entities | Only a name under a supplier label is used. If only the issuer line is found, the vendor name is left empty, `vendor_name` goes in `review_fields`, and the warning `VENDOR_NAME_ROLE_UNESTABLISHED` is added (`parties.withhold_vendor_name`). The vendor stays name-pending. |
+| Core text parser | An unlabelled invoice heading tied to a vendor GSTIN whose role is not established is withheld the same way. |
+| Configured entities | Unchanged. |
+| Leftover C (accepted) | S10-GRN: the buyer's own GSTIN is read as the vendor GSTIN, capped at 0.60 and listed for review (D59 rule); no vendor is created. Left for WI-5 or a follow-up. |
+
+Bench `none` (`scanfix-none-2.json`): hard 0/0/0/1 → 0/0/0/0; document vendor correct 31 / pending 2 / wrong 1 → 32 / 2 / 0; attribution C 4 → 1. Bench `truth` (`scanfix-truth-2.json`, report `470682236b6d`): segmentation, extraction, vendors, links, recon, hard and per-document blocks identical to `baseline-scanfix.json`. Tests 819 passed, 1 xfail; rules hash `43b153f776ec…`.
+
+## D61 — WI-2 steps 2/4/6: CI Tesseract, scan images, golden cases (9 Oct 2026)
+
+| Decision | Choice |
+|---|---|
+| CI | `scaffold-gates` installs `tesseract-ocr tesseract-ocr-eng` before `make test`, so OCR tests run in CI. The local skip remains (`scan_images.tesseract_with_english`). |
+| Scan images | New `backend/tests/support/scan_images.py` renders a synthetic invoice (`SYN-INV-0001`, checksum-valid made-up GSTIN) with `skew_deg`, `rotate`, `dpi`, `jpeg_quality`, `noise`, `tiles`, `text_layer` (none/poor/good). The old `_scanned_invoice_pdf()` now calls it. |
+| Scan tests | `tests/parsers/test_scan_images.py`, 7 cases: skew 1.5°, 150 DPI, rotated 90°, 4 strips and a garbled text layer read all 5 header fields correctly. JPEG q60/q40 with noise must give correct values or none (never a wrong one), and stay in review. |
+| Golden | `golden_run.py` accepts a compact form (synthetic XML documents parsed by the core parser, labelled links by key). A case is verified when status, link and expected reason codes match. A mismatch now fails the gate. `golden/SYN-SCN-01` (Matched) and `SYN-SCN-04` (Exception, QTY_OVER_PO + QTY_OVER_GRN) are both verified (`gate_status: evaluated`). |
+
+Seen, not fixed: on the q60 + 0.3% noise page, the taxable value and the GSTIN are lost (input to WI-8). A tiled page is OCR'd but not flagged `scanned`. Core unchanged, so no bench run. Tests 826 passed, 1 xfail; rules hash `43b153f776ec…`.
+
+## D62 — AC-L0 part 1: WI-G2, WI-G1, WI-BE1 (16 Oct 2026)
+
+Plan: `docs/plan-llm-extraction-call.md` §3. Owner decision §0.6 applies: Gemini and vLLM are separate providers; one request goes to exactly one provider; no answer is combined with another. No network, provider or vLLM call was made.
+
+| Decision | Choice |
+|---|---|
+| WI-G2 import guard | `httpx`, `openai`, `requests` added to `forbidden_modules` of the contract "Only the AI worker may load the Gemini SDK or AI worker code". No module outside the worker imported them. The `openai` SDK is not added. |
+| WI-G1 self-confirmation | `consensus.rules_readings`: a value whose source is `ai` becomes a `vision` reading, never `ocr`/`text_layer`/`structured`. So a vision value plus a second vision reading (any provider) is one reader kind → `single`/L2, never L1. A QR confirmation of such a value still counts as an independent reader. `crop_needs` now takes the first vision reading that has a page, so crops still use the check's geometry. The D59 strict xfail is removed and passes. `CONSENSUS_VERSION` unchanged (only AI-sourced fields can lose L1). |
+| WI-BE1 provider port | `ProviderRequest.thinking_level` is `minimal/low/medium/high/None` (default `low`), new `options` mapping (Gemini ignores it); `ProviderResult` gains `latency_ms`, `finish_reason`, `model_reported`, `reasoning_present` (Gemini fills `model_reported` only). New `ai/worker/providers.py` `build_providers()` → `{"gemini"}` only. `AiRequestRunner(providers=…)` picks by `ai_request.provider`; a name not registered is skipped with `PROVIDER_NOT_CONFIGURED` before any reservation. `VisionReaderInfo` gains `prompt_variant`, `schema_dialect`, `box_order`, `billing` (`vision_gemini`: `gemini`, `gemini`, `yx`, true; nothing reads them yet). |
+| Golden | `tests/unit/test_ai_provider_golden.py`, written before the refactor: SHA-256 and length of the exact Gemini request body for a synthetic two-page vision payload, plus its payload digest and cache key. Unchanged after the refactor. |
+
+Checks: offline suites 835 passed, 0 xfailed (826 + former xfail + 8 new). Integration on disposable PG: `test_ai_runner` 26 passed (2 new: dispatch by name, unregistered provider skip), `test_ai_settings_api` 22 passed, H1–H4 + vision 74 passed, 1 failed: `test_ai_h1::test_ai_first_suggests_for_a_clean_pdf…` (rules-only clean PDF now `needs_verification`); it fails the same way with the WI-G1 change taken out, and that path never calls consensus or the runner, so it was already failing before this work (open). Ruff, mypy strict, lint-imports (3 kept), core purity pass. Rules hash `dca98ea94e39…`. Engine version check vs HEAD passes (0.1.4 → 0.1.7, bump already in the working tree). Bench not run (needs approval).
+
+## D63 — AC-L0 part 2: WI-BE5 (provenance, cache key v2) and WI-BE4 (schema/prompt v4, standalone checks) (16 Oct 2026)
+
+Plan: `docs/plan-llm-extraction-call.md` §3. §0.6 applies: one request, one provider; no answer is combined with another. No network, provider or vLLM call was made. Synthetic data only.
+
+| Decision | Choice |
+|---|---|
+| Migration `0025_ai_reader_params` | `ai_request.reader_params jsonb NOT NULL DEFAULT '{}'` (object check); `ai_cache.provider ai_provider`, `schema_version text` (1–64), `reader_params jsonb` (object check), all nullable. No backfill. Errata entry added; CI previous schema `0024`; Phase 4.11/4.13 revision set includes `0025`. |
+| `reader_params` | `ai/vision.reader_params(reader, reader_pass)`: reader, render version, max side, JPEG quality, mask version, media resolution, max pixels, thinking, sampling profile, prompt variant, pass. `VisionReaderInfo` gains `thinking`, `sampling_profile`, `max_pixels` (`vision_gemini`: low, provider_default, none). The enqueuer stores them on vision requests; text hooks keep `{}`. |
+| Cache key v2 | `cache_key_v2` adds provider and a reader-params digest; `request_cache_key` picks v2 for `h6_vision` and keeps v1 for H1–H4 (their caches stay valid). The runner and the bench both use it. New cache rows record provider, schema version and (vision) reader params; `None` is written as SQL `NULL`, not JSON `null`. |
+| Golden keys (synthetic two-page payload) | v1 `5f1c6d16e9c7…` (unchanged, v3 payload) → v2 of the same v3 payload `848fa3cb6b47…` (BE5 alone; Gemini body hash `acd3bdd9a676…` unchanged through BE5) → v2 of the v4 payload `42cdab004640…` (after BE4). |
+| Bench | `accuracy_vision` uses the v2 key. `--vision-cache-compat v1` (read-only, default dir `work/accuracy-cache/vision-v1`) also finds answers recorded under the v1 key, only while the reader is Gemini with the pre-v2 parameters; the v1 key is computed from a frozen copy of the v3 prompt and schema. The 72 cached answers were copied to `vision-v1` (counts only). |
+| Schema `vision.schema.v4` | v3 plus top-level `unreadable: [{name, page, box_2d}]` (no value). Two dialects from one definition: `gemini` (as before, no `maxItems`/`anyOf`) and `openai_json_schema` (every key required, `additionalProperties: false`, optional keys nullable via `anyOf`). A unit test keeps both in step with the Pydantic models; `unreadable` is optional in the model so v3 answers still parse. |
+| Prompts | `vision.prompt.v4.gemini` = v3 text + rule 9 (unreadable). `vision.prompt.v4.qwen` = shorter rules, explicit `box_2d` coordinate rule, one made-up example (`SYN-INV-0001`, checksum-valid synthetic GSTIN). `PROMPT_VERSIONS` no longer holds `h6_vision`: `VISION_PROMPT_VERSIONS` per reader and `prompt_version(hook, reader=…)`. A reader returning `xy` boxes is swapped to `yx` before checks. |
+| Consent | With vision on, the fingerprint covers the reader's prompt version and variant (re-consent: the vision prompt changed). With vision off it is byte-identical to the legacy formula (test). |
+| Standalone checks (core) | `check_reading` marks, never drops: `totals_arithmetic`, `lines_vs_taxable` (±₹1), `line_arithmetic` (q × r), `date_window` (D42, only with `as_of`; the app passes today, the bench none). Counts in `VisionCheck.check_failed`; `unreadable` entries placed and counted (unknown name, bad page/box dropped). The OCR-anchored drop rules are unchanged. The date window moved to `extraction/date_window.py`, shared with consensus (same rule). |
+| Gemini body | Changes in BE4 as the plan specifies (rule 9 and the `unreadable` schema): new golden `7ede12081bc9…` (8,121 bytes). The frozen v3 builder still reproduces the D62 body `acd3bdd9a676…` and the v1 key (test). |
+
+Checks: offline suites 873 passed, 0 xfailed (835 + 38 new). Integration on disposable PG: `test_ai_runner` + `test_ai_assist_migration` 43 passed (new 0025 test included), `test_ai_settings_api` 22 passed, H1–H4 + vision 74 passed, 1 failed (`test_ai_h1::test_ai_first_suggests_for_a_clean_pdf…`, already failing before this work, D62). PG-SAFETY on `127.0.0.1:15497`: migration safety 0024→0025, drift, catalog, indexes, decisions, seed, queue schema, table count pass; contract counts unchanged (49 tables, 38 enums, 27 triggers, 164 FKs, 258 ACLs, 7 default privileges). Ruff, mypy strict, lint-imports (3 kept), core purity pass; OpenAPI export unchanged. Rules hash `24a1348f4fa4…`; engine version check vs HEAD passes (0.1.7 already in the tree). Not run: benches (need approval), so the `--vision-cache-compat v1` replay of `after-d41-lite.json` (header 271/313, lines 80/123) is still to be confirmed by the owner.
+
+## D64 — AC-L0 part 3: WI-BE2 `vision_openai_compat` provider for vLLM (Qwen3.5-9B) (16 Oct 2026)
+
+Plan: `docs/plan-llm-extraction-call.md` §0 and WI-BE2. §0.6 applies: Gemini and vLLM are separate alternatives; a request goes to exactly one provider and no answer is combined with another provider's. No network, provider or vLLM call was made; every HTTP exchange in tests is `httpx.MockTransport` with synthetic data.
+
+| Decision | Choice |
+|---|---|
+| Provider | New `ai/worker/openai_compat.py` `OpenAICompatProvider` (`name="vllm"`, `external=False`), plain `httpx` (no SDK): `SingleAttemptTransport(HTTPTransport(retries=0))`, `follow_redirects=False`, `trust_env=False`, timeouts connect 5 / read = request / write 30 / pool 5 s, request timeout 1–300 s. `POST {base_url}/chat/completions` (base URL already ends in `/v1`). Every body: `chat_template_kwargs {"enable_thinking": false}` (options cannot override it), sampling profile `qwen_card_nonthinking` (temperature 0.7, top_p 0.8, top_k 20, min_p 0, presence 1.5, repetition 1.0; `_pp0` arm available; Gemini's `provider_default` maps to the card), `seed 20261016`, `response_format json_schema` (`vision_reading`, strict) with the v4 `openai_json_schema` dialect, `stream false`. More than one image → `INVALID_REQUEST`, not sent. `Authorization: Bearer` only when a key is given. |
+| Response | `choices[0].message.content` must be a JSON text; `usage.prompt_tokens/completion_tokens` recorded; `reasoning_content`/`reasoning` → `reasoning_present` + counter; content starting with "Thinking Process" or `<think>` → `invalid_output` and `thinking_leak` counter; `finish_reason=length` → `invalid_output`, detail `at_output_cap`. Counters are in-process plus a warning log line (not persisted). |
+| Errors (`map_openai_compat_error`) | 400 `INVALID_REQUEST` (300-char diagnostic, digit runs ≥ 6 masked, kept on `ProviderFailure.detail` and logged; never shown), 401/403 `bad_key`, 404 `MODEL_UNAVAILABLE`, 408/504 `timeout`, 429 `rate_limited` / 503 `PROVIDER_UNAVAILABLE` (30 s backoff), other 5xx `error`, other 4xx `INVALID_REQUEST`, 3xx `error` (redirect not followed). Connect refused/timeout → `PROVIDER_UNAVAILABLE` not sent (released); read timeout → `timeout` responded; nothing is "uncertain" (nothing billed). |
+| Health | `health()` = `GET {base_url}/models` (5 s): ok, latency, model ids, `max_model_len` per model; `context_window(model)` fetches it once and caches it. Heartbeat and `last_health_*` columns are WI-BE3. |
+| Endpoint policy (SSRF) | New pure `ai/endpoint_policy.py` (stdlib only; added to the import-linter "no HTTP client" contract): `normalize_base_url` (http/https, no user info/query/fragment/`.`/`..`/empty segments/percent-escapes/non-ASCII, lowercase host, default port dropped, no trailing slash), `parse_allowlist`, `check_allowed` (exact origin + path prefix). Checked by the gate and again by the provider before every request and health call (no I/O when it fails). The API-side check on save comes with the URL field in WI-BE3. |
+| Gate | `DeploymentGate` gains `vllm_mode` (`RB_AI_VLLM_CALLS`, default `disabled`, same three modes) and `vllm_endpoints` (`RB_AI_VLLM_ENDPOINTS`, comma list; required when the mode is not `disabled`). `refusal(..., external=True, endpoint=None)`: external calls unchanged; a local call needs its mode (`LOCAL_CALLS_DISABLED`, synthetic-fixture rules for `synthetic_only`) and an allowlisted endpoint (`ENDPOINT_NOT_ALLOWED`). No approval reference for the company server. |
+| Registry | `vision_openai_compat`: provider `vllm`, external false, billing false, prompt variant `qwen` (`vision.prompt.v4.qwen`), dialect `openai_json_schema`, box order `yx` (to confirm in the WI-OPS1 image smoke test), thinking `off`, sampling `qwen_card_nonthinking`, new field `pages_per_call=1` (not in `reader_params`, so the Gemini cache key is unchanged). `build_providers` registers the vLLM provider only when `RB_AI_VLLM_BASE_URL` is set and `RB_AI_VLLM_CALLS` is not `disabled`; a base URL outside the allowlist stops the worker at startup. |
+| Limits and runner | `AiLimits.h6_vision_local` (used when the provider is `external=False`): 1 page per call, max output 4,096, image estimate 3,500 tokens, timeout 300 s, `max_concurrency` 1, `backoff_seconds` 30. Only `*_local` kinds may exceed the 120 s Gemini cap (validator). Per call the runner computes `max_tokens = max_model_len − ceil(prompt text bytes / 3) − image tokens − 256` (the schema is enforced by decoding, not sent) and skips with `CONTEXT_TOO_SMALL` before any reservation when it is below 1,024. `ledger.reserve` gains `max_concurrency` (in-flight per provider across workspaces, advisory lock) and `backoff_seconds` (defer `PROVIDER_BACKOFF` after the provider's last `rate_limited`/`PROVIDER_UNAVAILABLE`). Vision requests pass `reader_params` as `options`; Gemini ignores them. |
+| One page per call | `Prepared.parts` + `merge_outputs`: the vision handler builds one payload per page for a reader with `pages_per_call=1`; the runner sends them in order (lease = timeout × pages, usage summed, any page failure fails the request). Answers are merged by the new pure core `merge_page_readings` (each page's items kept; an item naming another page, or a boolean page, is dropped and counted; `doc_kind` = first named kind) and the merged answer is parsed strictly and checked exactly like a Gemini answer. Digest, cache key and input limits stay on the whole-document payload. |
+| Not done (deferred, with reason) | `RB_VISION_READER=all` and its default: consent fingerprint, settings API and enqueuer still assume one reader, and the `ai_provider` enum has no `vllm` value, so no ledger row can name the vLLM provider yet → WI-BE3 (migration, settings, key-optional path; the runner still requires a sealed workspace key). Image long side 1,600 px (the render spec is shared; images go at the existing 2,048 px render; `mm_processor_kwargs` not sent, unverified on vLLM 0.23.0) → WI-OPS1. The deferred 60 s retry after a refused connection (it is released and starts the 30 s backoff) → WI-OPS2. The stdlib mock server: the owner asked for `httpx.MockTransport` only; the integration test covers prepare → request → answer → cache → consensus enqueue with it. |
+| Gemini | Golden body `7ede12081bc9…` unchanged (`test_ai_provider_golden.py` untouched and passing). `test_vision_v4` now pins both readers' prompt versions. |
+
+Checks: offline suites 951 passed, 0 xfailed (873 + 78 new in `tests/unit/test_ai_openai_compat.py`). Integration on disposable PG (`127.0.0.1:15499`, stopped afterwards): `test_ai_runner` 32 passed (6 new), `test_ai_vision` 14 passed (1 new, vLLM reader through the real runner), `test_ai_settings_api` 22 passed; `test_ai_h1` 13 passed, 1 failed (`test_ai_first_suggests_for_a_clean_pdf…`, already failing before this work, D62). Ruff, mypy strict (core; touched app files also clean under strict), lint-imports (3 kept), core purity pass. Rules hash `24a1348f4fa4…` → `1e40652fe689…` (only `merge_page_readings` added; verified). Engine version check vs HEAD passes. Not run: benches and any vLLM call (need approval; record the real-invoice approval of 16 Oct here before the first real-page call).
+
+## D65 — AC-L0 part 4: WI-BE3 settings model, API, migration, consent, audit for separate providers (16 Oct 2026)
+
+Plan: `docs/plan-llm-extraction-call.md` §0 and WI-BE3, with the D64 deferrals. §0.6 applies: Gemini and the company vLLM server are separate alternatives; a workspace has at most one vision reader (`single`) or one shadow reader (`shadow`); there is no `dual_agree`, no `secondary_reader` value (always `null` in the API) and no merging of two providers' answers. No network, provider or vLLM call was made; all HTTP in tests is `httpx.MockTransport` with synthetic data.
+
+| Decision | Choice |
+|---|---|
+| Migration `0026_ai_providers` | `ALTER TYPE ai_provider ADD VALUE IF NOT EXISTS 'vllm'` in `autocommit_block()`; enums `ai_reader_strategy (off, shadow, single)` and `ai_apply_mode (suggest, merge)`; table `ai_provider_config` as specified (UNIQUE `(workspace_id, provider)`, `base_url` only for `vllm`, `limits` object, `last_test_*`, `last_health_*`, `version`), owner `reconbench_migrator`, default grants, `REVOKE ALL … FROM reconbench_report` (as for the other AI tables); `ai_setting` gains `reader_strategy`, `primary_reader`, `apply_mode` with CHECK `(reader_strategy = 'off') = (primary_reader IS NULL)`. Backfill: every Gemini row gets a Gemini card (`enabled = mode <> 'rules_only'`, model) and `single`+`gemini` when `vision_enabled`, else `off`. Fixed-forward; no other data rewritten. |
+| Deviations from the plan text (with reason) | (1) The Gemini card does **not** copy `key_secret_id`: the Gemini key stays on `ai_setting` (text hooks read it there), so one secret is never referenced by two rows that the key sweeps must keep in sync; CHECK `provider = 'vllm' OR key_secret_id IS NULL`. (2) `vision_enabled` is kept equal to `reader_strategy = 'single'` (not `<> 'off'`): in `shadow` the H1 text hook must keep running and nothing from the shadow reader is shown, so the old flag must not switch H1 to H6. No CHECK ties the two columns (older fixtures write only `vision_enabled`); a row with only the old flag reads as `single`+`gemini`. (3) Gemini `enabled` follows `mode` (turning Gemini off while AI is on is refused with `gemini_required`), because text hooks H1–H4 keep using Gemini. |
+| Runtime resolution | `SettingsSnapshot` carries strategy, primary reader, apply mode and the vLLM card. Text hooks target `ai_setting.provider/model`; the vision hook targets the primary reader (vLLM → card model). `request_blocker` checks the request against that target, refuses vision when the strategy is not `single`, and checks the key per provider. `AiHookEnqueuer` uses the provider's own gate (`RB_AI_VLLM_CALLS=enabled` + allowlisted card URL for vLLM) and takes provider, model, prompt version and reader params from that provider's reader (`reader_for_provider`; Gemini keeps exactly the configured Gemini reader). The worker vision handler picks the reader from the request's provider. Shadow requests are not enqueued yet (WI-BE6). |
+| Key-optional vLLM | `load_provider_key`: Gemini key required as before; vLLM without a stored key is called without `Authorization` (runner passes an empty key); a stored vLLM key is sealed like Gemini's (write-only, session or saved), ends with its session, and is removed with `remove_key`. Session/expiry sweeps also detach card keys and bump the settings version. |
+| Per-workspace URL + SSRF | `PUT /ai/settings` `providers[vllm].base_url` and `consent-preview` `vllm_base_url` go through `endpoint_policy.check_allowed` against `RB_AI_VLLM_ENDPOINTS` (now also read by the API process) → 422 `endpoint_not_allowed`; the normalised URL is stored. The worker calls the workspace URL via `OpenAICompatProvider.for_base_url` (same allowlist and transport, cached per URL, rechecked before every request). Tested: metadata IP, user info, query, longer/shorter path, IPv6 literal, other scheme or port, `..`, `file:`; uppercase host and `:80` normalise to the allowlisted URL. Redirects are never followed (D64). |
+| Consent | `fingerprint_for(...)` adds `vision_reader` (provider, model, base URL; qwen prompt version) for `single`+`vllm`, `reader_strategy`/`shadow_reader` for `shadow`, and `apply_mode` when not `suggest`. Legacy `off` and `single`+`gemini` give byte-identical fingerprints (unit tests; migration test: migrated workspaces stay `consent_current`). Consent text gains one sentence for the company server or shadow; `DATA_DESTINATIONS` per provider. A new server URL or model needs consent again. |
+| API | `GET /ai/settings` adds `providers[2]` (key only as `{set, hint, storage, expires_at}`), `reader_strategy`, `primary_reader`, `secondary_reader: null`, `apply_mode`, `vllm_calls`, `vllm_endpoints_allowed`. `PUT` accepts `providers`, `reader_strategy`, `primary_reader`, `apply_mode`; `merge` → 422 `merge_not_enabled` (no deployment flag yet, WI-BE7); local model regex `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`; per-card `limits` restricted to `max_concurrency` 1–4 and `timeout_seconds` 1–300 (stored, not yet applied). `POST /ai/test/provider` takes an optional `{provider, kind}`; the vLLM text test queues the same synthetic fixture (keyless unless a key is stored) and stores the result on the card; `kind=image` → 422 `image_test_not_available`. `GET /ai/usage?provider=` filters calls, tokens, uncertain requests and USD, and adds latency p50/p95 today. Audit: `ai.provider_config_save` (before/after without key, base URL as origin only), `ai.reader_strategy_change`, `ai.apply_mode_change`; `ai.test_requested` now names the provider. `ai.manage` stays manager-only (P0 maps every session to manager; the capability table is tested). |
+| Health heartbeat | `sweeps.provider_health`: every third heartbeat the AI worker calls `GET /models` once per enabled vLLM card URL (without a key) and writes `last_health_at/ok`; a URL no longer allowlisted is marked unhealthy without I/O. A server that requires a key shows unhealthy here (`bad_key`) and is proven by the provider test instead. |
+| Gemini | Golden body `7ede12081bc9…` unchanged (`test_ai_provider_golden.py` untouched, passing). The status ladder stays Gemini-only and now ignores provider tests of other providers. |
+| Not done (deferred) | Synthetic page-image test fixture and per-step results in `GET /ai/requests/{id}` (need a reviewed image fixture + digest) → WI-OPS1. Shadow execution and storage → WI-BE6. `merge` flag → WI-BE7. Replacing the hand-written `web/src/api/ai.ts` interfaces with generated types, and the UI cards → WI-FE1/FE3 (`generated.ts` regenerated; web typecheck passes). Dropping `vision_enabled` → a later migration. Applying per-card `limits` → WI-OPS2. |
+
+Checks: offline suites 973 passed, 0 xfailed (951 + 22 new in `tests/unit/test_ai_provider_settings.py`). Disposable PostgreSQL 16.15 at `127.0.0.1:15499`, plus a second clean instance at `15498` to regenerate the catalog contract without queue tables; both stopped. Migration safety (0025 clone with a legacy vision row → 0026) passed; schema drift (autogenerate: no drift; contract regenerated: 50 tables, 40 enums, 27 triggers, 167 FKs, 262 ACLs, 7 default privileges), catalog, indexes, decisions and table count (50 + 4 Procrastinate) passed. Integration: `test_ai_settings_api` 54 passed (22 + 32 new), `test_ai_runner` 32 passed, `test_ai_vision` 14 passed (the D64 vLLM test now runs as provider `vllm`, keyless, at the workspace URL), new `test_ai_providers_migration` 4 passed (clone rewound to 0025, legacy rows, real upgrade, backfill, unchanged fingerprints, constraints, owner/grants), `test_ai_assist_migration` 17 passed, H1–H4 61 passed plus the known `test_ai_h1::test_ai_first_suggests_for_a_clean_pdf…` failure (D62). Ruff, mypy `--strict` (37 files; touched app files clean under strict), lint-imports 3 kept, core purity, rules hash `1e40652fe689…` unchanged, engine version vs HEAD passes; OpenAPI and `generated.ts` regenerated and stable on a second run (only WI-BE3 additions); web typecheck passes. Note: `schema_contract.json` was first overwritten from a database that already had the queue schema; it was regenerated from a clean head database and the drift check passes against it. Nothing committed; no `docs/ReconBench_*.md` edited.
+
+## D66 — AC-L0 part 5: WI-BE6 shadow mode and comparison store, one reader only (16 Oct 2026)
+
+Plan: `docs/plan-llm-extraction-call.md` §0 and WI-BE6, with the D65 deferrals. §0.6 applies: shadow uses exactly one reader, the workspace's `primary_reader` (Gemini **or** the company vLLM server). There is no secondary reader, no LLM×LLM agreement and no dual-reader report; the plan text about "(and secondary)" and "For dual readers" is out of scope. No network, Gemini or vLLM call was made; tests use `ScriptedProvider` and `httpx.MockTransport` with synthetic documents.
+
+| Decision | Choice |
+|---|---|
+| Migration `0027_reader_comparison` | `ai_request.shadow BOOLEAN NOT NULL DEFAULT false` with CHECK `NOT shadow OR hook = 'h6_vision'` (existing rows are not shadow). Table `reader_comparison` as specified (`id`, `workspace_id`, `document_version_id`, `ai_request_id`, `provider`, `model`, `prompt_version`, `schema_version`, `reader_params_digest` (64 hex), `created_at`, `counts` object, `labels` array), UNIQUE `(workspace_id, ai_request_id)` (one row per request; a re-apply is a no-op), index `(workspace_id, created_at)`, trigger `reader_comparison_append_only` (`forbid_mutation()`), `REVOKE UPDATE, DELETE, TRUNCATE … FROM reconbench_app`, `REVOKE ALL … FROM reconbench_report` (as `consensus_decision`). Fixed-forward. |
+| Why a column on `ai_request` | The review view must tell a shadow request from the workspace reader's request after settings change; the request's own row is the only durable place. Not in `request_key` (shadow and single already differ by settings version and consent fingerprint) and not in `reader_params` (that would change the vision cache key; a shadow answer may be reused by `single` for the same provider/model/prompt/params/images and vice versa). |
+| Enqueue (D65 deferral) | `AiHookEnqueuer.ready(h6_vision)` accepts `single` or `shadow`. In `shadow` the consented hook list stays H1's (`vision_enabled` stays false, H1 keeps running), so the vision hook is gated on H1 being consented; same eligibility, gate, endpoint allowlist and key checks as `single`. The request is created with `shadow = true` (also for a recorded render-failure skip). |
+| Worker | `request_blocker`: a shadow request runs only while the strategy is `shadow`, a non-shadow vision request only while it is `single` (else `AI_OFF`, checked before sending and before applying). `VisionReadHandler.apply` for a shadow request: when current, write one `reader_comparison` row, purge the version's page bytes, return `applied`; no consensus enqueue, no suggestion. Stale → `discarded_stale` + purge, as before. Failed or invalid answers write no row (the failure is on `ai_request`; the idle sweep clears the bytes). |
+| Comparison (labels only) | `reconbench_app/ai/shadow.py` `compare(rules, check)`: the rules document is rebuilt as the consensus job does (`document_from_rows`); reader values come from the core `vision_readings` (same line alignment); fields are the comparable consensus fields (`HEADER_FIELD_TYPES`, `LINE_FIELD_TYPES`); agreement uses the core `values_agree`. Labels: `agree_ocr`, `disagree_ocr`, `llm_only`, `ocr_only`, `unreadable` (reader marked it unreadable and gave no value). `counts`: `fields_total`, one count per label, `check_failed_by_reason`, `dropped_by_reason`, `rows`. Field keys (`header:doc_no`, `line:3:amount`) and reason codes only; no value, quote or box is stored. No core change (rules hash unchanged). |
+| Review view | `GET /documents/{id}/ai-suggestions` ignores shadow requests: the latest H1 or workspace-reader request is shown as before; when the document has only shadow requests (e.g. a PO/GRN, which H1 does not read) it returns `state = not_applicable`, `code = SHADOW`. |
+| Report | `GET /ai/shadow-report?since=YYYY-MM-DD` (`ai.manage`) and `python -m reconbench_app.ai.shadow_report --workspace <uuid> [--since YYYY-MM-DD]` return the same body: `reader_strategy`, `shadow_reader`, `since`, and per provider `comparisons`, `totals`, per field group (`line:N:x` → `line:x`) the five label counts, merged check-failed/dropped reasons, shadow request states, `failures_by_code` (error or skip code), latency p50/p95 (cache hits excluded). No document id, value or line number. OpenAPI and `generated.ts` gain only this endpoint. |
+| Unchanged | Consent: `consent.py` and `fingerprint_for` untouched; the D65 shadow fingerprints are now pinned in a unit test (`cb7d2ee1…` for shadow+vLLM, `bad2261b…` for shadow+Gemini). Gemini golden `7ede1208…` unchanged (`test_ai_provider_golden.py` untouched, passing). |
+| Deviation (with reason) | The plan names `document_link`; the link tables are `link` and `link_current`, so the integration test counts both (plus `consensus_decision`). |
+| Not done (deferred) | Bench run with shadow (hard metrics are unaffected by construction: nothing is written to documents; the owner's bench run stays the acceptance step). UI for the report → WI-FE1/FE2. LLM×LLM arms stay offline-bench only (§0.6). |
+
+Checks: offline suites 981 passed, 0 xfailed (973 + 8 new in `tests/unit/test_ai_shadow.py`). PG-SAFETY on a fresh PostgreSQL 16.15 cluster at `127.0.0.1:15497`: migration safety (clone at 0026 → 0027) passed; autogenerate no drift; `schema_contract.json` regenerated at head **before** the seed and queue schema (no `procrastinate` schema or tables present) → 51 tables, 40 enums, 28 triggers, 170 FKs, 264 explicit ACLs, 7 default privileges; drift, catalog, index and decision checks passed; after seed + queue schema the table count is 51 + 4 Procrastinate. Integration on a second fresh cluster at `127.0.0.1:15499`: new `test_ai_shadow` 4 passed (0 rows changed in `document_version`, `doc_line`, `consensus_run`, `consensus_decision`, `vendor`, `link`, `link_current`; no consensus enqueue; page bytes purged; row, API report and CLI output contain none of the synthetic answer's value strings nor document ids; report role cannot read, app role cannot update/delete, UPDATE raises; GRN-only document → `not_applicable/SHADOW`; switching to `single` drops a queued shadow request with `AI_OFF` and no call; vLLM shadow calls only the workspace URL), `test_ai_runner` 32, `test_ai_vision` 14, `test_ai_settings_api` 54, `test_ai_providers_migration` 4 (rewind now also removes the 0027 objects; head `0027`), `test_ai_assist_migration` 17 passed; H1–H4 61 passed plus the known `test_ai_h1::test_ai_first_suggests_for_a_clean_pdf…` failure (D62). Both containers stopped. Ruff (app, core, tests, scripts), mypy `--strict` (37 files; touched app files clean; `ingestion.py` at its 33-error baseline), lint-imports 3 kept, core purity, rules hash `1e40652fe689…` unchanged, engine version vs HEAD passes; OpenAPI and `generated.ts` regenerated and stable on a second run; web typecheck passes. Nothing committed; no `docs/ReconBench_*.md` edited.
+
+## D67 — AC-L1 part 1: WI-EV1 evaluation harness, one vision provider per run (16 Oct 2026)
+
+Plan: `docs/plan-llm-extraction-call.md` §0 and WI-EV1, with D66. §0.6 applies: each bench run reads with exactly one vision provider (Gemini **or** the company vLLM server); two arms are compared by putting their reports side by side, never by combining answers. Out of scope and not built: the `llm_x_llm` and `llm_x_llm_x_ocr` policies, `--second-vision-report`, every LLM×LLM metric, WI-BE7's `merge_readings` and WI-BE8 crops. No bench was run on real samples, no Gemini or vLLM call was made, nothing in `work/` was read; tests use synthetic truth, recorded answers, `ScriptedProvider`-style callables and `httpx.MockTransport`.
+
+| Decision | Choice |
+|---|---|
+| Arm | `scripts/accuracy_vision.py` `VisionArm(provider, thinking, sampling, strategy, base_url, repeats)`. `reader()` is the app's reader for that provider (`PROVIDER_READERS`) with only the overridden fields replaced, so `reader_params`, prompt variant, schema dialect and the v2 cache key come from the app code. `DEFAULT_ARM.reader()` **is** `vision_reader("vision_gemini")`: default keys, legacy keys and answers are the ones recorded before. |
+| Flags (`scripts/accuracy_bench.py`) | `--vision-provider {gemini,vllm}` (default gemini); `--vision-base-url` (vLLM only); `--vision-model` (default `RB_BENCH_VISION_MODEL` or `gemini-3.8-flash` for Gemini, `qwen3.5:9b` for vLLM); `--vision-thinking {off,minimal,low,medium,high}`; `--vision-sampling {provider_default,qwen_card_nonthinking,qwen_card_nonthinking_pp0}`; `--vision-strategy {full,crops}`; `--repeat N` (1..10); `--agreement-policy {single,llm_x_ocr}`; `--vision-primary-sim`; `--vision-eval`. All arm checks run in `run()` before the truth file is read. |
+| Refusals (`ArmRefused`, nothing read or sent) | `--vision-primary-sim` (WI-BE7 `merge_readings` does not exist); `--vision-strategy crops` (WI-BE8); `--vision-base-url` not on `RB_AI_VLLM_ENDPOINTS` (normalised and matched by the app's `endpoint_policy`, origin and path) or given with Gemini; vLLM with thinking other than `off` (§0.5) or `provider_default` sampling (it would alias `qwen_card_nonthinking` under another key); Gemini with `off` or a Qwen sampling profile; a `qwen…` model with Gemini or a `gemini…` model with vLLM (mixing guard); `--repeat` outside 1..10; vLLM sending without `--vision-base-url`. `llm_x_llm`, `llm_x_llm_x_ocr` and `--second-vision-report` are not argparse choices (rejected by the parser). |
+| Repeats | `repeat_key(key, 0) == key`; repeat `i ≥ 1` is `sha256({"key": key, "repeat": i})`. Repeat 0 is the vision block's reading (so it reuses any recorded answer); repeats 1..N-1 are read into `repeat_validations`, their tokens into `VisionRun.repeat_usage` (the vision block's `usage` stays repeat 0 only). The page budget counts every missing request (`pages × missing repeats`). |
+| vLLM sending | `send(..., arm)` builds no Gemini client (test: `GeminiProvider.__init__` patched to raise) and binds the app's `OpenAICompatProvider` to the one checked URL (`frozenset({base_url})`; the adapter re-checks before every request). As in the AI worker: one page per call (`page_prompts`), per-page answers merged with `merge_page_answers` (an unparsable page is recorded as an empty answer → `invalid_output`), `reader_params` sent as `options`, answer budget `min(h6_vision_local cap, local_output_budget(max_model_len …))` from `GET {base}/models`, `CONTEXT_TOO_SMALL` skips with no POST, timeout `h6_vision_local` (300 s). No key unless `BENCH_VLLM_KEY` is set; `BENCH_GEMINI_KEY` is never read in vLLM mode. Failure entries keep only fixed adapter details (`thinking_leak`, `at_output_cap`, `not_json`, …), never server text. Gemini sending is unchanged (same request; `thinking_level` = reader `low` = the old default; Gemini ignores `options`). Recorded answers of a non-default arm also store `provider`, `calls`, `repeat`. |
+| `vision_eval` block | New `scripts/accuracy_vision_eval.py`, written as `report["vision_eval"]` with its own `vision_eval_hash` only when a WI-EV1 flag differs from the default, `--agreement-policy llm_x_ocr` or `--vision-eval` is given. Counts only (no value, file id or truth id). Contents: `arm`, `model`, `agreement_policy`; `accuracy` by subset (`all_pdf`, `scan_page`, `scan_type:{digital,scan,mixed}` from the rules reader's page OCR flags) × reader (`llm`, and `ocr` = Tesseract + rules on the same documents) × `header`, `header:<field type>` and `line:<amount,quantity,rate,description,hsn_sac,uom>` (a cell is scored only when truth has it; rows aligned as the bench aligns them); `auto_accept` per field type (`single`: LLM value that passed every standalone check; `llm_x_ocr`: and equal to the OCR value) with precision, coverage and Wilson 95% lower bound; `false_safe` (`rules`, `simulated_flags_kept`, `simulated_review_cleared`, `review_cleared_documents`); `unreadable_to_null` (listed vs silently omitted); `wrong_when_answered` (all and critical); `not_in_ocr_text`; `agree_wrong_llm_x_ocr`; `tokens` (all repeats); `cost` (USD only from `RB_AI_PRICE_FILE`, else `null`); `latency_ms` p50/p95 (nearest rank); `failures_by_code` (`call:`, `answer:`, `document:`); `repeat_variance` (fields whose normalised value or line-row count changes across repeats). |
+| False-safe simulation (stand-in until WI-BE7) | The rules document with the policy's accepted LLM header values put in; lines stay the rules'. `flags_kept` keeps the rules review flag; `review_cleared` clears it when the policy accepted every critical field the truth has (the case where auto-accept would let a document through). Both are reported because `flags_kept` alone is almost always 0 and `review_cleared` also exposes the rules' line misses (the synthetic invoice shows 1). WI-EV2 rule (b) should read `simulated_review_cleared`. `--vision-primary-sim` will replace this with `merge_readings` when WI-BE7 lands. |
+| Make | `accuracy-bench-vllm`: worker image with network on (company VPN through the host), passes only `RB_AI_VLLM_ENDPOINTS` and `RB_AI_PRICE_FILE` (no Gemini key), runs `--vision provider --allow-provider --vision-provider vllm $(BENCH_ARGS)`. With the default `--max-provider-pages 0` nothing is sent. Gemini arms keep `accuracy-bench-vision`. A price file must sit under `work/` and be named by its container path (`/app/work/…`). |
+| Unchanged | `backend/reconbench_core`, `backend/reconbench_app`, migrations and APIs untouched (no OpenAPI/types drift run, no PG integration run). Rules hash `1e40652fe689…`, Gemini golden `7ede1208…` (`test_ai_provider_golden.py` untouched, passing), D65/D66 shadow consent fingerprints (`consent.py` untouched, pin test passing). Synthetic default-bench guard (1 synthetic invoice, a recorded answer, scratch dirs only): `report_hash` `c728aec0…`, `vision_hash` `a9d9f53c…`, `consensus_hash` `c9392395…` identical before and after, whole report identical except `timing`; with `--vision-eval` the three hashes are still identical. |
+| Deviations (with reason) | Plan flag `--agreement-policy` keeps only `single`/`llm_x_ocr` (§0.6). `--vision-strategy` accepts `crops` in argparse so the refusal names WI-BE8. Gemini's thinking `off` is refused (the adapter has no off level). |
+| Not done (deferred) | Any real-sample run (owner, WI-EV2). `--vision-primary-sim` (WI-BE7), crops (WI-BE8). Thinking-token and reasoning counters from vLLM are not in `vision_eval` (the server reports none; `thinking_leak` shows as `call:invalid_output` with detail in `failures`). |
+
+Checks: offline suites 1008 passed, 0 xfailed (981 + 27 new). New `tests/unit/test_accuracy_vision_eval.py` (27): default arm = app reader and same keys; repeat/thinking/provider change the key; 10 refusal cases; URL normalisation; `--vision-primary-sim`/crops refused before any read and removed policies rejected by the parser; vLLM via `httpx.MockTransport` calls only `{base}/models` and `{base}/chat/completions`, thinking off, one image per call, no `Authorization`, no Gemini client, repeats stored and checked; `CONTEXT_TOO_SMALL` sends no POST; no base URL refuses; `thinking_leak` keeps its code only; every `vision_eval` metric on synthetic truth (header/line cells, unreadable listed vs omitted, wrong-when-answered, not-in-OCR-text, LLM×OCR agree-wrong, both policies, a check-failed total never accepted, both false-safe simulations, repeat variance, latency p50/p95, tokens, cost from a synthetic price file, failures by code, no values in the block); end-to-end bench: default report has no `vision_eval` and `--vision-eval --agreement-policy llm_x_ocr` keeps `report_hash`, `vision_hash`, `consensus_hash` and the vision block identical. Ruff (app, core, tests, scripts) clean; mypy `--strict` (37 files) clean; lint-imports 3 kept; core purity; rules hash `1e40652fe689…` verified; engine version vs HEAD passes. Nothing committed; no `docs/ReconBench_*.md` edited.
+
+## D68 — WI-EV2 E5 smoke test approval: 5 documents on the company vLLM server (16 Oct 2026)
+
+Owner approval in chat, 16 Oct 2026: "lets only smoke test 5 documents" (the owner delegated vLLM budget choices to Claude because the server is the company's own; Gemini is not included). Scope: arm E5 only (Qwen3.5-9B as served, `qwen3.5:9b`, thinking off, `qwen_card_nonthinking`, full pages, one page per call, 1 read, no repeats) at `http://43.242.226.63/vllm/v1` over the company VPN. Dataset: the `work/` truth set; the bench picks the 5 most informative PDF documents (`--max-provider-calls 5`). Budget: at most 15 masked page images (`--max-provider-pages 15`; nothing is sent if the 5 documents need more), concurrency 1, 300 s timeout per call. Pre-checks: `GET /models` from host and from the worker container → HTTP 200, `qwen3.5:9b`, `max_model_len` 8192. Output: counts only (report in `work/accuracy-reports/ev2-e5-smoke.json`). No full E5/E7 arm and no Gemini call are approved.
+
+Result (counts only, `work/accuracy-reports/ev2-e5-smoke.json`): 5 distinct requests answered (`sent` 5; 9 bench documents incl. copies, 14 pages budgeted), 1 call failed `invalid_output`/`at_output_cap` (a 2-page document, one page used the whole 3,550-token budget; not recorded). Hard metrics 0/0/0/0, gate PASS. On the same 9 documents (all scan-page): header LLM 72/80 vs OCR 62/80; line amounts 25/25 vs 17/25; wrong-when-answered 1/73 (critical 0/39); not-in-OCR-text 0/73; LLM×OCR agree-wrong 0 (60 agree-correct, 6 disagree); auto-accept (`single`) precision 100% in every field type, Wilson 95% lower bounds 0.44–0.88 (small n); false-safe simulated 0 (both variants); handwritten refs 0/12, marketplace order 0/4; 7 null answers, all silently omitted (0 listed `unreadable`); latency per document p50 88 s, p95 134 s; tokens in 53,348 / out 27,765; 3 answers over 4,096 output tokens (max 5,468). Not decision-grade (5 documents, chosen as the most informative, not random). Follow-ups for the owner: dense pages hit the per-call output budget (WI-BE8 crops or a smaller image, WI-OPS1); p95 is above the 120 s/document local target; the prompt does not get Qwen to list unreadable fields or handwritten refs.
+
+## D69 — WI-EV2 prep: one request per truth invoice; failed requests named by ID (16 Oct 2026)
+
+The D68 smoke test spent its 5 calls on only 3 truth invoices (other files and bundle pages of the same invoice took slots). No server call in this item; offline only.
+
+| Decision | Choice |
+|---|---|
+| Selection (`scripts/accuracy_bench.py` `_priority_subset`) | With `--max-provider-calls N`, each of the N requests is a different truth document: another file or bundle page of a truth document already chosen, or of one that already has a recorded answer (`covered`, from the targets not missing), takes no slot and is not sent. Exact copies (same request key) still ride along free and reuse the answer. Documents without truth each count as their own. Without a limit nothing changes. Order unchanged (handwritten refs, lines, other truth, no truth). |
+| Failure IDs (`scripts/accuracy_vision.py` `send`) | Each failed or skipped request in `failures` now carries `document` (`<file_id>#<index>`) and `truth_id`: truth-file IDs only, never a value or file name. Only provider runs have failures, so default reports are unchanged. |
+| Dry run (no network, `--max-provider-pages 0`) | `--vision-provider vllm --max-provider-calls 15`: 15 new invoices not covered by D68, 20 bench documents counting free copies, at most 34 page images; nothing sent. |
+
+Checks: offline suites 1009 passed, 0 xfailed (+1 selection test; two failure-entry assertions updated); ruff clean; synthetic default-bench guard unchanged (`report_hash` `c728aec0…`, `vision_hash` `a9d9f53c…`, `consensus_hash` `c9392395…`, whole report identical except `timing`). Core, app, rules hash and goldens untouched. Next (needs the owner's go): E5 on these 15 invoices, `--max-provider-calls 15 --max-provider-pages 34`, 1 read, about 25–35 min on the shared server.
+
+Owner go in chat, 16 Oct 2026: "Go: run E5 on the 15 new invoices, --max-provider-calls 15 --max-provider-pages 34, 1 read." Same arm and server as D68 (Qwen3.5-9B as served, thinking off, `qwen_card_nonthinking`, full pages, one page per call, concurrency 1); budget 15 distinct requests, at most 34 masked page images; report `work/accuracy-reports/ev2-e5-15.json` (counts and truth-file IDs only).
+
+## D70 — WI-EV2 E5 result on 15 more invoices (16 Oct 2026)
+
+Run per the D69 go (`work/accuracy-reports/ev2-e5-15.json`, counts and truth-file IDs only). `sent` 15, no call failed, hard metrics 0/0/0/0, gate PASS. With the D68 answers the report scores 24 bench documents = 20 distinct requests over 18 distinct truth documents (copies counted again; not random, not decision-grade).
+
+| Metric (LLM vs OCR, same documents) | Result |
+|---|---|
+| Headers, scan pages | 132/154 vs 115/154 |
+| Headers, digital PDF pages (bundle POs/GRNs) | 14/30 vs 18/30 |
+| Line cells, scan pages: amount / qty / rate / description | 44/50 vs 38/50; 38/44 vs 34/44; 42/48 vs 34/48; 23/47 vs 31/47 |
+| Wrong when answered | 1/147 (critical 0/78) |
+| Auto-accept (`single`) | precision 100% in every field type; Wilson 95% lower bounds 0.80–0.93 (reference 0.57, n=5) |
+| False-safe simulated / LLM×OCR agree-wrong | 0 / 0 |
+| Not in OCR text | 6/147 (upper bound on invention) |
+| Unreadable → null | 37 nulls, all silently omitted |
+| Handwritten refs / marketplace order | 0/14 / 0/5 |
+| Latency | 17–67 s per page; per document p50 41 s, p95 244 s (a 5-page invoice) |
+| Tokens | in 181,679 / out 82,226 |
+| Unusable answers | 3 truth invoices (S01-INV 2 pages, S08-INV 5 pages, S10-INV 1 page; 5 bench documents with copies): every page answered as JSON, but at least one page failed the strict v4 parse, so the merge recorded an empty answer (`invalid_output`). The raw page answers were not kept, so the failing schema rule is unknown. |
+
+Against the WI-EV2 rule on scans: (a) headers +11 points and line amounts +12, rates +17, quantities +9 (pass except quantities); (b) pass; (c) 0.7% (pass); (d) p95 244 s > 120 s (fail); (f) not measured (1 read). Follow-ups: keep per-page raw answers and the strict-parse error location (no values) when a merge fails, then re-read the 3 invoices; smaller images / crops for latency and dense pages; prompt work for `unreadable`, handwritten refs and descriptions.
+
+## D71 — Keep page answers on a failed merge; re-read the 3 unusable invoices (16 Oct 2026)
+
+Owner go in chat, 16 Oct 2026: "Yes: keep per-page answers and the parse error when a merge fails, then re-read only the 3 failed invoices (S01, S08, S10-INV)."
+
+| Decision | Choice |
+|---|---|
+| Failed merge record (`scripts/accuracy_vision.py` `_merged`) | When a per-page answer fails the strict v4 parse, the recorded answer stays empty (still `invalid_output`) and now also keeps `page_outputs` (raw page answers, `work/` cache only) and `merge_error.pages[]` = page + `parse_errors`. |
+| `parse_errors(text)` | The pydantic errors behind `InvalidOutput` as `location: type` patterns with list positions as `*` (`lines.*.hsn_sac: string_type`), `include_input=False`: no value is ever kept or reported. A non-schema failure gives its fixed reason. |
+| Report | `vision_eval.invalid_answer_rules`: pattern → pages (counts only). |
+| `--vision-retry-invalid` | Sends again only requests whose recorded answer fails the strict parse (`unusable_keys`); no new document is added; each key is sent once per run (copies reuse it) and the record is overwritten. The page count includes the retried requests. |
+| Re-read budget | 3 truth invoices (S01-INV 2 pages, S08-INV 5, S10-INV 1): 3 requests, 8 page calls (the bench counter shows 15 because it also counts 2 free copies), `--max-provider-calls 3 --max-provider-pages 15`, 1 read, same arm and server as D68. |
+
+Checks: offline suites 1011 passed, 0 xfailed (+2 tests); ruff clean; synthetic default-bench guard unchanged (`c728aec0…`, `a9d9f53c…`, `c9392395…`, report identical except `timing`); offline dry run (`--network none`, budget 0) selected exactly those 5 bench documents.
+
+Re-read result (`work/accuracy-reports/ev2-e5-retry.json`): `sent` 3, hard metrics 0/0/0/0, gate PASS; all 3 answers are **still** unusable, with the same rules broken (`invalid_answer_rules`): `fields.*.text: string_too_short` on 4 pages across all three invoices (an empty value where the model should have listed the field as unreadable; one page has it twice, 5 counted in total), and `lines.*.description: string_too_long` on 1 page of S08-INV (a description over 500 characters). In S08-INV only 2 of its 5 pages break a rule, yet the whole document is lost. Cause: the `openai_json_schema` dialect sent to vLLM carries no `minLength`/`maxLength` (`contracts._string` emits only `type`), so the server's structured output cannot prevent them, and the strict local parse rejects the whole answer for one bad item. Other numbers unchanged from D70 (the 3 invoices still have no usable answer). Owner decision needed: (A) send `minLength`/`maxLength` in the vLLM dialect (vLLM cache keys change; Gemini golden unaffected; needs a server check that 0.23 enforces them), and/or (B) a per-item tolerant vision parse that drops only the bad items (counted in `dropped`, never turned into values) instead of the whole answer.
+
+## D72 — Owner focus: vLLM (Qwen3.5-9B) accuracy; deterministic OCR/rules work frozen (16 Oct 2026)
+
+Owner decision in chat, 16 Oct 2026: "freeze deterministic OCR/rules work (WI-D1, WI-D2); OCR + rules stay only as the independent second reader (D42), fallback and the not-in-OCR-text check. Focus on vLLM (Qwen3.5-9B) accuracy. Latency is out of scope until accuracy is decided. Order: (1) answer-format root fix, (2) Qwen prompt v4.qwen improvements (unreadable list, handwritten refs, descriptions), (3) repeats x3, (4) bigger truth set (owner), (5) WI-BE7 merge."
+
+| Decision | Choice |
+|---|---|
+| Frozen | WI-D1 (FP WI-4…WI-7 scan rules) and WI-D2 (forced OCR, >20-page warning, UTF-8 decode). No new deterministic extraction work until the owner reopens it. |
+| OCR + rules keep | The independent second reader for D42, the fallback when no LLM answer is usable, and the not-in-OCR-text check. |
+| Focus | Accuracy of the company vLLM arm (Qwen3.5-9B, §0.5). WI-EV2 criterion (d) latency is not judged until accuracy is decided. |
+| Order | (1) answer-format root fix (D71 options A and B, D73), (2) `vision.prompt.v4.qwen` improvements (unreadable list, handwritten refs, descriptions), (3) repeats ×3, (4) bigger truth set (owner), (5) WI-BE7 merge. §0.6 still binds: Gemini and vLLM are separate providers. |
+
+## D73 — Answer-format root fix: per-item tolerant vision parse (B) + length limits in the vLLM schema (A) (16 Oct 2026)
+
+Step (1) of D72, both D71 options. No server call and no Gemini call in this item; the re-score below was offline (`docker run --network none`, `--max-provider-pages 0`) from the `page_outputs` D71 kept in `work/accuracy-cache/vision`.
+
+| Decision | Choice |
+|---|---|
+| (B) Tolerant parse (`reconbench_app/ai/contracts.py` `parse_output` → `_vision_items`) | For `h6_vision` only: each `fields`, `lines`, `annotations` and `unreadable` item is checked against its own item model. An item that breaks a rule is left out and counted as `schema:<location>: <type>` (list positions `*`, first broken rule per item, no value kept). It is never repaired, truncated or turned into a value. A field whose **only** problem is an empty `text` (`fields.*.text: string_too_short`) also becomes an `unreadable` entry with its `name`, `page`, `box_2d` (still counted under that reason); an empty text together with another broken rule is only dropped; an empty annotation text is only dropped. The top level stays strict and rejects the whole answer: not JSON, duplicate keys, not an object, missing or extra top-level keys, wrong top-level types, `doc_kind`, every `pages` item, list caps (`fields` 400, `lines` 500, `annotations` 60, `unreadable` 200), byte limit. Text hooks H1–H4 and `provider_test` are unchanged (strict). |
+| Same rule for both providers | One code path: Gemini answers go straight to `parse_output`; vLLM per-page answers go through `merge_page_answers`, which now checks each page's top level with the same parse and merges the page's items **as answered** (off-page items still dropped by the core merge), so the parse of the merged answer is the single place a bad item is dropped and counted. The counts ride on `VisionOutput.schema_dropped` (a private attribute: not in `model_dump`, not in stored answers) and `validate_vision` adds them to `VisionCheck.dropped`, so they appear in the bench `vision.dropped`, the evidence `dropped` and shadow `dropped_by_reason`. Re-validation from a stored, already-cleaned answer (`ingestion`, `consensus`) has nothing left to drop. |
+| (A) vLLM schema limits (`_openai_dialect`) | Every free-text string in the `openai_json_schema` dialect now carries `minLength`/`maxLength` read from the pydantic field limits (e.g. `fields.text` 1–500, `lines.description` ≤500, `lines.rate` ≤60, `pages.title` ≤200), inside the nullable `anyOf` where the key is optional. Enum strings get none (the enum bounds them). Array caps (`maxItems`) are not added. The `gemini` dialect is not touched: byte-identical, golden `7ede1208…` test passing. |
+| Cache keys | (A) changes the vLLM response schema, which is part of `payload_digest`, so **every vLLM cache key changes**: offline dry run with the new schema shows all 39 vLLM bench documents `missing` (67 pages). All Qwen answers need a fresh read before they count again. Gemini keys are unchanged. Whether vLLM 0.23's structured output enforces the length keywords is not yet verified; the next read shows it (expected `schema:` drops = 0). |
+| Bench (`scripts/accuracy_vision.py`) | `stored_answer`: a record whose `output_text` is empty but has `page_outputs` (D71 failed merge) is merged again offline with the current rule; `check_answers` and `unusable_keys` use it, so `--vision-retry-invalid` no longer resends a record that now merges. The old `merge_error` counts in `invalid_answer_rules` only when the answer is still `invalid_output`. `parse_errors` uses the shared `contracts.error_patterns` and now reports only whole-answer (top-level) failures. |
+| Unchanged | `backend/reconbench_core` (rules hash `1e40652fe689…` verified, engine version check vs HEAD passes, `check_reading`/`merge_page_readings` untouched), Gemini dialect + golden, D65/D66 consent fingerprints (pin tests passing), APIs (no OpenAPI/types drift run: no API changed), migrations. |
+
+Offline re-score of the 3 unusable invoices (`work/accuracy-reports/ev2-e5-rescore.json`, old schema keys, counts only; before = `ev2-e5-retry.json`):
+
+| Count | Before (D71) | After |
+|---|---|---|
+| Vision outcomes (39 PDF bench documents) | read 24, `invalid_output` 5, missing 10 | read 29, `invalid_output` 0, missing 10 |
+| S01-INV, S08-INV, S10-INV (5 bench documents with copies) | 0 usable | 5 usable (all three invoices) |
+| `invalid_answer_rules` | `fields.*.text: string_too_short` 5, `lines.*.description: string_too_long` 2 | none |
+| Schema drops (bench documents, copies counted again) | — | `schema:fields.*.text: string_too_short` 9 (each now an `unreadable` entry), `schema:lines.*.description: string_too_long` 2 |
+| Headers, scan pages: LLM / OCR | 146/184 / 133/184 | 178/228 / 173/228 (the 5 added documents: LLM 32/44, OCR 40/44; LLM wrong +2) |
+| Line amount / qty / rate / description, scan pages, LLM | 44/62, 38/56, 42/60, 23/47 | 57/87, 50/80, 54/84, 24/72 (added: 13/25, 12/24, 12/24, 1/25) |
+| Same cells, OCR | 38/62, 34/56, 34/60, 31/47 | 62/87, 42/80, 42/84, 37/72 |
+| Hard metrics | 0/0/0/0 | 0/0/0/0 |
+| Hashes | `report_hash` `09115aa2…`, `vision_hash` `70de3f02…`, `consensus_hash` `2c3461f9…` | `report_hash` `09115aa2…` (same), `vision_hash` `136df320…`, `consensus_hash` `397c676c…` |
+
+`vision_hash` (and the bench consensus block that uses the vision readings) changed only because the 5 previously rejected answers are now partly usable. On these three invoices Qwen is behind OCR (headers 32/44 vs 40/44, line amounts 13/25 vs 24/25); S08-INV alone has 5 of their 8 pages, and the set is small and not random: not decision-grade.
+
+Checks: offline suites 1040 passed, 0 failed, 0 xfailed (1011 + 28 in new `tests/unit/test_vision_tolerant_parse.py` + 1 offline re-merge test; 2 tests in `test_ai_vision.py` and 2 in `test_accuracy_vision_eval.py` changed from "one bad item rejects the answer" to "the item is dropped and counted"); ruff (app, core, tests, scripts) clean; mypy `--strict` (37 files) clean; lint-imports 3 kept; core purity; rules hash; engine version vs HEAD; PG integration (disposable `postgres:16.15` on 15499, migrated to 0027 + queue schema, stopped afterwards) `test_ai_vision`, `test_ai_runner`, `test_ai_shadow` 50 passed. Synthetic default-bench guard (1 synthetic invoice, recorded Gemini answer, scratch dirs; run with and without this change): `report_hash` `d054b29d…`, `vision_hash` `822e366e…`, `consensus_hash` `cca27c5e…` identical before/after and with `--vision-eval`, `dropped` `{}`. (These differ from the `c728aec0…` set quoted in D67–D71 because the guard was rebuilt from the `_bench` test helper; both sides of this comparison use the same setup.) Nothing committed; no `docs/ReconBench_*.md` edited.
+
+Next (needs the owner's go): a fresh read of every vLLM bench document under the new schema. Proposed budget (vLLM budget is Claude's call per the owner; accuracy first, latency ignored): all 39 PDF bench documents, at most 70 page images (67 needed, copies reuse answers), 1 read, same arm and server as D68 (Qwen3.5-9B `qwen3.5:9b`, thinking off, `qwen_card_nonthinking`, full pages, one page per call, concurrency 1, 300 s timeout). Approval line: "Go: fresh E5 read of all vLLM bench documents under the D73 schema, --max-provider-pages 70, 1 read." Command (Git Bash, VPN on, `RB_AI_VLLM_ENDPOINTS=http://43.242.226.63/vllm/v1` exported):
+`MSYS_NO_PATHCONV=1 make accuracy-bench-vllm BENCH_ARGS="--vision-base-url http://43.242.226.63/vllm/v1 --max-provider-pages 70 --vision-eval --workers 1 --out /app/work/accuracy-reports/ev2-e5-d73.json"`
+
+## D74 — Fresh E5 read under the D73 schema: approval (16 Oct 2026)
+
+Owner go in chat, 16 Oct 2026: "Go: fresh E5 read of all vLLM bench documents under the D73 schema, --max-provider-pages 70, 1 read." Scope: arm E5 only (Qwen3.5-9B as served, `qwen3.5:9b`, thinking off, `qwen_card_nonthinking`, full pages, one page per call, concurrency 1, 300 s timeout) at `http://43.242.226.63/vllm/v1` over the company VPN. Dataset: all 39 PDF bench documents of the `work/` truth set (67 page images needed, copies reuse answers), at most 70 page images, 1 read, no repeats, no Gemini call. Output: counts and truth-file IDs only, `work/accuracy-reports/ev2-e5-d73.json`.
+
+Result (`work/accuracy-reports/ev2-e5-d73.json`, counts only): all 39 PDF bench documents read (67 pages), 0 failed calls, 0 `invalid_output`, `invalid_answer_rules` none, **0 `schema:` drops** (vLLM 0.23 structured output enforced the D73 length limits on every answer), hard metrics 0/0/0/0, `report_hash` `09115aa2…` unchanged, `vision_hash` `b06453ed…`. All 39 documents are scan-page documents in this set (scan_page = all_pdf).
+
+| Metric (LLM vs OCR, same 39 documents) | Result |
+|---|---|
+| Headers | 255/313 vs 242/313 (wrong 1 vs 24) |
+| Line amount / qty / rate / description | 90/123 vs 94/123; 79/114 vs 65/114; 85/118 vs 67/118; 47/108 vs 59/108 |
+| Wrong when answered | 1/256 (critical 0/137) |
+| Auto-accept (`single`) | precision 100% in every field type (amount 89/89, doc_date 35/35, doc_no 27/27, gstin 53/53, reference 12/12, vendor_name 32/32) |
+| LLM×OCR | 205 agree-correct, 21 disagree, 0 agree-wrong |
+| Not in OCR text | 11/256 |
+| False-safe simulated | `flags_kept` 0; **`review_cleared` 1** (one document where every critical truth field was accepted while the rules' lines are wrong; D67 stand-in until WI-BE7) |
+| Unreadable → null | 57 nulls, all silently omitted (0 listed) |
+| Handwritten refs / marketplace order | 1/18 found (17 missed) / 0/5 |
+| Tokens / latency | in 257,747, out 114,562; per document p50 62 s, p95 253 s (not judged, D72) |
+
+Compared with D70 (fewer documents, earlier schema): the vLLM arm now beats OCR on headers, quantities and rates, is slightly behind on line amounts (−4) and clearly behind on descriptions (−12). Next per D72: step (2) `vision.prompt.v4.qwen` (unreadable list, handwritten refs, descriptions); the `review_cleared` case should be examined then.
+
+## D75 — D72 step (2): Qwen prompt `vision.prompt.v5.qwen` from an offline diagnosis of the D74 answers (16 Oct 2026)
+
+No server call and no Gemini call. Part 1 read the D74 cached answers (`work/accuracy-cache/vision`) and the truth file offline (`docker run --network none`, `--max-provider-pages 0`, the D74 arm and keys) with a counts-only script (`work/diag_d75.py`, git-ignored). Counts are bench documents (copies counted again, as in D74); no value or file name was printed.
+
+**Part 1 (a) — the 57 null header answers.** Every one has a truth value (printed); 51 of 57 also occur in the OCR text (folded match), 6 do not (4 vendor names, 1 grand total, 1 IGST). 0 were listed `unreadable`. By field: `doc_no` 12, `grand_total` 9, `taxable_total` 8, `vendor_name` 7, `buyer_gstin` 5, `doc_date` 4, `cgst` 3, `sgst` 3, `po_refs` 3, `igst` 2, `vendor_gstin` 1. What actually happened:
+
+| Cause | Count | Detail |
+|---|---|---|
+| Returned under the right name, removed by the checks | 28 | `taxable_total` 7, `vendor_name` 7, `doc_no` 5, `buyer_gstin` 4, `cgst` 2, `sgst` 2, `po_refs` 1; 24 had the right value among the items. In 24 of the 28 the per-page answers (one page per call) gave several same-name items with different values, which the `conflict` rule drops together |
+| Returned under another name | 18 | `doc_no` as `po_ref` on 4 POs and as `grn_ref` on 3 GRNs; `grand_total` as `taxable_total` 8 (4 PO, 3 GRN, 1 invoice); `igst` as `taxable_total` 1; `po_refs` as `other_ref` 1; `vendor_gstin` as `grn_ref` 1 |
+| Only inside a line | 4 | `cgst`, `sgst`, `igst`, `taxable_total` 1 each |
+| Not returned anywhere | 7 | `doc_date` 4, `buyer_gstin` 1, `grand_total` 1, `po_refs` 1 |
+
+So only 7 of the 57 "silently omitted" values were really left out; the rest were read but lost to naming (18), line placement (4) or the cross-page conflict rule (28).
+
+**(b) Descriptions (108 truth cells; LLM 47 correct).** Wrong 40: extra text merged in 34 (truth text at the start in 22; the extra part is ≥70% of the answer in 16; it holds the row's HSN code as a token in 10, always with an HSN/SAC word, the row's quantity in 6, a part/model/code word in 6, only other 4+-digit codes in 3), two rows joined 3, different text 3 (similarity <0.1 in 2, 0.3 in 1); cut short 0; wrong row 0. Missing 21: all because the row was not aligned (no LLM row with that amount), 12 in documents where the LLM returned fewer rows than truth and 9 where it returned as many or more; in none of the 21 did another LLM row carry the right description; "row found, no description" 0.
+
+**(c) Handwritten refs (18 in 13 documents; 1 found, typed `po_number`).** The 17 misses: 7 in documents whose answer had no annotation at all, 10 in documents whose answer had annotations that do not contain the ref (7 of the 13 documents had ≥1 annotation; their 11 annotations: handwritten/date 4, handwritten/note 4, handwritten/po_number 2, stamp/invoice_number 1, all 11 accepted). Typed as something else: 0; returned as a printed field or inside a line: 0. None of the 17 appears in the OCR text (handwritten only). Best similarity of any returned annotation or field text to the ref: 0.3–0.5 in 15, 0.6 in 1, 0.8 in 1 (one probable misread). Patterns: `DD-DD/DD-DDD` 8, `DD-DDD` 6, `LL/DD-DD/DD-DDD` 1, `LLL/LLLL/DD-DD/DD-DDD` 1, `LLLLLLLLLL/DD-DD/DD-DD` 1. In short: the ref is not returned at all.
+
+**(d) Marketplace orders (5, pattern `DDD-DDDDDDD-DDDDDDD`).** All printed (in the OCR text) and all returned with their value: as `po_ref` 4, as `sales_order_ref` 1; the label was returned every time and contains "ORDER", never "PO"/"Purchase"; `marketplace_order_ref` was never used. Cause: rule 5 of `v4.qwen` never names `marketplace_order_ref` (the Gemini rule 5 does).
+
+**(e) The simulated `review_cleared` document: S08-INV** (invoice, 5 pages). Critical truth fields `doc_no`, `doc_date`, `vendor_gstin`, `grand_total`, `po_refs`: all 5 accepted under `single` (every standalone check passed) and all 5 correct; `buyer_gstin`, `cgst`, `sgst`, `vendor_name` also accepted and correct. The rules reader flags the document (alone it is not false-safe); the D67 stand-in clears the flag because every critical field was accepted, and the document is then false-safe only through the **rules' lines** kept in the simulation: 10 rows for 10 truth rows, 5 matching and 5 spurious (3 truth amounts are not among the rules' rows; 2 rows have the amount but another quantity or rate), and the rules' Σ line amounts ≠ the truth taxable value. The LLM lines are not right either (9 rows, 6 matching, 3 spurious, Σ ≠ taxable), and no standalone line-sum check fired because the LLM document has no `taxable_total`, so there was nothing to compare. Consequence for WI-BE7 (not changed now): a merged document must keep its review flag unless Σ lines = taxable holds, and a missing taxable value must never clear it.
+
+**Part 2 — changes.**
+
+| Decision | Choice |
+|---|---|
+| Prompt `vision.prompt.v5.qwen` (`reconbench_app/ai/prompts.py`: `VISION_SYSTEM_QWEN_V5`, `QWEN_EXAMPLE_V5`, variant `qwen_v5`) | v4.qwen rules 1–4 kept word for word; new or rewritten: **5** `doc_no` is the document's own number (PO number on a PO, GRN number on a GRN), from (a), 7 renamed; `po_ref` only for the buyer's PO; on a marketplace invoice (Amazon, Flipkart and the like) the Order Number / Order ID is `marketplace_order_ref`, never `po_ref` or `sales_order_ref`, from (d). **6** `grand_total` is the final total also without tax; totals only from the totals block, never page subtotals or carried-forward amounts, from (a): 9 renamed and the cross-page conflicts. **7** description = the full item text of that one row, wrapped lines joined, never the quantity/rate/amount/HSN-SAC/unit columns or another row's text, from (b). **8** every handwritten or stamped mark goes in `annotations` even when it repeats a printed number, each with `kind` and one of the schema's `looks_like` values (`po_number`, `grn_number`, `invoice_number`, `date`, `amount`, `initials_or_signature`, `note`, `unknown`; the schema has no `po_ref`/`grn_ref` value, and the vLLM schema is enforced by decoding, not shown to the model, so the list is in the text), from (c). **9** unreadable: a printed value that cannot be read with certainty is not guessed, gets no value and is listed as `{name, page, box_2d}`; never left out silently; one inline example (`po_ref`, the same entry as in the example answer). Rules 5 (own number) and 6 go beyond the four requested items; they come straight from (a) and cost about 90 tokens. The example answer is the v4 one plus one handwritten `SYN-PO-0042` `po_number` annotation; made-up `SYN-…` values only. |
+| Size | System text 3,640 bytes (v4.qwen 2,569). Estimated answer budget on a full page (8192 context, 3,500 image tokens, 3 bytes/token, 256 margin): **3,193** tokens (v4.qwen 3,550; floor 1,024; cap 4,096). |
+| Reader | `vision_openai_compat.prompt_variant = "qwen_v5"`, so `VISION_PROMPT_VERSIONS["vision_openai_compat"] = "vision.prompt.v5.qwen"`; the bench vLLM arm gets it through `PROVIDER_READERS`. Variant `qwen` (v4.qwen) stays available and byte-identical. Gemini reader, prompt, schema (both dialects) and golden `7ede1208…` untouched. |
+| Cache keys | Every vLLM key changes (prompt version, `reader_params.prompt_variant`, payload digest). Offline dry run (`--network none`, budget 0): 39 vLLM bench documents `missing`, **67 page images** needed, nothing sent. Gemini keys unchanged (synthetic key pinned). |
+| Consent | vLLM fingerprints change because they cover the vLLM reader's prompt version (WI-BE4: a new prompt needs consent again, as after D38/D40): `single`+vLLM → `9212c85d…`; **shadow+vLLM `cb7d2ee1…` → `e4eef8f4…`** (the D66 pin is updated; keeping it would let a workspace's consent stand for a prompt it never saw). Unchanged and tested with the vLLM reader patched back to v4.qwen: legacy, `off`, `single`+Gemini, shadow+Gemini `bad2261b…`. Workspaces that consented to vLLM `single` or `shadow` must consent again before the worker sends under v5. `consent.py` untouched. |
+| Unchanged | `backend/reconbench_core` (rules hash `1e40652fe689…` verified), migrations, APIs (no OpenAPI change), bench scripts. |
+
+Tests (synthetic only): new `tests/unit/test_vision_prompt_v5.py` (19): each new rule in the v5 text and the kept v4 rules; the v5 example is synthetic and parses (all three document types); v4.qwen and Gemini system texts byte-identical per document type and both payloads (text + schema) pinned; schema version; variant and reader version maps; vLLM reader and bench vLLM arm pick v5, default arm is still the Gemini reader; vLLM cache key differs from the v4.qwen key, Gemini key pinned; answer budget ≥ 1,024 (and ≥ 3,000) for invoice/PO/GRN; only the vLLM consent fingerprints change. Updated: `test_vision_v4.py` (variant map), `test_ai_openai_compat.py` (reader variant), `test_ai_shadow.py` (shadow+vLLM pin, renamed `…_are_pinned`).
+
+Checks: offline suites **1059 passed, 0 xfailed** (1040 + 19); ruff (app, core, tests, scripts) clean; mypy `--strict` (37 files) clean; lint-imports 3 kept; core purity; rules hash verified; engine version vs HEAD passes; Gemini golden passing; synthetic default-bench guard `report_hash` `d054b29d…`, `vision_hash` `822e366e…`, `consensus_hash` `cca27c5e…` unchanged, also with `--vision-eval`, `dropped` `{}`; PG integration (disposable `postgres:16.15` on 15499, migrated to 0027 + queue schema, stopped afterwards) `test_ai_vision`, `test_ai_runner`, `test_ai_shadow` **50 passed** (the known `test_ai_h1` failure is in a group not run). Nothing committed; no `docs/ReconBench_*.md` edited.
+
+Next (needs the owner's go): a fresh read with v5.qwen. Budget (Claude's call per the owner; accuracy first, latency ignored): all 39 PDF bench documents, at most 70 page images (67 needed), 1 read, same arm and server as D68 (Qwen3.5-9B `qwen3.5:9b`, thinking off, `qwen_card_nonthinking`, full pages, one page per call, concurrency 1, 300 s timeout), no Gemini call. Approval line: "Go: fresh E5 read of all vLLM bench documents with vision.prompt.v5.qwen, --max-provider-pages 70, 1 read." Command (Git Bash, VPN on, `RB_AI_VLLM_ENDPOINTS=http://43.242.226.63/vllm/v1` exported):
+`MSYS_NO_PATHCONV=1 make accuracy-bench-vllm BENCH_ARGS="--vision-base-url http://43.242.226.63/vllm/v1 --max-provider-pages 70 --vision-eval --workers 1 --out /app/work/accuracy-reports/ev2-e5-v5.json"`
+
+Owner go in chat, 17 Oct 2026: "Go: fresh E5 read of all vLLM bench documents with vision.prompt.v5.qwen, --max-provider-pages 70, 1 read." Scope: arm E5 only (Qwen3.5-9B `qwen3.5:9b`, thinking off, `qwen_card_nonthinking`, full pages, one page per call, concurrency 1, 300 s timeout) at `http://43.242.226.63/vllm/v1` over the company VPN; all 39 PDF bench documents of the `work/` truth set, at most 70 masked page images, 1 read, no repeats, no Gemini call. Output: counts and truth-file IDs only, `work/accuracy-reports/ev2-e5-v5.json`.
+
+Result (`work/accuracy-reports/ev2-e5-v5.json`, counts and truth-file IDs only): 67 page images in budget, `sent` 26 requests (copies reuse answers), 4 calls failed: `invalid_output`/`at_output_cap` 2 (a page of a 5-page S08-INV copy and the 1-page S09-PO used the whole 3,193/3,192-token answer budget) and `PROVIDER_UNAVAILABLE` 2 (copies of S08-INV and S05-INV; the shared server). 36 of 39 bench documents read; unread: PO-T2#0 (S09-PO), RESCAN-1#0 (S08-INV), RESCAN-2#0 (S05-INV). 0 `schema:` drops, `invalid_answer_rules` none, hard metrics 0/0/0/0, gate PASS, `report_hash` `09115aa2…` unchanged, `vision_hash` `34df2857…`. Not retried: a retry would go over the approved 70 pages and the two cap failures need a bigger answer budget anyway.
+
+Because v5 read 36 documents, the D74 answers were re-scored offline on the **same 36** (the D74 arm with the reader patched back to `qwen`; `work/diag_d75.py` and a per-document outcome script, counts only). Before/after (LLM unless stated):
+
+| Metric | D74 v4.qwen, 39 docs | v4.qwen, same 36 | v5.qwen, 36 |
+|---|---|---|---|
+| Headers LLM / OCR | 255/313 / 242/313 | 235/286 / 218/286 | **229/286** / 218/286 |
+| Line amount / qty / rate / description | 90/123, 79/114, 85/118, 47/108 | 83/109, 72/100, 78/104, 47/95 | **76/109, 68/100, 69/104, 39/95** |
+| Same cells, OCR | 94/123, 65/114, 67/118, 59/108 | 83/109, 58/100, 60/104, 58/95 | same |
+| Wrong when answered (critical) | 1/256 (0/137) | 1/236 (0) | **6/235 (4/136)** |
+| Nulls / listed unreadable / silently omitted | 57 / 0 / 57 | 50 / 0 / 50 | 51 / 0 / 51 |
+| Nulls by cause: conflict-dropped / other name / in a line / not returned | 28 / 18 / 4 / 7 | 24 / 16 / 4 / 6 | 20 / **4** / **14** / **13** |
+| Description wrong: extra merged / two rows / other; missing (not aligned) | 34 / 3 / 3; 21 | 30 / 2 / 2; 14 | 33 / 0 / 2; 21 |
+| Handwritten refs found | 1/18 | 1/18 (11 annotations returned) | **4/18** (+1 as another annotation; 53 returned) |
+| Marketplace order found | 0/5 | 0/5 | **5/5** |
+| Auto-accept precision (`single`) | 100% every type | 100% every type | reference **8/11**, doc_date **32/33**, others 100% |
+| Not in OCR text / LLM×OCR agree-wrong | 11/256 / 0 | — | 9/235 / 0 |
+| Simulated `review_cleared` / `flags_kept` | 1 (S08-INV) / 0 | 0 / 0 | **8** / 0 |
+| `schema:` drops / `invalid_output` / `at_output_cap` | 0 / 0 / 0 | — | 0 / 2 / 2 |
+| Tokens in / out | 257,747 / 114,562 | — | 238,669 / 102,789 (8 answers over 4,096, max 9,907, document sums) |
+| Hard metrics | 0/0/0/0 | — | 0/0/0/0 |
+
+What changed, by rule (same 36 documents):
+
+- **Worked:** rule 5 marketplace (0 → 5/5, all as `marketplace_order_ref`); rule 5 own number and rule 6 final total (nulls under another name 16 → 4; `doc_no` nulls 10 → 6, `grand_total` 9 → 2); rule 8 annotations (every one of the 13 documents with handwritten refs now returns annotations; refs found 1 → 4; the 13 still missed are not returned, 0 in OCR text).
+- **Hurt:** CGST/SGST/taxable nulls 11 → 25 (`cgst` 3 → 8, `sgst` 3 → 8, `taxable_total` 5 → 9), now put inside line rows or left out; most likely rule 6's "only from the totals block, never page subtotals" (tax summary tables are not read as totals). Line cells fell (amount −7, rate −9, quantity −4) and descriptions fell (47 → 39): the rule 7 wording did not stop merged text (30 → 33) and rows not aligned rose 14 → 21.
+- **New wrong values, accepted under `single`:** `po_refs` 3 (S01-INV, S02-INV ×2): the right PO plus an extra PO-like number read from page 2 of a 2-page invoice (one page per call); `doc_date` 1 (S03-INV, one marketplace copy): the "Order Date" (3 days before the invoice date) taken as `doc_date`, a side effect of the marketplace emphasis. These end the 100% auto-accept precision for `reference` and `doc_date`.
+- **`review_cleared` 8:** 3 from the accepted wrong `po_refs` (S01-INV, S02-INV ×2: a real auto-accept risk), 5 from the D67 stand-in keeping the rules' lines (S05-INV ×2, S14-GRN, S15-GRN, S16-GRN: these GRNs now have every critical field because `doc_no` is read, so the rules' line misses show).
+- **Budget:** the longer prompt cut the per-page answer budget 3,550 → 3,193; 2 pages hit it (S08-INV was read under v4).
+- One read with sampling on: part of every difference may be run-to-run noise (not measured until repeats, D72 step 3), but the 4 new accepted wrong values have specific causes.
+
+Verdict: **v5.qwen is not better than v4.qwen overall** (headers −6, every line cell lower, 4 accepted critical errors where v4 had 0), although three of its rules clearly work. The vLLM reader still points at v5.qwen in the code; v4.qwen is intact. Proposed next step (owner decision): a `v6.qwen` = v4.qwen plus only the rules that worked (marketplace order field, own `doc_no`, `grand_total` without tax, handwritten marks in annotations with `looks_like`), plus "doc_date is the invoice date, never the order date" and "po_ref only from a field labelled as the buyer's PO"; without the totals-block sentence and the description wording; keep it short to restore the answer budget. Then read v4 and v6 three times each (repeats) so the difference can be told from noise. Separately for WI-BE7: never auto-accept a `po_refs` set that grew across pages, and never clear review without Σ lines = taxable.
+
+
+## D76 — Qwen prompt `vision.prompt.v6.qwen` (v4 + what worked in D75) and the repeats ×3 proposal (17 Oct 2026)
+
+Owner go in chat, 17 Oct 2026: "Yes: write vision.prompt.v6.qwen = v4.qwen plus only the rules that worked, plus the order-date and po_ref guards, point the vLLM reader at it, and propose the repeats x3 comparison of v4 vs v6 with its page budget." No server call and no Gemini call in this item.
+
+| Decision | Choice |
+|---|---|
+| Prompt `vision.prompt.v6.qwen` (`prompts.py`: `VISION_SYSTEM_QWEN_V6`, variant `qwen_v6`) | v4.qwen with its 9 rules; rules 1, 2, 3, 6 (lines), 8 (unreadable) and 9 kept word for word. Added from D75 because they worked: rule 4 continues "`doc_no` and `doc_date` are this document's own number and date (on a purchase order its PO number, on a goods receipt its GRN number), never an order, due or delivery date. `grand_total` is the final total, also when there is no tax" (own number + final total; the date clause is the **order-date guard** for the S03-INV error); rule 5 "po_ref only for a number **labelled** as the buyer's purchase order (PO No., Buyer's Order No.)" (the **po_ref guard**, Gemini's v3 wording) + the marketplace sentence (`marketplace_order_ref`, never `po_ref`); rule 7 is v5's rule 8 (every handwritten or stamped mark in `annotations` with `kind` and `looks_like`). Left out because they hurt or did nothing: the totals-block sentence, the description wording, v5's longer unreadable rule. Example answer: the v5 one (with the synthetic handwritten `SYN-PO-0042` annotation). |
+| Size | System text 3,288 bytes (v4 2,569, v5 3,640); full-page answer budget **3,311** tokens (v4 3,550, v5 3,193). Two D75 pages used the whole 3,193; dense pages may still hit 3,311 (the real fix is WI-BE8 crops or a smaller image). |
+| Reader | `vision_openai_compat.prompt_variant = "qwen_v6"` → `vision.prompt.v6.qwen`. Variants `qwen` (v4) and `qwen_v5` stay available and byte-identical (pinned). Gemini reader, prompt, schema and golden `7ede1208…` untouched. |
+| Bench (`scripts/accuracy_vision.py`, `accuracy_bench.py`) | New `VisionArm.prompt_variant` / `--vision-prompt-variant {gemini,qwen,qwen_v5,qwen_v6}` (default: the reader's own). The request key's prompt version now comes from the variant actually sent (`VISION_PROMPT_VARIANTS[reader.prompt_variant]`, identical to `prompt_version(HOOK, reader=name)` for every app reader), so `--vision-prompt-variant qwen` finds the D74 answers again: offline check, all 39 documents `read`, headers 255/313 as in D74. Refused before any read: a Qwen variant with Gemini, `gemini` with vLLM, an unknown name. `vision_eval.arm` and the printed summary now show `prompt_version`. |
+| Cache keys | Every vLLM key changes again (v6). Gemini keys unchanged. |
+| Consent | vLLM fingerprints follow the prompt version (as D75): `single`+vLLM `32824ed7…`, shadow+vLLM `7ee9e281…` (v4 `cb7d2ee1…`, v5 `e4eef8f4…`/`9212c85d…`, all pinned per variant). Legacy, `off`, `single`+Gemini and shadow+Gemini `bad2261b…` identical under every variant. Workspaces with vLLM consent must consent again. |
+| Unchanged | `backend/reconbench_core` (rules hash `1e40652fe689…`), migrations, APIs. |
+
+Tests (synthetic): new `tests/unit/test_vision_prompt_v6.py` (20): v6 = v4 rules word for word where kept plus each added rule and guard; the v5 rules that hurt are absent; example synthetic and parses (3 doc types); v5 system texts pinned; answer budget v5 < v6 < v4 and ≥ 3,300; variant and reader maps; vLLM keys for v4/v5 pinned and v6 different, Gemini key pinned; the bench vLLM arm reads v6 and with `prompt_variant="qwen"` rebuilds the D74 key; refusals; only the vLLM fingerprints follow the variant, pinned per variant. `test_vision_prompt_v5.py` keeps only the v5 text tests (12; reader/key/consent tests moved to v6). Updated: `test_vision_v4.py`, `test_ai_openai_compat.py`, `test_ai_shadow.py` (shadow+vLLM pin → `7ee9e281…`).
+
+Checks: offline suites **1072 passed, 0 xfailed**; ruff (app, core, tests, scripts) clean; mypy `--strict` (37 files) clean; lint-imports 3 kept; core purity; rules hash verified; engine version vs HEAD passes; synthetic default-bench guard `d054b29d…` / `822e366e…` / `cca27c5e…` unchanged (also with `--vision-eval`); PG integration (disposable `postgres:16.15`, 0027 + queue schema, stopped) `test_ai_vision`, `test_ai_runner`, `test_ai_shadow` 50 passed. Offline dry runs (`--network none`, budget 0): v6 `--repeat 3` needs **201** page images (39 documents × 3 reads); v4 `--vision-prompt-variant qwen --repeat 3` needs **134** (repeat 0 is the D74 read, already recorded). Nothing committed; no `docs/ReconBench_*.md` edited.
+
+**Proposal: repeats ×3, v4.qwen vs v6.qwen** (D72 step 3; vLLM budget is Claude's call per the owner; accuracy first, latency ignored). Two bench runs, one provider and one prompt each (§0.6), same arm and server as D68 (Qwen3.5-9B `qwen3.5:9b`, thinking off, `qwen_card_nonthinking`, full pages, one page per call, concurrency 1, 300 s timeout), all 39 PDF bench documents, no Gemini call:
+
+| Run | Reads | Pages needed / budget | Report |
+|---|---|---|---|
+| A: v6.qwen | 3 new | 201 / `--max-provider-pages 210` | `work/accuracy-reports/ev2-e5-v6-r3.json` |
+| B: v4.qwen | D74 + 2 new | 134 / `--max-provider-pages 140` | `work/accuracy-reports/ev2-e5-v4-r3.json` |
+
+Total at most 350 page images (335 needed), about 4 hours on the shared server at the D75 pace. Failed calls are not retried inside this budget. Approval line: "Go: repeats x3 of v6.qwen and v4.qwen on all vLLM bench documents, --max-provider-pages 210 for v6 and 140 for v4." Commands (Git Bash, VPN on, `RB_AI_VLLM_ENDPOINTS=http://43.242.226.63/vllm/v1` exported), run one after the other:
+`MSYS_NO_PATHCONV=1 make accuracy-bench-vllm BENCH_ARGS="--vision-base-url http://43.242.226.63/vllm/v1 --repeat 3 --max-provider-pages 210 --vision-eval --workers 1 --out /app/work/accuracy-reports/ev2-e5-v6-r3.json"`
+`MSYS_NO_PATHCONV=1 make accuracy-bench-vllm BENCH_ARGS="--vision-base-url http://43.242.226.63/vllm/v1 --vision-prompt-variant qwen --repeat 3 --max-provider-pages 140 --vision-eval --workers 1 --out /app/work/accuracy-reports/ev2-e5-v4-r3.json"`
+
+Scoring: the bench scores repeat 0 and reports `repeat_variance`; each repeat is then scored offline on the documents every read answered (counts only, extending `work/diag_cmp.py` to `repeat_validations`). Proposed decision rule: v6 replaces v4 only if, over the 3 reads, its accepted critical errors are not above v4's (v4 so far: 0) and its mean headers and mean line cells are not below v4's by more than v4's own spread across its 3 reads. Otherwise the vLLM reader goes back to `qwen`.
+
+Owner go in chat, 17 Oct 2026: "Go: repeats x3 of v6.qwen and v4.qwen on all vLLM bench documents, --max-provider-pages 210 for v6 and 140 for v4." Scope: runs A and B above exactly (arm E5, `http://43.242.226.63/vllm/v1` over the company VPN, all 39 PDF bench documents, v6 at most 210 and v4 at most 140 masked page images, no retries, no Gemini call); counts and truth-file IDs only.
+
+Result (counts and truth-file IDs only). Run A `work/accuracy-reports/ev2-e5-v6-r3.json`: 201 page images in budget, `sent` 84, 6 calls failed (`at_output_cap` 3: S10-PO, 1 page, all 3 reads at the 3,310-token budget; `PROVIDER_UNAVAILABLE` 3: S02-INV ×2, S03-INV ×1), 38 of 39 documents read in repeat 0 (PO-T1#0 unread). Run B `work/accuracy-reports/ev2-e5-v4-r3.json`: 134 in budget, `sent` 54, 6 calls failed, all `at_output_cap` at 3,550 (S06-INV ×4 on two copies, S08-INV ×2), 39 of 39 read in repeat 0 (the D74 answers). Both: hard metrics 0/0/0/0, gate PASS, `report_hash` `09115aa2…`, 0 `schema:` drops; `vision_hash` v6 `69aa89fc…`, v4 `4b929e11…`. No retries.
+
+**The server returns identical answers to identical requests.** Byte comparison of the recorded answers: v6, 28 of 28 requests that all 3 reads answered are identical in all 3 reads (`repeat_variance` 0/290); v4, reads 1 and 2 (both 17 Oct) identical in 27 of 27, while the D74 read (16 Oct) differs from them in 22 of 27. This holds even though every request carries the `qwen_card_nonthinking` sampling settings (temperature 0.7, top-p 0.8, top-k 20). So repeats sent in one run measure no sampling noise on this server; the only spread seen is from one day to the next (v4 D74 vs 17 Oct: headers 227 vs 222 on the same 35 documents, every line cell unchanged). The cause (a fixed seed, a cache in front of the server, or a config change on the shared server) is unknown and is the owner's/server's matter (WI-OPS1).
+
+Comparison on the 35 documents every read of both arms answered (counts; "17 Oct" = v4 reads 1 and 2, which are identical; v6 reads 0–2 are identical):
+
+| Metric | v4.qwen D74 read (16 Oct) | v4.qwen, 17 Oct | v6.qwen, 17 Oct |
+|---|---|---|---|
+| Headers LLM (OCR 213/281) | 227/281 | 222/281 | 222/281 |
+| Line amount / qty / rate / description | 81/110, 70/101, 76/105, 45/96 | same | **77/110, 69/101, 72/105, 44/96** |
+| Wrong header values | 1 (taxable, S03-INV) | 1 (taxable, S03-INV) | 1 (`doc_date`, S03-INV) |
+| Accepted wrong values (`single`) | 0 | 0 | **1** (`doc_date`, S03-INV: the order-date guard did not prevent it) |
+| Handwritten refs found | 1/16 | 0/16 | **6/16** |
+| Marketplace order found | 0/5 | 0/5 | **5/5** |
+| Simulated `review_cleared` | 0 | 0 | 4 (S14-GRN, S14-PO, S15-GRN, S16-GRN: all from the stand-in keeping the rules' lines; v6 now reads every critical field of these documents) |
+| Spread across reads | — | 0 (identical) | 0 (identical) |
+
+Header fields, v4 (17 Oct) → v6 on the same documents: gains `doc_no` 9 / losses 4, `grand_total` 6/2, `doc_date` 4 / 0 (+1 now wrong), `po_refs` 3/2, `taxable_total` 2/3 (+1 wrong → missing), `vendor_gstin` 1/0; losses only: `cgst` 6, `sgst` 6, `buyer_gstin` 1. The CGST/SGST loss also appeared under v5 without being tied to the totals-block sentence, so its cause lies in what v5 and v6 share (own-number/final-total sentence, annotations rule, longer example); not isolated.
+
+Whole-run blocks (repeat 0, every document read; not the same document sets): v6 38 documents, headers 244/309 vs OCR 239/309, wrong 3/247 (critical 1/144), auto-accept precision `amount` 74/76 and `doc_date` 37/38, all other types 100%, not in OCR text 13/247, agree-wrong 0; v4 39 documents, 255/313 vs 242/313, wrong 1/256 (critical 0/137), precision 100% every type, not in OCR text 11/256, agree-wrong 0. Tokens in/out: v6 799,539 / 361,746; v4 702,749 / 318,912.
+
+Verdict under the D76 rule: **v4.qwen stays** (v6 adds an accepted critical error and lowers amount, rate and quantity cells; headers equal). v6's marketplace and handwritten gains are real and repeatable but come with the CGST/SGST and line losses. The vLLM reader still points at `qwen_v6` in the code until the owner decides.
+
+What this changes for the plan: (1) on this server one read per variant is enough within a day, and a fair comparison needs the control (v4) re-read **the same day** as the candidate; (2) the next prompt step should change one rule at a time (single-rule variants on v4, each 67 pages plus one same-day v4 control), starting with the marketplace sentence and the annotations rule, which carried the gains; (3) `at_output_cap` hits dense pages under every prompt (S06-INV, S08-INV, S09/S10-PO), so WI-BE8 crops or a smaller image remain needed regardless of the wording.
+
+## D77 — v7.qwen (v4 + the marketplace rule), same-day control read, and cross-page conflict resolution (20 Oct 2026)
+
+Owner go in chat, 20 Oct 2026, replying to the proposal "do 1 and 2 next … step 1 needs about 134 pages (v4.1 plus a same-day v4 control)": "i agree do". Scope of the server reads: arm E5 (Qwen3.5-9B `qwen3.5:9b`, thinking off, `qwen_card_nonthinking`, full pages, one page per call, concurrency 1, 300 s timeout) at `http://43.242.226.63/vllm/v1` over the company VPN, all 39 PDF bench documents, no Gemini call, no retries: (a) v4.qwen control, `--vision-prompt-variant qwen --repeat 4` (only repeat 3 is new: 67 pages), at most 70 page images, `work/accuracy-reports/ev2-e5-v4-ctl.json`; (b) v7.qwen, 1 read, at most 70 page images, `work/accuracy-reports/ev2-e5-v7.json`. Both on the same day, back to back (D76: the server answers identical requests identically within a day, so the control must be read the same day). Counts and truth-file IDs only.
+
+First control attempt: nothing was sent. With `--repeat 4` the bench also counted the repeat 1–2 keys that failed at the output cap on 17 Oct (85 page images > 70), so it stopped before any call; the VPN was not the cause (server reachable from host and container). New bench option `--send-from-repeat K` (`VisionArm.send_from_repeat`, refused unless 0 ≤ K < repeats; not part of any key): repeats before K are scored from the cache, never sent. Control rerun after v7 with `--vision-prompt-variant qwen --repeat 4 --send-from-repeat 3`: 67 page images (dry run), within the 70 approved.
+
+| Decision | Choice |
+|---|---|
+| Prompt `vision.prompt.v7.qwen` (`prompts.py`: `VISION_SYSTEM_QWEN_V7`, variant `qwen_v7`) | v4.qwen with exactly one rule line changed: rule 5 gains "On a marketplace invoice (Amazon, Flipkart and the like) the Order Number or Order ID is marketplace_order_ref, never po_ref or sales_order_ref." v4's own example; answer budget 3,502 (v4 3,550). Kept as a variant; **the vLLM reader is back on `qwen` (v4.qwen)**, see the result. |
+| Cross-page conflicts (`reconbench_core/extraction/vision.py` `check_reading`, `_resolve_conflict`, `_ocr_agrees`) | A single-valued field read with different values no longer always loses every value. Keep the one value the rules reader (OCR) also read; otherwise, when the values come from different pages, the first page's value (totals: the last page's) if that page gave exactly one value; otherwise drop all, as before (so a same-page conflict without OCR agreement is still dropped). The kept value is marked `check_failed: page_conflict` (counted in `check_failed`), so it is a visible suggestion only: excluded from `single`/`llm_x_ocr` auto-accept (`_passed_fields`) and, new, skipped by the consensus job (`reconbench_core/extraction/consensus.py` `vision_readings`), so it can never help verify a field. Other values count under `dropped.conflict` as before. Same rule for both providers (one code path); Gemini answers with cross-page conflicts change the same way. |
+| Bench | `--send-from-repeat K` (above). `vision_eval.arm` shows `send_from_repeat`. |
+| Rules hash | `1e40652fe689…` → **`1e9af32f2514…`** (reviewed: `check_reading` conflict resolution + consensus skip). Engine version check vs HEAD passes. |
+| Consent / keys | Back on v4.qwen, so the vLLM keys are the D74 ones again and the vLLM consent fingerprints are the D65/D66 values (shadow+vLLM `cb7d2ee1…`), pinned per variant in `test_vision_prompt_v6.py` (v5/v6/v7 values kept). Gemini and legacy unchanged throughout. |
+
+**Step 2 result (offline, no server call; same answers scored with the old and the new conflict rule).**
+
+| On the D74 v4.qwen answers (39 documents) | Old rule | New rule |
+|---|---|---|
+| Headers correct / wrong | 255/313 / 1 | **275/313** / 3 |
+| Changes | — | correct now: `vendor_name` 7, `doc_no` 5, `taxable_total` 3, `buyer_gstin` 2, `cgst` 2, `sgst` 2; wrong now: `taxable_total` 2 (both marked `page_conflict`); lost: `grand_total` 1 (correct → missing) |
+| Accepted wrong values (`single`) / simulated `review_cleared` | 0 / 1 | 0 / 1 |
+| Line cells | unchanged | unchanged |
+| Values marked `page_conflict` | — | 23 |
+
+The 17 Oct v4 reads (36 documents) move the same way: 225 → 245 correct, wrong 1 → 3. Headers are now 275/313 for Qwen vs 242/313 for OCR on the same documents.
+
+**Step 1 result (server reads).** v7 (`ev2-e5-v7.json`): `sent` 26, 5 calls failed (`PROVIDER_UNAVAILABLE` 3, `at_output_cap` 2: S08-INV, S02-INV), 35 of 39 documents read, hard metrics 0, gate PASS. v4 control (`ev2-e5-v4-ctl.json`): the server became unavailable during the run: `sent` 14, `PROVIDER_UNAVAILABLE` 7, `stopped:provider_down` 12 (the bench stops after repeated failures), `at_output_cap` 2 (S06-INV copies); 18 documents got the new read; hard metrics 0. No retries. Where the control was read, it equals the 17 Oct v4 read on all 17 comparable documents (header outcomes identical), so the server state had not changed since 17 Oct and the 17 Oct v4 read is a valid same-state control for the rest.
+
+| v7 vs v4 (both scored with the new conflict rule) | 17 docs read by both today | 32 docs, v4 = 17 Oct read |
+|---|---|---|
+| Headers correct: v4 / v7 | 102/125 / 82/129 | 207/245 / 188/249 |
+| Wrong: v4 / v7 | 1 / 8 | 3 / 10 |
+| Accepted wrong (`single`): v4 / v7 | 0 / **4** | 0 / **4** |
+| Line cells | identical | identical |
+| Marketplace order found: v4 / v7 | 0/5 / **5/5** | 0/5 / 5/5 |
+
+24 of the 36 changed header outcomes are on S03-INV (the Amazon invoice, 4 bench copies): with the marketplace sentence the model reads the order number but also returns a `buyer_gstin` the invoice does not show (truth has none; 4 accepted wrong values) and loses `vendor_gstin`, `doc_no`, totals and the PO reference there. Verdict: **v7 is not better than v4; the reader is back on v4.qwen.** One prompt sentence moves the whole reading of the page it targets, so marketplace order IDs are better taken without touching the prompt: a deterministic post-check that renames a `po_ref`/`sales_order_ref` whose label contains "Order" and whose value has the marketplace pattern (`DDD-DDDDDDD-DDDDDDD`) to `marketplace_order_ref` (proposal only; D72 froze deterministic OCR/rules work, so the owner decides).
+
+Tests (synthetic): new `tests/unit/test_vision_conflicts.py` (10: first/last page choice, OCR agreement wins, same-page conflict still dropped, two values on the chosen page dropped, duplicates, no conflict → no mark, other marks kept, consensus never uses a resolved value), `tests/unit/test_vision_prompt_v7.py` (one line changed, v4 example, budget, reader back on v4), `test_accuracy_vision_eval.py` +1 (`--send-from-repeat` sends only later repeats, same keys, refusals); pins updated in `test_vision_prompt_v6.py`, `test_vision_v4.py`, `test_ai_openai_compat.py`, `test_ai_shadow.py` (back to `cb7d2ee1…`).
+
+Checks: offline suites 1090 passed, 0 xfailed (also re-run after the reader went back to v4: 1090 passed); ruff, mypy `--strict` (37 files), lint-imports 3 kept, core purity, rules hash `1e9af32f…`, engine version vs HEAD; synthetic default-bench guard `d054b29d…` / `822e366e…` / `cca27c5e…` unchanged (also with `--vision-eval`); PG integration (disposable `postgres:16.15`, 0027 + queue schema, stopped) `test_ai_vision`, `test_ai_runner`, `test_ai_shadow` 50 passed. Nothing committed; no `docs/ReconBench_*.md` edited.
+
+**Remaining work in the LLM plan (`docs/plan-llm-extraction-call.md`), as of D77.**
+
+| Phase | Done | Remaining |
+|---|---|---|
+| AC-L0 provider layer | WI-G1, WI-G2, WI-BE1, WI-BE5 (D62–D63) | WI-EV0 (offline re-score of stored Gemini answers, never run) |
+| AC-L1 local provider, settings, shadow | WI-BE2, WI-BE3, WI-BE4, WI-BE6 (D63–D66) | WI-FE1 (AI settings UI with two provider cards), WI-FE3 (frontend tests), WI-OPS1 (written server checklist and smoke test; only ad-hoc checks so far; the server's own availability is a known issue), WI-OPS2 (health, concurrency, fallback in operation) |
+| AC-L2 evaluation and decision | WI-EV1 (D67); WI-EV2 E5 arm runs (D68–D77); prompt work D75–D77 (v4.qwen stays); repeats (D76: the server is deterministic per state) | WI-BE8 cropped two-pass reading (needed: dense pages hit the output cap under every prompt); Gemini arms E1–E4 (need the owner's Gemini approval); decision matrix and DP-L1 auto-accept thresholds (need a bigger truth set) |
+| AC-L3 LLM values on scans | — | WI-BE7 merge with OCR per field (never clear review without Σ lines = taxable; never auto-accept a `po_refs` set that grew across pages; `page_conflict` values stay suggestions), WI-FE2 review UI provenance, WI-FE3 rest, WI-G3 regression guards and rollback switches |
+| Deterministic | — | WI-D1, WI-D2 frozen (D72); WI-D3 parser-version guard, WI-D4 link recall, WI-D6 page-split defect not started; WI-D5 truth set v3 (owner-led, D72 step 4) |
+| D72 order | (1) answer format D73, (2) prompt D75–D77, (3) repeats D76 | (4) bigger truth set (owner), (5) WI-BE7 |
+
+DoD §7 is not met yet (headers ≥ 98%: Qwen 275/313 = 87.9% with the conflict fix; lines ≥ 95%; links ≥ 95%). Suggested next order: WI-BE8 crops (recovers documents lost to the output cap) and the marketplace post-check, then WI-BE7, with WI-D5 (owner) in parallel.
+
+## D78 — Plan consolidation: `docs/accuracy-plan.md` rewritten Qwen-first (20 Oct 2026)
+
+Stage 2 of the owner's two-plan consolidation. `docs/accuracy-plan.md` was rewritten in place and now replaces `accuracy-implementation-plan.md`, `plan-llm-extraction-call.md`, `accuracy-fix-plan-scan-extraction.md`, `progress-accuracy-plan.md` and `audit-llm-extraction.md`, which stay on disk until Stage 3. `docs/ReconBench_*.md` are untouched (main plan blob `c6a96759…` equals HEAD). No code, config, container, database, migration, dataset or truth change; no model call and no benchmark. Evidence checks beyond file reads: image and container metadata, a directory/`RULES_HASH`/variable-name listing inside the three running app containers, and read-only SQL counts on the live database.
+
+| Decision | Choice |
+|---|---|
+| Owner decisions of 20 Oct | O-1 two-tier truth (Tier H about 80 invoices header-only, Tier S 8–10 complete sets; about 5 sets indicative only; labelling protocol and dev/held-out split in WI-D5). O-2 auto-accept only when Qwen and OCR agree or a deterministic validator confirms, plus the lower-bound threshold, 0 critical wrong and a shadow period; DP-L1 arithmetic corrected (a 98% lower bound needs 189 error-free values, not 100). O-3 D-8 gates Gemini only. O-4 D72 lifted for WI-V2 only. O-5 version rule. O-6 Qwen down: rules + OCR with a visible flag, no automatic Gemini failover. O-7 `audit-llm-extraction.md` retired after merging. O-8 live rebuild only inside AC-INT1 (full backup, tested restore, dry-run 0024→0027 on a copy). O-9 carried items keep defaults. |
+| Version rule (O-5, recorded here) | `ENGINE_VERSION` for recon-path rules; `PARSER_VERSION` for OCR/rules extraction; `CONSENSUS_VERSION` (or a new check version) for vision-check and consensus logic; guards compare with the last release tag, not HEAD (HEAD is 0.1.4, the tree 0.1.7, so a HEAD comparison is vacuous). D77's change to vision conflict resolution and the consensus skip is covered retroactively by a `consensus.v2` bump in WI-D3. No release tag exists yet; the owner creates the first at AC-INT1b. |
+| Recoverability | Option A′ (docs-only commit with explicit pathspecs, tag `pre-plan-merge-20261020`) and Option B (copy to `work/plan-archive-20261020/`). Option B was done in Stage 2 for the eight files below (SHA-256 list in the folder) because rewriting `accuracy-plan.md` replaced an uncommitted version; five of the plan documents are untracked in git. Nothing is committed yet. |
+| D43 | Cited by the retired implementation plan (lines 3 and 178) but no D43 entry exists (D42 → D44). Treated as a numbering gap; the number is not reused; old entries are not edited. |
+| AC-L labels | D62–D67 headings ("AC-L0 part 1–5", "AC-L1 part 1") do not match the phase membership in the retired LLM plan (BE2/BE3/BE4/BE6 in AC-L1, EV1 in AC-L2). The new plan uses the plan's labels and refers to work by task ID (§13.0). |
+| New findings recorded in the plan | The running images (built 16 Oct 04:41) contain none of D62–D77 and the live database is at 0024; the live app is Gemini `ai_first` (`gemini-3.5-flash-lite`), suggestions only, with 0 `consensus_run` rows (WI-INT0); Gemini cannot be switched off while Qwen vision is on because H1–H4 are bound to Gemini (WI-BE9); `test_ai_h1::test_ai_first_suggests_for_a_clean_pdf…` is still failing (WI-T1); the engine-version guard is vacuous against HEAD; four critical fields (doc no., date, GSTIN, refs) and vendor name cannot be proven ≥ 95% at the present sample size. |
+| New tasks | WI-EV3, WI-T1, WI-INT0, AC-INT1a/b, WI-BE9, AC-LIVE-S/M, WI-V1, WI-V2, WI-Q1/Q2/Q3, WI-OPS3, WI-BE7a/b/c, WI-QR1, AC-7c; WI-D2b/D2c (fix-plan WI-8 steps 1, 2, 6, frozen). Fix-plan WI-3 steps 4–5 verified done (`SettingsPage.tsx:240`; live config has 1 buyer entity). |
+| Rule recorded | RULE-DESC: a line description is never auto-accepted until WI-Q1 shows a measured fix on held-out data. |
+
+Verification of the plan file: every ID-bearing item of the six merged documents (AC-x, WI-x, D-x, DP-x, DP-Lx, R1–R12, B1–B12, C1–C6, P1–P10, M1–M6, I1–I6, E0–E9) appears in §13 (scripted check, no gaps); all relative links resolve; all report files cited exist; every cited decision ID exists except D43 (explained) and D78 (this entry). Baseline numbers were re-read from `ev2-e5-v4-ctl.json` (headers 275/313) and `scanfix-truth-2.json` (302/373); all 13 per-field figures quoted in the owner's brief match `ev2-e5-d73.json` exactly and the D77-rule values are in the plan.
+
+Not done (by design): Stage 3 removal and reference mapping, the docs-only commit and tag, the README and `gates/phase-4.md` pointers, any engineering.
+
+Archived (byte for byte) in `work/plan-archive-20261020/`: `accuracy-plan.md` (previous version), `accuracy-implementation-plan.md`, `plan-llm-extraction-call.md`, `accuracy-fix-plan-scan-extraction.md`, `progress-accuracy-plan.md`, `audit-llm-extraction.md`, `diagnosis-scan-extraction.md`, `decision-log.md` (before this entry).

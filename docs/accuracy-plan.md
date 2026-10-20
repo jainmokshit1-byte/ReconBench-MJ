@@ -1,246 +1,1141 @@
-# Accuracy overhaul plan: extraction → mapping → reconciliation
+# Accuracy plan: extraction → mapping → reconciliation (Qwen-first)
 
-Status: written 6 Oct 2026. **AC-0 done** (benchmark + baseline, D32); **AC-1 done** (deterministic guards, D33); **AC-2 done** (e-invoice QR, D34); **AC-3 done** (page split + classify, D35); **AC-4 done** (vendor hygiene, D36); **AC-5 done** (vision reader, suggestions only, D37; the owner-run probe and recorded bench answers are still to come); AC-6 is next. Run one phase per session, in order, with the benchmark (AC-0) after every phase.
-Real sample values and ground truth are **not** kept in this repo. They live in the owner's local memory directory and in `work/` (git-ignored).
+This is the single authoritative accuracy plan. The other authoritative plan is [`ReconBench_Implementation_Plan.md`](ReconBench_Implementation_Plan.md), which is read-only and is never copied here; this file only points to it. Real sample values and ground truth are not kept in the repo; they live in the owner's local `work/` folder (git-ignored).
 
----
-
-## 1. What "100% accurate" means here
-
-No OCR or AI reader is 100% correct on arbitrary scans, so the product commits to this instead:
-
-| Hard guarantee (must stay 0) | Measured as |
-|---|---|
-| **False-safe document**: a document marked verified that has a wrong critical value | per benchmark run |
-| **False auto-link**: an automatic (non-suggested) link to the wrong PO or GRN | per benchmark run |
-| **False Matched**: a reconciliation case marked Matched that should not be | per benchmark run |
-| **Wrong auto-created vendor**: a vendor created from the buyer's own GSTIN, a label, or an unverified value | per benchmark run |
-
-Everything else is a **throughput** target. The goal is the most documents verified automatically and the fewest fields a person has to touch:
-
-| Target (proposed; owner may change) | Today (from the 6 Oct real-sample test) |
-|---|---|
-| Header fields correct before human touch: ≥ 98% | about 89% (D18 measurement on 8 scans; worse on the new sets) |
-| Line items correct before human touch: ≥ 95% | about 84% |
-| Documents fully auto-verified: ≥ 90% digital/QR, ≥ 60% scans | low; most scans need review |
-| Fields a person must touch per document: ≤ 2 on average | not measured |
-| Invoice → PO/GRN link found (linked or suggested) when the PO is in the data: ≥ 95% | 0 links in the real test (no complete set) |
-
-A field reaches matching only when it is **verified** (by a deterministic check, an independent second reading, a signed source, or a person). This keeps D17/D18, and the plan extends what counts as verified.
+**Reading conventions.** Every number cites a report file in `work/accuracy-reports/` and a decision-log ID (`Dnn`, [`decision-log.md`](decision-log.md)). **verified** = read from code, a stored report or the live stack on the stated date. **documented** = stated by an earlier decision or doc and not re-checked. **unverified** = not checked; the check that would verify it is named. Counts are always shown with their denominators, and rates carry the sample size because the truth set is small (§3.4).
 
 ---
 
-## 2. Root causes from the real-sample test
+## 0. Status
 
-| # | Symptom in the real test | Root cause | Fixed in |
+| | |
+|---|---|
+| Date / last decision | 20 Oct 2026 / **D78** (this consolidation; the last engineering entry is D77) |
+| Main-plan anchors | [Task 4.9](ReconBench_Implementation_Plan.md) (PDF extractor; gate ≥ 97% critical-field accuracy, no field < 95%; "blocked until real PDFs exist"), **Task 4.9b** (scanned-invoice OCR, G-30: it is **not in the main plan**; see [`gates/phase-4.md`](gates/phase-4.md) "Task 4.9b" and decision-log G-30), [Task 4.17](ReconBench_Implementation_Plan.md) (AI assist), and the [Phase 4 exit gate](ReconBench_Implementation_Plan.md) (TRD M3). G-07 is the register row for real samples, not the exit gate itself. |
+| Branch / tree | `phase2-hosted-ci`; 159 uncommitted entries (98 modified, 61 untracked) at 20 Oct; other sessions share the tree, containers and database |
+
+**Where we are.** The rules + OCR path, QR, page split, vendor hygiene, vision reader, consensus (D42), verify screen, identity and matching v2 are built (AC-0 … AC-9a, D32–D58). The provider layer, the Qwen reader, settings, shadow store and the evaluation harness are built **in the working tree only** (D62–D67; offline suites 1090 passed per D77, not re-run for this plan). Qwen3.5-9B on the company vLLM server has been benchmarked offline in six server reads (D68–D77). With prompt `vision.prompt.v4.qwen` and the D77 cross-page conflict rule it reads **275/313 headers (87.9%)** on the 39 dev PDFs, against **242/313 (77.3%)** for Tesseract + rules on the same documents (`ev2-e5-v4-ctl.json`, repeat 0 = the 16 Oct read, D74 answers rescored under D77). Lines are weaker: amount 90/123, quantity 79/114, rate 85/118, description 47/108 (40 wrong), HSN 46/75. **No accuracy target is met.** All hard-zero metrics are 0 in every stored report, and the simulated critical false-accept count is 0.
+
+**Qwen is not live.** The running containers (images built 16 Oct 04:41) contain no D62–D77 code (no `openai_compat.py`, no `endpoint_policy.py`, migrations end at 0024, container `RULES_HASH` `43b153f7…` vs tree `1e9af32f…`); the live database is at `0024` while the tree needs `0027`; `compose.yaml` forwards no `RB_AI_VLLM_*` variable. The live app runs Gemini `ai_first` with page images on (`gemini-3.5-flash-lite`), suggestions only: 40 documents, 29 `h6_vision` requests (26 applied, 2 discarded invalid, 1 failed; 7–9 Oct), 17 H1 requests, **0 `consensus_run` rows**, 0 document versions created from an AI reader (live DB read-only check, 20 Oct). Qwen output never reaches a document value today, and Excel export on real data has never been measured.
+
+**Owner decisions recorded 20 Oct (O-1 … O-9, §9):** two-tier truth set; auto-accept only through agreement or a deterministic validator plus the lower-bound gate and a shadow period; Gemini is optional; D72 lifted for WI-V2 only; version rule through `CONSENSUS_VERSION`; Qwen down → rules + OCR with a visible flag; live rebuild only inside AC-INT1 with a tested backup.
+
+**Stage 4 ready queue (needs separate authorisation to change code, call the server, run benches or touch deployment):**
+1. **WI-BE8** cropped two-pass reading, in parallel with **WI-D5** (truth set; labelling protocol is in §7).
+2. Close **WI-EV2** (fill the decision matrix from the D74–D77 and WI-BE8 evidence).
+3. **WI-BE7a** merge core with the D77 guards (flag off); in parallel the cheap read-only items **WI-T1** and **WI-INT0**.
+
+---
+
+## 1. Scope and non-goals
+
+**In scope.** Improve the accuracy and safety of the running application end to end: upload → classification → OCR/text → page and region prep → Qwen reading → parse → normalisation → evidence checks → validation → linking → reconciliation → review → persistence → Excel export. Qwen3.5-9B (company vLLM) becomes the primary extractor; Tesseract + rules stay as the independent second reader, the fallback and the not-in-OCR-text check (D72). Offline scores count only when the integration ladder (§4.11) reaches the running app.
+
+**Non-goals.**
+- Claiming 100% accuracy. The direction is zero errors on payment-affecting fields, reported honestly with sample sizes.
+- Reading handwriting as a verified value (D42 rule 4); handwritten references are hints.
+- Training or fine-tuning models; changing reconciliation rules or tolerances; AI deciding status, payable amount, links or PO capacity.
+- New deterministic OCR/rules extraction work: WI-D1/WI-D2 stay **frozen** (D72). The only exception is WI-V2 (O-4).
+- Combining answers from Gemini and Qwen, or calling both for one request (owner decision §0.6 of the retired LLM plan; D62–D67).
+- Gemini in production (optional bench arm only until D-8 and D-1 are settled for it).
+- H2–H4 text hooks on the local model (see WI-BE9 for the Gemini-off question).
+- GSTR-2B (AC-12) and the vendor profile (AC-10) are in the plan but optional/late.
+
+---
+
+## 2. Accuracy contract
+
+### 2.1 Hard zeros (must stay 0 on every run; the bench exits non-zero otherwise)
+
+| ID | Hard zero | Measured as |
+|---|---|---|
+| HZ-1 | False-safe document: not flagged, with a wrong critical value | bench `FALSE_SAFE` |
+| HZ-2 | False auto-link: an automatic link to the wrong PO/GRN | `FALSE_AUTO_LINKS` |
+| HZ-3 | False "Matched" | `FALSE_MATCHED` |
+| HZ-4 | Wrong auto-created vendor (buyer GSTIN, label, unverified value) | `WRONG_VENDORS_CREATED` |
+| HZ-5 | Auto-accepted wrong value: a value that left review without a person and is wrong | `critical_false_accept` (new, WI-EV3), reported **separately from misses** |
+| HZ-6 | Silent overwrite of a value without provenance: every change is a new `document_version` carrying its origin; a manual correction or verified field is never replaced | integration test + audit of `document_version`/`field_evidence` (WI-BE7) |
+
+A "0" is reported with its denominator and the one-sided 95% bound: 0 errors in N means a true rate ≤ 3/N (e.g. 0 in 141 critical values ⇒ ≤ 2.1%). The simulated stand-in `review_cleared` is a warning, not a pass: `ev2-e5-v4-ctl.json` shows 1 document (S08-INV) where every critical field was accepted while the rules' lines were wrong (D75(e)); this is MG-4 below.
+
+### 2.2 Targets (carried; the owner may change them)
+
+| Target | Source | Status |
+|---|---|---|
+| Critical-field accuracy ≥ 97% overall and no critical field < 95% | main plan Task 4.9 | unmet; per field in §3.2 |
+| Header fields correct before human touch ≥ 98%; line items ≥ 95%; invoice→PO/GRN link found (linked or suggested) ≥ 95% when the PO is in the data | old accuracy contract (98/95/95) | unmet |
+| Documents fully auto-verified ≥ 90% digital/QR and ≥ 60% scans; fields a person must touch ≤ 2 per document | old accuracy contract | unmet (18/51 = 35.3% auto-verified; 4.96 touches; `scanfix-truth-2.json`) |
+| Zero errors on payment-affecting fields (grand total, taxable, tax amounts, line amount/qty/rate, supplier GSTIN) | owner direction | reported with n, never claimed |
+
+**Critical fields** (bench `_CRITICAL`): invoice number, date, supplier GSTIN, grand total, printed PO refs; PO: number, date, supplier GSTIN, grand total; GRN: number, date, supplier GSTIN, PO refs. Vendor name is not critical but vendor creation is gated by GSTIN (AC-4).
+
+A target is **claimed** only when the held-out sample size is large enough (§5.1): per field, a lower bound needs `n ≥ 73` error-free values for 95% (110 with one error), `n ≥ 189` for 98%.
+
+### 2.3 Trust levels and the D42 rule
+
+| Level | Meaning | Verified? |
+|---|---|---|
+| **L0** | Digital/structured source, signed QR, or person-entered | yes |
+| **L1** | `existing` (rules already verified, ≥ 0.98) or `d42` (below) | yes |
+| **L2** | One reader, a never-automatic field, a failed soft validator, or no/negative crop agreement | no (prefilled suggestion) |
+| **L3** | Readers disagree, or an LLM contradicts a rules-verified value | no (person picks) |
+| **Rejected** | Fails a hard rule (buyer GSTIN as supplier, bad checksum, tax type vs state, invented IGST, off-page value) | never used |
+
+**D42 (decided 8 Oct; every sub-phase implements it).** A machine-read value is verified without a person per field only if (1) two independent readers give the same normalised value (OCR/text, signed QR, XML, vision; two answers of one model never count twice), (2) every deterministic validator passes, (3) a local OCR re-read of the reader's box agrees, (4) never for handwritten/stamped marks, new vendor names, a field a person corrected, or an unconfirmed split, (5) switched on per field type only after the bench shows 0 false-safe and 0 agree-wrong-confirmed for that type, behind a workspace setting that is off by default. Two different vision LLMs are one reader kind (DP-L2: No). Consensus invariants CI-1 … CI-6 (AC-6a tests): consensus never changes a value; L0/person values untouched; policy off ⇒ same object; a vision-only value is never written; result independent of input order; a never-automatic name never gets `auto_verified`.
+
+**O-2 additions (20 Oct) in front of D42, not instead of it.** A critical field may leave review without a person only if **all** hold: (a) *Qwen and OCR agree* **or** *a deterministic validator confirms* (the validator-only path exists only for the two classes in §2.4: supplier GSTIN and arithmetic-closed amounts; it amends D42 rule 1 for those classes and still needs rules 2, 3 and 5); (b) the field type passes the lower-bound gate on **held-out** data (DP-L1, §9); (c) 0 critical wrong on that data; (d) a shadow period has passed (§6, PH3); (e) D42 rules 2–5 hold. Nothing else changes D42. *Interpretation to confirm: O-10.*
+
+### 2.4 Safety gates by field class (default action per case)
+
+Actions: **AA** auto-accept (may reach L1 through consensus, subject to §2.3), **VA** validate-then-accept (accept only if the named validator passes, same gate), **S** suggest (prefilled, unverified, a person decides), **R** reject (never used), **U** unresolved (flagged, no value). Every `S` keeps the OCR/rules value as the document's current value unless the arbitration policy (§4.3) names the other reader as the leader for that field.
+
+| Class (fields) | Qwen alone | Qwen and OCR agree | Validator confirms | Readers conflict | Missing |
+|---|---|---|---|---|---|
+| Critical IDs: doc no., doc date, printed PO/GRN refs | S | AA (gated) | VA only for refs matching an open same-vendor PO/GRN (V-REFEXIST); none for doc no./date | S with both values; never AA | U |
+| Supplier GSTIN | S | AA (gated) | **VA**: checksum + not a buyer entity + state consistent + equals the linked PO's vendor GSTIN when one exists | R if a validator fails, else S | U |
+| Vendor name | S | S (never automatic, D42 rule 4) | — | S | U |
+| Amounts/totals (taxable, tax, grand) | S | AA (gated) | **VA**: full arithmetic tree closes ±₹1, amount-in-words equal when present | S, never AA | U |
+| Line amount / quantity / rate | S | AA for `line_amount` (D42 list), S for qty/rate until gated | VA: qty × rate ≈ amount; Σ lines = taxable before review is cleared (MG-4) | S | U |
+| **Line description** | **S** | **S** | — | S | U |
+| HSN/SAC | S | S until DP-L1 data exist | VA after WI-V1 (4/6/8-digit shape) | S | U |
+| Handwritten / stamped marks | S (annotation only, hint) | S | — | S | not scored as fields |
+| Marketplace order no. | S | S | VA as a link **hint** only after WI-V2 (pattern + "Order" label) | S | U |
+| Links | LLM never creates a link; suggestions only; auto only for verified deterministic anchors (D-6) | | | | |
+| Reconciliation outcome | Deterministic engine only; `Matched` needs every critical field at/above the review floor | | | | |
+
+**RULE-DESC (owner, 20 Oct).** A line description is never auto-accepted, merged as verified, or used as verified evidence for linking until WI-Q1 shows a measured fix on held-out data (Qwen currently has 40 wrong, not missing, of 108: D74/D75(b)).
+
+### 2.5 Measurement rules
+
+- Every report names: prompt version, model id, server version and canary digest (WI-OPS3), sampling profile, rules hash, `ENGINE_VERSION`, `CONSENSUS_VERSION`, truth-file SHA, dev or held-out split, and the read date.
+- One variable changes per experiment; a server-dependent comparison needs a control read the same day (D76: identical requests give identical answers within a day; one drift event is documented, 16 → 17 Oct).
+- Hard-zero results and critical false accepts are tracked on their own line, not folded into accuracy.
+- Held-out data are looked at only at gates and never used for tuning (§5.1).
+
+---
+
+## 3. Verified baseline
+
+### 3.1 Headline (39 PDFs of the dev set unless stated)
+
+| Measure | Rules + OCR (Tesseract 5.5) | Qwen v4.qwen + D77 | Source |
 |---|---|---|---|
-| R1 | Handwritten PO/GRN numbers never read; ₹ glyph read as 1/2; a rotated page misread; garbled multi-column names | Tesseract reads text only; it cannot read handwriting and loses layout | AC-5 vision, AC-1 glyph rule |
-| R2 | The buyer's own GSTIN extracted as the vendor; the label "(Bill from)" used as the vendor name; the AI picked the buyer as the vendor | No party-role model; `buyer_entities` is used only by the reconciliation engine, not by extraction, AI validation or vendor creation | AC-1, AC-4 |
-| R3 | O/0 and I/1 in document numbers; the same scan read differently on each re-scan | No cross-reader agreement; no vendor number-pattern knowledge | AC-6, AC-10 |
-| R4 | Totals wrong on non-standard layouts (typo "TOTEL" row, line amount taken as CGST) | Heuristic summary detection; only one reader | AC-1 validators, AC-6 consensus |
-| R5 | A 6-page bundle (PO+GRN+invoice) treated as one invoice → wrong link and a false duplicate | One file = one document in the layout path; no page classification | AC-3 |
-| R6 | Tally PO/GRN PDFs: number, date, totals and "Reference No." not captured; no AI help | Tally labels not wired; H1 is invoice-only (D13) | AC-1, AC-5 |
-| R7 | The AI invented IGST, kept GSTIN typos, and used the buyer as the vendor | AI output is checked only for type and grounding, not against business rules | AC-1 validators, AC-6 |
-| R8 | Correct AI values that the OCR text misread are rejected | H1 grounding requires the quote to appear in the OCR text | AC-5/AC-6 grounding by bounding-box crop |
-| R9 | Re-scans create new documents; real duplicates are missed | The natural key and duplicate rules use unstable OCR fields (vendor GSTIN/name, document number) | AC-8 |
-| R10 | Vendor master polluted (label names, GSTIN-only names, the buyer as a vendor) | `_ensure_gstin_anchors` creates vendors from any checksum-valid GSTIN, even unverified ones | AC-4 |
-| R11 | No PO number means no link | The content step needs the same `vendor_id` and good lines; there is no invoice↔GRN anchor, and handwritten refs, challan and supplier-invoice refs are unused | AC-9 |
-| R12 | XML lines show the category ("CABINET") instead of the item; GRN serials dropped | XML field mapping | AC-1 |
+| Headers, 39 PDF docs | 242/313 (77.3%); wrong 24 | **275/313 (87.9%)**; wrong 3; accepted-wrong 0 | `ev2-e5-v4-ctl.json` (D77) |
+| Headers, all 51 parsed docs (incl. XML) | 302/373 (81.0%) | not run on XML | `scanfix-truth-2.json` (`470682236b6d`, D60) |
+| Lines recall (amount) | 94/123 (PDF); 96/141 (all) | 90/123 | same; D74 |
+| Links | 3/10 (0 auto, 3 suggested, 7 missed) | n/a (reader only) | `scanfix-truth-2.json` (D58/D60) |
+| Auto-verified documents / touches per document | 18/51 (35.3%) / 4.96 | n/a | same |
+| Identity: extra documents / wrong merges; duplicates caught | 8 / 0; 0 of 2 | n/a | same (D55) |
+| Hard zeros | 0 / 0 / 0 / 0 | simulated `review_cleared` 1 (S08-INV) | same |
+| Gemini flash-lite cached (comparison, v3 prompt) | — | headers 271/313; lines 80/123 | `after-d41-lite.json` (D41) |
+
+### 3.2 Per field (dev set, 39 PDFs; Qwen = v4.qwen + D77 rule; correct/total)
+
+"Floor" is the Task 4.9 per-field floor (95%). *Max LB* is the highest 95% Wilson lower bound this n could ever show with zero errors (`n/(n+3.84)`); *obs LB* is the Wilson bound of the observed Qwen value. `unverified` where the figure is not in a stored report.
+
+| Field | Qwen | OCR | Floor gap (Qwen) | n | Max LB at n | Obs LB (Qwen) | Source |
+|---|---|---|---|---|---|---|---|
+| doc no. | 32/39 (82.1%) | 31/39 (79.5%) | −12.9 | 39 | 91.0% | 67.3% | `ev2-e5-v4-ctl.json`; was 27/39 before D77 (D74) |
+| doc date | 35/39 (89.7%) | 38/39 (97.4%) | −5.3 | 39 | 91.0% | 76.4% | same |
+| vendor name | 39/39 (100%) | 15/39 (38.5%) | n/a (not critical) | 39 | 91.0% | 91.0% | same; was 32/39 |
+| GSTIN | 55/59 (93.2%) | 55/59 (93.2%) | −1.8 | 59 | 93.9% | 83.8% | same; was 53/59 |
+| totals (taxable, tax, grand) | 102/122 (83.6%) | 91/122 (74.6%) | −11.4 | 122 | 96.9% | 76.0% | same; was 96/122 |
+| printed PO/GRN refs | 12/15 (80.0%) | 12/15 (80.0%) | −15.0 | 15 | 79.6% | 54.8% | same |
+| line amount | 90/123 (73.2%) | 94/123 (76.4%) | −21.8 | 123 | 97.0% | unverified | same |
+| line quantity | 79/114 (69.3%) | 65/114 (57.0%) | −25.7 | 114 | 96.7% | — | same |
+| line rate | 85/118 (72.0%) | 67/118 (56.8%) | −23.0 | 118 | 96.9% | — | same |
+| line description (ratio ≥ 0.85) | 47/108 (43.5%); **40 wrong**, 21 missing | 59/108 (54.6%); 34 wrong | −51.5 | 108 | 96.6% | — | same; D75(b) |
+| HSN/SAC | 46/75 (61.3%) | 61/75 (81.3%) | −33.7 | 75 | 95.1% | — | same |
+| handwritten refs found | 1/18 (v4); 6/16 (v6); 4/18 (v5) | 0 (not in OCR text) | n/a | 18 | — | — | D74–D76 |
+| marketplace order no. | 0/5 (v4); 5/5 (v6, v7) | 0 | n/a | 5 | — | — | D74–D77 |
+
+Reading the table: four critical fields (doc no., date, GSTIN, printed refs) and vendor name **cannot be proven ≥ 95% with the current n** even with zero errors. Qwen and OCR are complementary: OCR is wrong where Qwen is missing and the reverse (OCR doc no. 7 wrong; Qwen 7 missing; OCR totals 12 wrong, Qwen 3). The best-of-both bound for Qwen v4 is not stored (**unverified**; check: `scripts/accuracy_attribution.py` or `diag_cmp.py`-style offline rescoring of `ev2-e5-v4-ctl.json` answers, `--network none`). The earlier Gemini best-of-both bound was 302/313 (`after-d41-lite.json`, D41).
+
+### 3.3 Qwen cost and latency (`ev2-e5-v4-ctl.json`, 39 documents, mixed reads)
+
+Tokens in/out 791,102 / 359,804 over the control run; per-call latency p50 58.8 s, p95 224.1 s (129 answers); answer budget 3,550 tokens for v4; dense pages hit the cap. `repeat_variance` 190/325 is a **cross-day artefact** (reads from 16, 17 and 20 Oct are mixed) and is not sampling noise.
+
+### 3.4 Truth set and what it can prove
+
+- 26 truth documents in 35 files; 51 parsed documents (invoice 29, PO 11, GRN 11, including copies and re-scans); 10 expected links; **2 complete PO + GRN + invoice sets** (`scanfix-truth-2.json`, `segmentation`). "~18 truth invoices" is **unverified** (reports store parsed docs by type, not truth docs; check: counts-only tally of truth entries by type).
+- Sizing rule: for `k = n` correct out of `n`, the 95% Wilson lower bound is `n/(n+3.84)`. Needed `n` for a lower bound of 95% / 97% / 98% / 99%: **73 / 125 / 189 / 381** with zero errors; **110 / 185 / 280 / 563** with one error; **142 / 239 / 361 / 726** with two.
+- With the current set only totals, line amount/qty/rate/description and HSN reach n ≥ 73. With ~5 complete sets the plan can show point estimates, paired before/after comparisons on a fixed set, hard-zero counts with rule-of-three bounds, and regressions; it cannot certify any per-field or link target. Tier H (§5.1) exists to fix exactly this.
+- The owner's target moved from 15–20 sets (old D-7) to ~5 (9 Oct) to the two-tier design of O-1 (20 Oct).
+
+### 3.5 Server limits (documented 16 Oct, D-log and D68–D77; **not re-checked** in this consolidation: no network contact)
+
+`http://43.242.226.63/vllm/v1`, over the company VPN, plain HTTP, no key; served `qwen3.5:9b` (`Qwen/Qwen3.5-9B`), vLLM 0.23.0, `max_model_len` 8192; thinking default **on** with no reasoning parser, so every request must send `enable_thinking: false`; structured outputs (`response_format json_schema`) enforce the D73 length limits (0 schema drops in the D74 read); shared with other projects; GPU, image limits and request logging unknown (owner/admin). Failures per run: `PROVIDER_UNAVAILABLE` D75 2, D76 run A 3, D77 v7 3, D77 control 7 plus 12 stopped on `provider_down`. Determinism: identical requests give identical answers within a day (D76: 28 of 28; 27 of 27), one drift event 16 → 17 Oct (22 of 27 differ), none 17 → 20 Oct (17 of 17 equal, D77). The cause (seed, cache or server config) is unknown.
+
+### 3.6 Live application state (verified 20 Oct)
+
+| Item | Value |
+|---|---|
+| Images | `reconbench-{api,worker,ai-worker,setup}:latest` created 16 Oct 04:41 IST; containers up 3 h |
+| Code in images | no `openai_compat.py`, no `endpoint_policy.py`; migrations ≤ 0024; consensus code **is** present and wired in the ai-worker image |
+| Live DB | Alembic `0024`; 40 documents, 31 source files; 1 buyer entity configured (count only); 47 `document_page_image` rows, all purged |
+| AI settings | `gemini` / `ai_first` / `vision_enabled` true / `gemini-3.5-flash-lite`; `auto_verify_field_types` = `{doc_date, doc_no, gstin, line_amount, reference}` |
+| AI requests | `h1_extract` 17 applied (5 Oct); `h3_rerank` 1 (7 Oct); `h6_vision` 26 applied (9 Oct), 2 discarded invalid, 1 failed (7 Oct); 4 provider tests |
+| Consensus | 0 `consensus_run` rows although 26 vision answers were applied and `auto_verify_field_types` is set: cause **unverified** (WI-INT0) |
+| Environment | `RB_AI_EXTERNAL_CALLS` value not read (`.env` names only); `RB_AI_VLLM_*` absent from `compose.yaml` and from container environments |
+
+### 3.7 Unverified items and the check for each
+
+| Item | Check |
+|---|---|
+| Truth invoices ≈ 18 | counts-only tally of truth entries by type (WI-D5 step 1) |
+| Best-of-both bound for Qwen v4 | offline rescoring of stored answers, `--network none` |
+| Why `consensus_run` = 0 | WI-INT0 |
+| Whether the 40 live documents equal the 39 bench PDFs | compare file SHA-256 manifests, counts only (WI-INT0) |
+| `RB_AI_EXTERNAL_CALLS` effective value | `docker exec` environment read of one variable (non-secret) in AC-INT1a |
+| Container reachability of the vLLM URL from the compose `ai-worker` network | WI-OPS1 smoke test 4 (reachability from `docker run` of the worker image was confirmed in D68) |
+| Whether `RB_AI_VLLM_BASE_URL` is still required with per-workspace URLs (D65) | read `ai/worker/providers.py:22-40` in AC-INT1b |
+| E-invoice NIC key present in the app (signed QR = L0) | WI-QR1 |
+| Per-cell Qwen accuracy by scan type | WI-EV3 `vision_eval` split |
+| Excel export correctness on real data | WI-EV3 export metric (MT-12) on Tier S |
 
 ---
 
-## 3. Target extraction architecture
+## 4. Pipeline architecture
+
+### 4.1 Flow
 
 ```
-file ─► page split + classify (AC-3) ─► per-document page set
-          │
-          ├─ Reader A: local layout/OCR (existing local_hybrid + legacy text layer)
-          ├─ Reader B: e-invoice signed QR / IRN (AC-2)              ← exact values
-          ├─ Reader C: vision model on page images (AC-5, async, consented)
-          └─ Reader D: person (verify screen, AC-7)
-                 │
+upload ─► classify + split (AC-3) ─► per-document page set
+            │
+            ├─ Reader A  Tesseract layout + rules (frozen, D72)  ── independent second reader, fallback
+            ├─ Reader B  signed e-invoice QR / XML / CSV          ── exact values (L0/L1)
+            ├─ Reader C  Qwen3.5-9B via vLLM, masked page images  ── PRIMARY on scans (async, ai-worker)
+            │              one page per call; full page, or header / table / totals crops (WI-BE8)
+            └─ Reader D  person (verify screen, AC-7)
                  ▼
-      validators (deterministic, authoritative)   ── AC-1
-                 │
+   standalone checks on the LLM reading (check_reading; WI-V1 adds HSN / ref existence)
                  ▼
-      consensus + trust level per field (AC-6) ── verify loop: targeted re-read of failing regions (max 2)
-                 │
-        all critical fields L0/L1 ──► verified version ──► vendor, identity, matching
-        otherwise ──► verify queue (only the uncertain fields are shown)
+   merge policy (WI-BE7): arbitration table §4.3 + guards MG-1…MG-10 → new document_version (alternatives kept)
+                 ▼
+   consensus (D42 + O-2): independent reader + validators + local crop re-read → verified fields only
+                 ▼
+   vendor resolution → linking (suggestions; auto only for verified anchors) → reconciliation (deterministic)
+                 ▼
+   review (verify screen, provenance) → persistence (append-only) → Excel export
+ Qwen down / answer unusable ► the rules + OCR version stays current; document flagged LLM_UNAVAILABLE (§4.8)
 ```
 
-### 3.1 Trust levels (extends D18)
+### 4.2 Per stage: current implementation, failure modes, fix
 
-| Level | Meaning | Examples | Counts as verified |
+| Stage | Current implementation | Failure modes and evidence | Proposed fix (task) | Risk |
+|---|---|---|---|---|
+| ST-1 Upload | `ingest_file`; zone type; ZIP; bundle prompts a split (D35) | live image lacks D62–D77 (§3.6) | AC-INT1 | migrating the live DB |
+| ST-2 Classification and split | `extraction/pages.py`; 54 page kinds correct (D41) | `test_page_split.py` 2 failures (`_current()` duplicate PO rows, D57); B11 same-type scans split only on "Page 1 of N" | WI-D6; B11 accepted gap (§10) | low |
+| ST-3 OCR / text | layout engine + text layer; OCR 0.65, text layer 0.90 | 9 header and 24 line-cell OCR-absent misses on scans (diagnosis §5); poor text layers, > 20 pages, Windows decode | frozen (D72): WI-D2, WI-D2b, WI-D2c | — |
+| ST-4 Page and region prep | render 2,048 px long side (≈ 175 DPI), mask, one page per call | answers cut at the output cap on dense pages: D68 1, D75 2, D76 9, D77 4 (16 failed calls, the same few dense pages recurring); 33 line rows missing per cell | **WI-BE8** | may hurt normal pages |
+| ST-5 Qwen inference | shared server; 30 s provider backoff; 300 s timeout; heartbeat every third tick | unavailable runs (§3.5); p95 224 s; one drift event; thinking must be off | WI-OPS1/2/3 | fallback load |
+| ST-6 Structured parse | strict top level + tolerant per-item parse (D73) | 0 schema drops after length limits; `unreadable` never listed (0 of 35–57 nulls) | none; do not rely on `unreadable` as a lever | — |
+| ST-7 Normalisation and page merge | look-alike fold; D77 conflict rule | 170 duplicate and 58 conflict drops (control run); `po_refs` grew across pages under v5; order date taken as date under v5–v7 | WI-BE7 guards MG-3, MG-5; arbitration | medium |
+| ST-8 Evidence and confidence | LLM-only capped 0.65/0.69; `page_conflict` excluded from accept and consensus | consensus never ran on live data | WI-INT0, AC-INT1 | — |
+| ST-9 Validation | `check_reading` rejects; arithmetic, Σ lines, line arithmetic and date window are marks, not drops (D63) | no HSN shape, no reference-existence, no vendor doc-no pattern for LLM values; Σ lines = taxable is mark-only | WI-V1; AC-10 (pattern) | over-flagging |
+| ST-10 Linking | resolver + AC-9a scorer | links 3/10: 4 are an AC-9a regression, 2 handwritten refs, 1 vendor pending (diagnosis §5.7); an LLM can fix ≤ 2 of 7 | WI-D4, AC-9b; WI-Q2 (hints) | low |
+| ST-11 Reconciliation | deterministic engine | both status disagreements are the unlinked complete sets; hard zeros 0 | follows ST-10 | — |
+| ST-12 Review | verify screen (AC-7); suggestions panel shows model only | 30 s target untimed; no provenance/disagreement UI | WI-FE2, AC-7c | — |
+| ST-13 Persistence | append-only versions; AI values live only in `ai_cache` | `merge` refused (422 `merge_not_enabled`); no `merge_readings` | WI-BE7a/b/c | **highest** |
+| ST-14 Excel export | synthetic workbook equals `expected.yaml` (D28); Home KPIs = Summary | real-data export never measured | MT-12 in WI-EV3; AC-11 | — |
+
+### 4.3 Per-field arbitration (policy `arb.v1`, stored as data, versioned)
+
+Principle: no "always trust the LLM" and no "always trust OCR". The policy names, per field, the **leader** whose value is the document's current (unverified) value when both readers pass validators and disagree; the other reading is kept as the alternative and the field enters review with warning `LLM_DISAGREEMENT`. Nothing here auto-accepts; acceptance is §2.3/§2.4. The default leader is **OCR for every field** (so flag-off = today); a field's leader changes only after the held-out set confirms the dev-set lead (paired comparison, lead ≥ 10 points and wrong-count not higher).
+
+| Field | Dev evidence (Qwen / OCR, correct; wrong) | Proposed leader after confirmation | Conflict handling |
 |---|---|---|---|
-| **L0 certain** | Value from a digital or signed source, or entered by a person | XML, text-layer value that also passes its check, signed e-invoice QR, human save | yes |
-| **L1 confirmed** | Two **independent** readers agree exactly **and** format checks pass, **or** a deterministic relation holds (D18 "confirmed/corrected") | vision value = Tesseract re-read of the same crop; qty × rate = amount; GSTIN checksum valid and not a buyer entity; amount in words = grand total | yes |
-| **L2 single** | One reader, passes format checks | only the vision model read the date | no; shown prefilled |
-| **L3 conflict** | Readers disagree and no check settles it | OCR "PAPLO826", vision "PAPL0826" | no; person picks from the options |
-| **Rejected** | Fails a hard rule | supplier GSTIN = buyer entity; invented IGST on an intra-state invoice; invalid checksum | never used; shown as an error |
+| vendor name | 39 / 15; 0 / 2 wrong | Qwen | alternative kept; never auto-verified |
+| totals (amount) | 102 / 91; 3 / 12 wrong | Qwen | arithmetic tree decides when it closes for exactly one candidate |
+| line qty, rate | 79 / 65; 85 / 67 (OCR 12 rate wrong) | Qwen | row-level: qty × rate ≈ amount decides |
+| doc no. | 32 / 31; 0 / 7 wrong | OCR (tie) | disagreement ⇒ both shown; look-alike guard stays |
+| doc date | 35 / 38 | OCR | Qwen order-date errors seen under v5–v7 ⇒ never lead |
+| GSTIN | 55 / 55 | OCR (tie) | checksum + buyer + state; both valid and different ⇒ R for the buyer-role one, else S |
+| printed refs | 12 / 12 | OCR (tie) | extra ref on a later page ⇒ MG-5 |
+| line amount | 90 / 94 | OCR | row alignment as in the bench |
+| line description | 47 / 59, both mostly wrong | OCR; **no AA** (RULE-DESC) | S only |
+| HSN/SAC | 46 / 61 | OCR | shape check (V-HSN) |
+| handwritten refs | OCR 0 | Qwen as hint only | annotation, never a field |
+| marketplace order no. | 0 (v4) / — | Qwen after WI-V2 | rename by pattern |
 
-Two rules keep this honest:
-- **Two answers from the same model never confirm each other** (their errors are correlated). Agreement counts only between different readers (OCR vs vision vs QR), plus a check.
-- The D18 look-alike guard stays for the OCR reader. A look-alike field can reach L1 only when an independent reader (vision or QR) agrees and the vendor's known number pattern accepts it (AC-10).
+A value that fails its validator is excluded from the merge but kept as a visible suggestion (`check_failed:<reason>`, D63). A value marked `page_conflict` (D77) is a suggestion only, never the leader and never used by consensus.
 
-### 3.2 Deterministic validators (AC-1; the core stays pure)
+### 4.4 Deterministic validators on LLM values
 
-- **Arithmetic tree**, as today (D18): line qty × rate, line sums to taxable, taxable + tax = grand (round-off), amount in words.
-- **GST structure**: supplier state (GSTIN digits 1–2) vs place of supply/buyer state. Intra-state means CGST = SGST and IGST = 0; inter-state means IGST only. The tax-to-taxable ratio must be a configured slab (`_STANDARD_RATES`) or a mix of slabs that the lines explain.
-- **Parties**: supplier GSTIN ∉ `buyer_entities`; the buyer GSTIN should be in `buyer_entities` (warning otherwise); PAN consistency; checksum.
-- **Names**: reject label text ("Bill from", "Supplier", "Consignee", "Buyer", "M/s" alone), GSTIN-shaped names and line text as vendor names.
-- **Dates**: not in the future, within a sane window of the upload, invoice date ≥ PO date (warning, not reject).
-- **References**: a PO/GRN reference must look like a document number. Address digits ("501"), seller sales-order numbers and marketplace order numbers are typed separately, never as `po_refs`.
+| Validator | Checks | Exists? | Needs D72 lifted? |
+|---|---|---|---|
+| V-GSTIN | checksum, not a buyer entity, state vs place of supply, tax type vs state | yes (`check_reading`, `values.py`, `parties.py`) | no |
+| V-ARITH | taxable + taxes ± round-off = grand (±₹1); amount in words | yes, mark-only (D63) | no |
+| V-LINE | qty × rate ≈ amount | yes, mark-only | no |
+| V-SUMLINES | Σ line amounts = taxable (±₹1) | yes, mark-only; becomes a **gate** for clearing review (MG-4) | no |
+| V-DATE | date window (D42), invoice date ≥ PO date warning | yes, needs `as_of` | no |
+| V-REF | reference shape (no address digits, marketplace or sales-order number as PO) | yes | no |
+| V-HSN | 4/6/8-digit HSN, 6-digit SAC (`99…`) | OCR table path only (`table.py _HSN_SHAPE`); **new** for LLM values (WI-V1) | no (validator on LLM output) |
+| V-REFEXIST | a printed PO/GRN ref equals an open same-vendor PO/GRN number; evidence for the ref only, links stay suggestions | link-time only; **new** at acceptance (WI-V1) | no |
+| V-DOCNO-PATTERN | per-vendor document-number pattern | no; AC-10 | no |
+| V-MARKETPLACE | label contains "Order" and value matches `DDD-DDDDDDD-DDDDDDD` ⇒ rename to `marketplace_order_ref` | no | **yes, WI-V2 only (O-4)** |
+| V-NOTINOCR | value absent from folded OCR text ⇒ cannot be accepted unless the crop re-read agrees; also reported as MT-10 | metric exists (D68+); gate is D42 rule 3 | no |
 
-### 3.3 Verify loop (AC-6)
+### 4.5 Dense pages and truncation: WI-BE8 design
 
-When a check fails, re-read **only the failing region** instead of sending the document to a person straight away:
-- Arithmetic fails on a line: re-OCR that row at 2×/600 DPI, then (if consented) ask the vision reader for that crop only.
-- Total vs lines mismatch: re-read the summary block.
-- GSTIN checksum fails: re-read the GSTIN crop with a character whitelist.
+Cause: one page per call with a 3,100–3,550-token answer budget (8,192 context, ≈ 3,500 image tokens) truncates dense tables; 33 rows per line cell are missing (D74) and 16 calls hit the cap across D68–D77 (the same dense pages recurring).
+- **Region selection (variant A, default, no extra LLM call).** From the deterministic layout of the masked page: a header band (above the table heading, ≤ 35% of height), one or more table bands (heading to summary rows; a band covers at most R rows, start R = 12, tuned on dev), and a totals band (summary rows to page end). No heading found ⇒ the full page is read (fallback, as today).
+- **Overlap and context.** Adjacent table bands overlap by one full row (≥ 8% of band height). Every table crop carries the column-heading strip (re-drawn from the same masked pixels) and the text "Page p, band k of m, kind". Long side per crop ≤ 1,600 px.
+- **Boxes and merge.** The model returns boxes relative to the crop; pure core `map_crop_box` converts them to page boxes; pure core `merge_regions` combines regions of one page: header fields only from header and totals bands; rows from table bands; an overlapped row seen twice is merged when (amount, quantity, rate) are equal and the mapped boxes overlap (IoU ≥ 0.5); if the two copies disagree both are kept as `region_conflict` suggestions (never a value). Cross-band duplicates of a header field use the D77 conflict rule.
+- **Cost.** Calls per page rise from 1 to about 3–5, each with fewer image tokens; total tokens and wall time are reported (latency is not judged until accuracy is decided, D72, but is recorded).
+- **Proof it helps without hurting.** One variable (strategy `crops` vs `full`), same prompt, same-day full-page control, dev set. Accept if (a) on the dense subset (documents with an output-cap failure in any D68–D77 read) usable answers go from the control's to all, and line-amount recall on scan pages rises ≥ 5 points; (b) non-dense documents: headers and line cells not lower by more than 1 field in total; (c) wrong-when-answered and accepted-wrong not above the control; (d) a failed region falls back to the full-page answer for that document. Otherwise stay on full pages.
 
-Stop after 2 rounds; anything left goes to the verify screen. Every round is logged as evidence.
+### 4.6 Weak-field levers (one lever and one experiment each)
 
----
+| Field | Failure | Lever | Experiment (pre-registered target on dev; held-out confirms) |
+|---|---|---|---|
+| line description | 40 wrong: row text merged with other columns (34, D75(b)); 21 not aligned | WI-Q1: read the description column band per row (layout x-range from the heading) in the table crop pass; hypothesis only: v5's description wording lowered the score (47 → 39) | correct ≥ 65/108 and wrong ≤ 20; RULE-DESC stays until held-out shows it |
+| HSN/SAC | 26 missing; OCR leads | arbitration (OCR leads) + V-HSN + crops | Qwen+OCR combined ≥ OCR's 61/75 with 0 new wrong |
+| doc no. | 7 missing; own number of PO/GRN renamed to `po_ref`/`grn_ref` (7 of 12 pre-D77 nulls, D75) | WI-Q3: single-rule prompt variant "doc_no is this document's own number (PO number on a PO, GRN number on a GRN)" on v4 | doc no. ≥ 36/39 with other field groups net ≥ −1 and accepted-wrong 0 |
+| handwritten refs | 1/18 (v4); 0 in OCR text; v6 reached 6/16 but lost CGST/SGST | WI-Q2: annotations rule alone on v4, and (if BE8 passes) a margin-band crop pass | recall ≥ 6/16 with no loss on any header group; output is link hints only |
+| marketplace order no. | 0/5 on v4; v7 sentence gave 5/5 but 4 accepted-wrong on S03-INV | WI-V2 deterministic post-check, no prompt change | 5/5 with 0 side effects on any other field |
+| references (printed) | 3 missing, 3 OCR wrong | V-REFEXIST + arbitration | ≥ 13/15 with 0 wrong accepted |
 
-## 4. Matching without a PO number (AC-9)
+### 4.7 Prompt policy
 
-The current ladder (`reconbench_core/mapping/links.py`) has five steps: labelled ref → reverse text lookup → via GRN → manual → content. The content step only considers POs with the **same `vendor_id`**, needs aligned lines, and always ends as a suggestion (confidence capped at 0.90). So matching without a PO number needs three things: (a) a correct vendor (AC-4), (b) correct lines (AC-5/6), and (c) more anchors and a better scorer.
+`vision.prompt.v4.qwen` is the baseline (the vLLM reader is on `qwen` again; v5, v6 and v7 stay as byte-identical variants). A new prompt is accepted only if, on the same fixed dev set and against a same-day v4 control read: the target field gains ≥ 3 correct; every other header or line group is net ≥ −1; accepted wrong critical values are 0; the stated target failure is the one that improved. Each run records prompt, model, server version, canary digest, sampling profile, seed and rules hash. One variable per run. Prompt text changes bump the prompt version and the vLLM consent fingerprint (re-consent).
 
-**New anchors** (each one is evidence, not truth):
-1. **Handwritten PO/GRN numbers** (vision, stored separately as `annotation_refs`). They are a hint only and must exist in the data and agree with the vendor and amount.
-2. **GRN → invoice**: the GRN "Reference No." / "Supplier Invoice No." / challan number equals the invoice number (after look-alike folding) for the same vendor. This gives a direct invoice↔GRN edge, and the PO follows from GRN→PO (which already works for XML).
-3. **Challan / delivery-note number** on the invoice equals the GRN challan.
-4. **Marketplace order number**, stored as `marketplace_order_no` and matched against PO narration or notes when present.
+### 4.8 Server reliability and fallback
 
-**Scoring**: one explainable score per invoice × candidate (PO or GRN):
+| Mechanism | Today | Plan |
+|---|---|---|
+| Health check | `GET /models` every third heartbeat; writes `last_health_*` (D65) | WI-OPS2: status code `LOCAL_PROVIDER_DOWN` in settings and a Home banner |
+| Retry / backoff | single attempt; 30 s backoff after `rate_limited`/`PROVIDER_UNAVAILABLE` | WI-OPS2: one deferred retry after 60 s; then give up |
+| Timeout | 300 s per call, `max_concurrency` 1 | unchanged; recorded latency feeds WI-OPS2 |
+| Fallback (O-6) | async path leaves the OCR version current | document-level flag `LLM_UNAVAILABLE` visible in review; **no automatic Gemini failover** |
+| Queue | would pile up | skip new requests with `PROVIDER_UNAVAILABLE` while health has failed > 5 min |
+| Cache | `cache_key_v2` over provider, model, prompt, schema, reader params, masked image digests | unchanged; add server fingerprint as provenance (not in the key) |
+| Cross-day drift | undetected | WI-OPS3: canary of 3 synthetic pages read daily; the answer digest and `/version` are stored; a change opens a "server epoch"; comparisons never mix epochs |
+| Server down for a week | not handled | every document is processed on rules + OCR and flagged; hard zeros are unaffected because that path is today's; metric `llm_coverage` shows the loss; on recovery the owner chooses whether to back-fill |
 
-| Signal | Notes |
+### 4.9 Linking and reconciliation
+
+- Evidence-backed links only; similarity is not proof (D-6): auto-link only for verified deterministic anchors; every content or multi-signal link stays a suggestion. Handwritten refs and marketplace order numbers are hints/anchors that still need a same-vendor open PO and an amount signal.
+- Cases the Tier S sets must cover (§5.1): partial deliveries, several GRNs for one PO, several invoices for one PO, an exact duplicate and a re-scan, an invoice without a PO number, a cross-vendor same-reference collision, a period boundary.
+- Arithmetic is always deterministic (quantity/value ceilings, tolerance, variance split); the LLM only extracts. Known open defects: 4 GRN→PO links lost in AC-9a (WI-D4), B6/B10 (AC-9b), 8 extra documents and 2 missed duplicates (AC-8b).
+
+### 4.10 Merge policy (WI-BE7) and its guards
+
+The pure core `merge_readings(ocr_document, checked_readings, policy)` produces a candidate document; the general worker (never the ai-worker) appends it as a new `document_version` (`extraction_method = 'ai_fallback'`, `derived_from_version_id` = OCR version). Per field: both pass and agree ⇒ keep, supporting readers recorded; Qwen passes and OCR is missing or failing ⇒ Qwen value, source AI, confidence capped 0.69; both pass and disagree ⇒ arbitration leader, alternative kept, `LLM_DISAGREEMENT`; Qwen unreadable/omitted/`check_failed` ⇒ OCR value plus flag; annotations never enter fields.
+
+| Guard | Rule |
 |---|---|
-| Vendor | Verified GSTIN equal (strong); same PAN; alias; none |
-| Amount | Invoice grand/taxable vs GRN value or PO open balance, within tolerance |
-| Date window | PO date ≤ GRN date ≤ invoice date + N days (configurable) |
-| Lines | Existing `align_lines` (description, code, HSN, UoM) plus qty equal to GRN accepted qty and rate equal to PO rate |
-| Strong tokens | Model and part numbers shared between invoice and PO lines |
-| Anchors | Handwritten or challan or GRN reference matches |
+| MG-1 | Provenance on every field and line cell: reader id (`llm:<provider>:<model>:<prompt>`), schema, reader-params digest, `ai_request` id, page, box (HZ-6) |
+| MG-2 | An LLM-only value is capped below the review floor and is never verified except through consensus (D42 + O-2) |
+| MG-3 | A `page_conflict` value is a suggestion; it never leads the merge and is skipped by consensus (D77) |
+| MG-4 | The review flag is cleared only when Σ line amounts = taxable (±₹1) **and** a taxable value exists; a missing taxable never clears it (D75(e); the S08-INV case) |
+| MG-5 | A `po_refs` set that grew across pages is not accepted automatically (D75: v5 wrong refs on S01/S02) |
+| MG-6 | Descriptions never auto-accepted (RULE-DESC) |
+| MG-7 | A manual correction or verified field is never replaced; the merged version is stored as an alternative (D19 guard, B9) |
+| MG-8 | Flag off (`RB_AI_LLM_MERGE` disabled, `apply_mode` suggest) ⇒ the default bench report hash is identical to the pre-merge hash; one switch rolls back; "restore OCR version" appends a copy |
+| MG-9 | Handwritten and stamped marks are annotations; their references stay hints |
+| MG-10 | DP-L1 thresholds per field type and a completed shadow period before any field type is enabled for acceptance |
 
-**Assignment**: instead of greedy per-document reservation, match invoices against GRN/PO capacity for the whole period. Use a deterministic maximum-weight assignment with quantity/value capacities. When the top two candidates are within the lead margin, the result is "ambiguous" and goes to a person with both options.
+### 4.11 Integration ladder (a feature is done only when every rung is verified)
 
-**Policy** (owner decision D-6): automatic links come only from verified deterministic anchors (as today). A multi-signal match is a **suggestion with a one-click confirm** until the benchmark shows zero false links over an agreed number of documents. After that, an auto-link rule for "unique + vendor verified + exact amount + qty equal" can be switched on per workspace.
+| Rung | Evidence required | Status (20 Oct) |
+|---|---|---|
+| RG-1 Code in the tree | files present, offline suites green | verified in tree (1090 passed per D77; not re-run) |
+| RG-2 Config | compose forwards `RB_AI_VLLM_CALLS`, `RB_AI_VLLM_ENDPOINTS` (and `RB_AI_VLLM_BASE_URL` if still needed), `RB_VISION_READER` | **missing** (`compose.yaml` forwards none) |
+| RG-3 Server reachable from the running ai-worker | `GET /models` 200 from `docker exec ai-worker` | reachable from a `docker run` of the worker image (D68); compose container unverified |
+| RG-4 Enabled | gate mode, endpoint allowlist, workspace card, reader strategy, consent current | no |
+| RG-5 Deployed image runs that code | image digest, file presence, migrations at head | **no** (§3.6) |
+| RG-6 Qwen output reaches the app | `reader_comparison` rows in shadow; then suggestions | no |
+| RG-7 Validated values persisted | merged `document_version` rows with provenance | no |
+| RG-8 Reconciliation uses them | recompute after the new version; status/link deltas reported | no |
+| RG-9 Excel export correct | workbook cells equal expected on Tier S | never measured on real data |
+
+Shadow before merge, always; a one-switch rollback at every step; consent, endpoint allowlist and network safeguards stay (SSRF policy `endpoint_policy`, exact origin + path; redirects never followed).
+
+### 4.12 Versioning rule (O-5)
+
+| Change | Version that must change | Check |
+|---|---|---|
+| Recon-path rules (align, mapping, normalize, recon, schema, seed) | `ENGINE_VERSION` patch | `scripts/check_engine_version.py` |
+| OCR/rules extraction output | `PARSER_VERSION` | new parser-hash guard (WI-D3) |
+| Vision check or consensus logic in core (`extraction/vision.py`, `extraction/consensus.py`) | `CONSENSUS_VERSION` (or a new `VISION_CHECK_VERSION`), stamped on every `consensus_run`, `reader_comparison` and evidence row | extended guard (WI-D3) |
+| Prompt / schema / render / mask | prompt version, schema version, `reader_params` (these already change cache keys and consent) | existing tests |
+| Any core `.py` change | `RULES_HASH` file | `scripts/check_rules_hash.py` |
+
+The guards compare the working tree with the **last release tag**, not HEAD (HEAD is `0.1.4` while the tree is `0.1.7`, so a HEAD comparison is vacuous). No release tag exists today; the owner creates the first at AC-INT1b. **D77 resolution:** D77 changed vision conflict resolution and the consensus skip without a version bump, which is consistent with the old script (it does not watch `extraction/`) but not with this rule; WI-D3 bumps `CONSENSUS_VERSION` to `consensus.v2` retroactively and records it. Recorded in D78.
+
+### 4.13 Findings carried from the LLM audit (16 Oct; the audit document is retired, §14)
+
+Where a correct LLM value can be lost today (P1–P10) and the plan's answer:
+
+| # | Drop point | Plan answer |
+|---|---|---|
+| P1 | Never enters the document (suggestion only) | WI-BE7 |
+| P2 | Not requested: `ai_assisted` skips documents that do not need verification; > 8 pages skipped | eligibility reviewed in WI-BE7b; page cap in D-8 terms for Gemini only |
+| P3 | A strict parse failure used to lose the whole answer | fixed by the tolerant per-item parse (D73) |
+| P4 | Core drops per item (control run: duplicate 170, conflict 58, bad_value 41, gstin_invalid 29, bad_cell 10 …); correctness of dropped values unknown | WI-EV0-style attribution of drops on Qwen answers inside WI-EV3 |
+| P5 | All-or-nothing `ungrounded` when every item is dropped | WI-BE7a keeps per-item suggestions |
+| P6 | "Leave out what you cannot read" makes omission and absence look equal | `unreadable` exists (v4) but is never used by Qwen (0 of 35–57); not a lever |
+| P7 | Consensus keeps OCR when readers disagree (L3) | arbitration §4.3 |
+| P8 | Cache expiry after 30 days hides suggestions | accepted; shadow comparison rows persist |
+| P9 | A stale source (new version, consent or settings change) discards the answer | accepted by design; re-read on demand |
+| P10 | Handwritten marks never become fields | by design (MG-9) |
+
+Coupling gaps found and where each is handled: one provider instance per worker and one provider/model/key per workspace (done D62, D65); consent text and preview assumed Gemini (done D65); the cache key omitted provider and reader params (done D63); LLM arithmetic was only checked against consistent OCR totals (done D63, mark-only; gate in MG-4); review UI shows model only (WI-FE2); no mock OpenAI-compatible server beyond `httpx.MockTransport` (accepted, D64); **text hooks H1–H4 are bound to Gemini and `HOOKS_BY_MODE` keeps H2–H4 in both active modes, so Gemini cannot be switched off while Qwen vision is on (new finding, WI-BE9)**. Facts relied on from external documentation (checked 16 Oct, sources named in the retired audit): Qwen3.5-9B is multimodal, Apache-2.0; thinking is on by default and is disabled per request with `chat_template_kwargs {"enable_thinking": false}`; card sampling for non-thinking is temperature 0.7, top-p 0.8, top-k 20, min-p 0, presence penalty 1.5; structured outputs through `response_format json_schema`; `--api-key` protects `/v1` only; quantised variants exist from RedHat/community, none official; image limits and `--limit-mm-per-prompt` are **unverified** (check `vllm serve --help` on the server version). Gemini 3: keep the default temperature; thinking levels low/medium/high; `media_resolution` high recommended.
+
+### 4.14 Role of Gemini
+
+Qwen is the primary reader. Gemini is **not** an automatic fallback (O-6). Until WI-BE9 is done, the live Gemini key keeps serving text hooks H2–H4; afterwards Gemini is off in the live workspace and remains only an optional bench arm (E1–E4) and a manual workspace alternative, one provider per request, never combined (D62–D67).
 
 ---
 
-## 5. Vendor master hygiene (AC-4)
+## 5. Evaluation framework
 
-- `buyer_entities` (owner's own GSTINs and names) becomes a **prerequisite setting**. It is passed into extraction hints, AI validation, and vendor resolution.
-- Vendors are created **only from a verified supplier identity**: an L0/L1 GSTIN that is not a buyer entity. A document without one gets the state **vendor pending**, with ranked suggestions (GSTIN, PAN, alias, fuzzy name). No new vendor is created.
-- Display-name quality: never a label, a GSTIN, or line text. The name comes from QR/verified text or a person; otherwise the vendor shows as "(name pending)".
-- A supplier without a GSTIN (unregistered, e.g. a small service vendor) is created only by a person or from a confirmed PO party, keyed by verified name plus PO.
-- **Marketplace rule** (owner decision D-5): on marketplace invoices, the legal supplier is the **seller GSTIN** printed on the invoice, not the marketplace. If POs are raised to the seller (as in the samples), no alias is needed. If some POs are raised to the marketplace itself, the marketplace order number becomes the anchor.
-- A one-time **cleanup**: list junk vendors (label names, buyer GSTIN, GSTIN-as-name), merge or delete them with an audit trail, then re-run resolution and mapping. There is a merge/assign UI on the Mapping page (G-13 endpoints).
+### 5.1 Datasets and splits (O-1: two tiers)
+
+| Set | Content | Role | Size now → target |
+|---|---|---|---|
+| **DEV-CORE** | the existing truth set: 26 truth documents in 35 files (39 PDFs, XML/CSV, 2 complete sets) | tuning, prompt and rule experiments, regression baseline | as is |
+| **Tier H** | header-only truth for **invoices**: document no., date, supplier GSTIN, buyer GSTIN (if printed), taxable, tax amounts, grand total, printed PO refs | **held-out evidence** for per-field claims | 0 → **80 invoices** (zero errors on 80 values gives a 95.4% lower bound; one error needs 110, so an escalation batch of +30 is pre-planned) |
+| **Tier S** | complete PO + GRN + invoice sets with lines, links and expected status | linking, reconciliation, export, end-to-end | 2 → **8–10 sets**; split by set: dev = the existing 2 + 2 new, **held-out ≥ 4 new sets** |
+
+Rules:
+- Tier H and the held-out sets of Tier S are **never used for tuning**. They are scored only at gates (PH4 and PH7) and for the escalation decision; each look is recorded in the decision log. A held-out item that influenced a rule or prompt is retired from evidence.
+- Split by vendor as well as by document: at least one third of Tier H invoices come from vendors absent from DEV-CORE, and reports show seen-vendor and unseen-vendor rows separately.
+- Composition quotas for Tier H (minimums, owner may adjust, O-12): digital text PDF 10; clean scan 15; tilted or rotated scan 10; phone photo or low-DPI 5 if they occur in production; invoices with handwritten marks 10; marketplace 5; three or more pages 10; dense tables (≥ 15 rows) 10; supplier without GSTIN 3; carrying a printed PO ref ≥ 73 if a per-field claim on references is wanted (otherwise references are reported as counts only). Tier S must contain: a partial delivery, two GRNs for one PO, two invoices for one PO, an exact duplicate and a re-scan, an invoice without a PO number, a cross-vendor same-reference collision, a handwritten-reference case, a bundle file, and a marketplace invoice.
+- Labelling protocol is in WI-D5. Labels are produced blind to the system output for Tier H.
+
+### 5.2 Metric definitions
+
+"Exact match" never applies look-alike folding: `O` ≠ `0`, `I` ≠ `1`. The harness (WI-EV3) aligns its scoring with these definitions and records any difference it finds in the existing bench.
+
+| ID | Metric | Numerator / denominator | Matching and normalisation | Where |
+|---|---|---|---|---|
+| MT-1 | Field accuracy (per field, per document type) | correct / truth-present fields (key present, not null); report wrong and missing separately | IDs: canonical form, uppercase, no folding; GSTIN 15 chars exact; dates ISO; refs: canonical PO number | offline + e2e |
+| MT-2 | Required-field completeness | critical fields with any value / critical truth-present fields | presence only | offline + e2e |
+| MT-3 | Document exact-correct | documents with every critical header field exactly correct (header variant) / documents; full variant also needs every truth line matched and 0 spurious lines | as MT-1, MT-4 | offline + e2e |
+| MT-4 | Line-item accuracy | per cell (amount, quantity, rate, description, HSN, UOM) correct / truth cells; line recall = truth lines matched / truth lines; spurious = extracted lines unmatched | row match by amount, then quantity/rate tie-break (bench rule); description ratio ≥ 0.85 after casefold and whitespace collapse | offline + e2e |
+| MT-5 | Numeric accuracy | money values equal / money truth values | Decimal equality to 0.01; quantity exact after UOM canonicalisation; a second row reports "within ±₹1" (arithmetic-consistent) | offline + e2e |
+| MT-6 | Link precision / recall | precision = correct automatic or confirmed links / automatic links; recall = expected links found (auto or suggested) / expected; auto and suggested reported separately | truth pair (source, PO) | offline + e2e |
+| MT-7 | Reconciliation decision accuracy | cases whose status equals truth / scored cases, with a confusion matrix | Tier S only | e2e |
+| MT-8 | Critical false-accept | auto-accepted (reached L1 without a person) values that are wrong / auto-accepted values; also per document | critical fields; HZ-5 | offline + shadow + e2e |
+| MT-9 | False-reject | (a) correct candidates dropped or excluded by a check / correct candidates; (b) documents sent to review whose critical fields are all correct / documents | review burden | offline + e2e |
+| MT-10 | Unsupported-value rate | answered values not found in folded OCR text / answered values (an upper bound on invention: OCR can miss real values) | D74: 11/256 for v4 | offline |
+| MT-11 | Duplicate detection | duplicates caught / expected duplicates; false duplicates; extra documents | existing bench | offline + e2e |
+| MT-12 | Excel export correctness | workbook cells equal expected / cells checked (Summary, case rows, ledger columns) | Tier S expected values; Home KPI = Summary parity (exists, D28) | e2e |
+| MT-13 | End-to-end app accuracy | MT-1/4/6/7/12 measured on the **persisted** current version through the running stack | upload → ingest → Qwen → merge → map → reconcile → export | e2e |
+| MT-14 | Trusted-but-wrong | wrong values at confidence ≥ 0.98 | exists | offline |
+| MT-15 | LLM coverage | documents with a usable Qwen answer / eligible documents | includes unavailable and cap failures | offline + e2e |
+| MT-16 | Latency and tokens | p50/p95 per call and per document; tokens in/out | recorded, not judged (D72) | offline |
+| MT-17 | Repeat and epoch variance | fields whose normalised value changes between reads on the same server epoch | cross-epoch changes reported separately | offline |
+
+*Offline* = bench from stored or fresh server reads. *E2E* = the running stack after AC-INT1 (RG-9).
+
+### 5.3 Regression gate (run on every change that can touch extraction, merge, linking or reconciliation)
+
+1. **Flag-off identity.** Default bench `report_hash`, `vision_hash` and `consensus_hash` equal the frozen pre-change values (synthetic guard `d054b29d…/822e366e…/cca27c5e…` and the real-set hash `09115aa2…` for the rules path).
+2. **Hard zeros** HZ-1 … HZ-6: bench exits non-zero on any.
+3. **Offline suites**: unit, property, scenarios, parsers; `lint-imports`, core purity, rules hash, engine/consensus/parser version guards (§4.12).
+4. **DEV-CORE paired comparison** against the frozen baseline: any critical-field group lower by ≥ 2 fields, or any new accepted-wrong value, blocks the change until explained.
+5. **Held-out** only at PH4/PH7 or the escalation decision.
+6. Server-dependent runs carry a same-day control and the canary digest; runs from different server epochs are not compared.
+7. The report prints counts with denominators, never document text.
+
+### 5.4 What can be proven at each truth-set size
+
+| Claim | ~5 complete sets only | + Tier H (80) | + Tier S (8–10 sets, ≥ 4 held-out) |
+|---|---|---|---|
+| Hard zeros hold | point evidence; "0 in N" with bound 3/N | same, N larger | same + links |
+| Per-field accuracy ≥ 95% (critical IDs, totals) | no (n ≤ 59) | yes at zero errors (n = 80), else escalate to 110 | yes |
+| Pooled critical-field ≥ 97% | no | yes if ≥ 125 pooled values with zero errors, or ≥ 185 with one | yes |
+| Auto-accept thresholds (DP-L1) | no | per field type once n ≥ the DP-L1 requirement | yes |
+| Line accuracy ≥ 95% | only the dev lines (n ≈ 110–120 per cell) | not covered (header-only) | dev + Tier S lines |
+| Link recall ≥ 95% | no (10 pairs) | no | indicative (≈ 20 pairs); counts reported |
+| Reconciliation and export accuracy | no | no | yes, on Tier S |
 
 ---
 
-## 6. Identity, re-scans, duplicates, bundles
+## 6. Phases
 
-- **Bundles (AC-3)**: classify every page (invoice, PO, GRN, e-way bill, annexure/terms, other) by title keywords plus layout, and by vision when consented. Split pages into documents at type changes or document-number changes, using "Page x of y" continuity. A file uploaded to the invoice zone that contains PO/GRN pages gets a "split this file?" prompt (default: suggest split, never silently merge). An e-way bill for another document stays attached as evidence only (existing `ATTACHED_EWAY_BILL_OTHER_DOCUMENT`).
-- **Document identity (AC-8)**: the natural key uses **verified** fields only. Before verification, identity comes from the file SHA plus a **page image perceptual hash** plus a **content fingerprint** (grand total, date, multiset of line amounts, supplier PAN if verified). A re-scan whose fingerprint matches an existing document becomes a new version of that document, not a new document. A conflict check makes sure it never overwrites a human-verified version silently (the open "rescan overwrites clean version" policy).
-- **Duplicates**: add fingerprint-based suspicion that works even when the vendor or number was misread: same total ± ₹1, date within N days, and the document number equal after look-alike folding, or the same line-amount multiset. Duplicates go to `DUP_SUSPECTED`, so a person decides, and they keep consuming balance (OQ-5).
+Each phase lists entry and exit criteria. Interim numbers marked *proposed* are pre-registered per experiment, never fitted afterwards; the contract numbers (§2.2) are the final gate. Every phase ends with: the regression gate (§5.3), a decision-log entry, and an update of §0.
 
----
-
-## 7. AI guardrails and privacy
-
-- **Vision reader contract**: the model returns each field with `page`, `bbox`, `as_printed` text (no normalisation by the model) and `role` for parties (supplier / buyer / ship-to). Handwritten marks go in a separate `annotations[]` list, never into printed fields. `null` means not visible. The model never computes totals.
-- **Grounding** moves from "quote appears in OCR text" (H1) to: the bbox lies on the page, a Tesseract re-read of that crop agrees (gives L1) or does not (gives L2/L3), and all validators pass.
-- **Hard rejects**: buyer GSTIN as supplier, invalid checksum, tax type against the state rule, numbers that break arithmetic that the OCR numbers satisfy, values on a page that does not exist.
-- **Determinism and cost**: responses are cached by `(page image hash, schema version, model)`, so re-runs and the benchmark are stable and free. A per-document page cap and a monthly budget are owner-set (D-8).
-- **Privacy**: before sending a page image, black out regions that OCR word boxes identify as bank account, IFSC, phone, e-mail or signatures (reusing the H1 redaction categories on word positions). GSTINs stay visible. This is best-effort, and the residual risk is stated in the consent text. Only the paid API tier with `store=False` is used, and calls go through the existing gate, consent, limits and ledger.
-- The PDF sandbox has no network access, so vision runs **asynchronously in the ai-worker**: parse locally → version v1 (unverified) → vision job → consensus job → version v2 (verified, or still in the verify queue). This is the same queue pattern as H1–H4.
-- **Built in AC-5 (D37):** hook `h6_vision`, chosen per workspace in the AI consent flow (it replaces H1 for that workspace); pages rendered and masked in the PDF sandbox by the general worker and handed to the AI worker through the transient `document_page_image` bytes; images only (no OCR text) so the reading stays independent; one box per field and per line row; every value checked by `reconbench_core/extraction/vision.py` with the hard rejects above; suggestions only. The crop re-read and L1/L2/L3 levels are AC-6.
-- **AC-5b follow-up (D38):** first owner bench on `gemini-3.5-flash-lite` read headers well (141/166, no OCR × vision agreement on a wrong value) but almost no line rows (1/77). `vision.schema.v2` makes the line description required and prompt v2 asks for each row's amount and quantity as printed; the bench and probe now show why a call failed (Google's error text, or status + tokens + row/loop counts, never values) and score handwritten-reference recall (a truth-loader bug had kept it at 0/0). The output cap stays 16,384 until the next run shows whether answers are cut by it.
+| Phase | Entry | Tasks | Exit criteria (numbers) |
+|---|---|---|---|
+| **PH1 Measurement and integrity** | this plan approved | WI-EV3, WI-D5 (protocol + first batch), WI-T1, WI-INT0 | (1) one gate command reproduces 302/373 (rules, `scanfix-truth-2.json` hash `470682236b6d`) and 275/313 (Qwen, `ev2-e5-v4-ctl.json` answers, `--network none`) with identical hashes; (2) MT-1 … MT-17 implemented with unit tests on synthetic truth; (3) WI-T1 closed; (4) WI-INT0 root cause written with a reproducible check; (5) labelling protocol accepted by the owner and ≥ 25 Tier H invoices double-labelled with ≥ 95% agreement on critical fields (disagreements adjudicated) |
+| **PH2 Qwen reading quality** (dev set) | PH1 gate command; server reachable; per-run approval recorded | WI-BE8, WI-V1, WI-V2, WI-Q1, WI-Q2, WI-Q3, close WI-EV2, WI-OPS1 | *proposed*: all 39 dev PDFs have a usable answer (0 lost to the output cap); dev headers ≥ 92% (≥ 288/313) with accepted-wrong 0; scan-page line amount ≥ 85% (≥ 105/123), quantity and rate ≥ 80%; WI-Q1 verdict recorded against its target; marketplace 5/5 with 0 side effects; handwritten recall reported; WI-EV2 matrix filled; arbitration `arb.v1` drafted from dev |
+| **PH3 Reliability and deployment ladder** | AC-INT1a complete (backup, tested restore, dry-run 0024→0027 on a copy) | WI-OPS2, WI-OPS3, WI-BE9, AC-INT1b, AC-LIVE-S, WI-FE1, WI-FE3, WI-D3 | RG-1 … RG-6 verified on the running stack in shadow; WI-INT0 closed; canary running ≥ 7 days with an epoch record; shadow ≥ 14 days **and** ≥ 100 shadow comparisons (a back-fill of the 40 live documents counts); shadow writes 0 rows to documents (test); outage drill (server blocked ≥ 10 min): documents flagged, no queue pile-up, hard zeros 0 |
+| **PH4 Merge** | PH2 and PH3 exits; DP-L1 numbers decided; Tier H ≥ 80 labelled and frozen | WI-G3, WI-BE7a/b/c, WI-FE2, AC-LIVE-M | on held-out Tier H: each claimed critical field has n ≥ 73 and a 95% lower bound ≥ 95% (zero errors, or the +30 escalation); pooled critical ≥ 97%; `critical_false_accept` 0; flag-off bench hash identical; merge enabled only for field types that pass, all others stay suggestions; lines and links: target met or gap reported with n |
+| **PH5 Matching and identity** (parallel with PH2–PH4) | none | WI-D4, WI-D6, AC-8b, AC-9b, AC-10a/b | links ≥ 7/10 on dev with 0 false auto and 0 false suggestions (WI-D4); then on held-out Tier S: recall reported with counts (target 95%), false auto 0; AC-8b extras and missed duplicates at an owner-accepted level; B6/B10 closed |
+| **PH6 Hygiene and optional** | none | WI-EV0, Gemini arms E1–E4, AC-12, WI-QR1, AC-7c, FP DP-3 | each item closed or recorded as skipped by the owner |
+| **PH7 = AC-11 Real-set E2E and Phase 4 exit gate** | PH4 and PH5 exits | AC-11 | hard zeros 0 at end-to-end level; a full real month or Tier S through the running app with MT-13 reported; export parity MT-12; the main plan's Phase 4 exit gate items (SCN-01 … 20, `make demo`, real-month demo, carried decisions, [`gates/phase-4.md`](gates/phase-4.md)) closed or carried with named owners; every target met or its gap reported per field with n |
 
 ---
 
-## 8. Benchmark harness (AC-0, used by every phase)
+## 7. Task cards
 
-- **Truth v2 format** (local only, `work/accuracy-truth/*.json`): a list of **sets**, each with documents (file, page range, type, header fields, lines) plus expected vendor, expected links (invoice→PO/GRN, GRN→PO), expected duplicates and expected recon status. It extends `work/extraction-truth/invoices.json`.
-- `scripts/accuracy_bench.py` builds on `scripts/measure_extraction.py`. It runs extraction offline (`parse_pdf_isolated`), then vendor resolution, linking (`resolve_links`), duplicates and the recon engine on the pure core, with no database needed. Reader C uses only the local response cache unless the owner passes `--allow-provider`.
-- **Report**: per field and doc type (correct / wrong / missing / flagged), false-safe count, auto-verified rate, fields-to-touch per document, link precision and recall, vendor correctness, duplicate recall, recon status agreement. It prints summary metrics only, never document text.
-- **Gate**: any non-zero hard metric (§1) fails the phase. A decision-log entry records the before/after numbers (no real values).
-- **CI**: synthetic only. Add rendered "scan-like" synthetic invoices (rotation, noise, look-alikes, bundles, no-PO sets) and recorded fake vision responses, so the logic is regression-tested without real documents or provider calls.
-- **Truth set needed from the owner (D-7)**: there is currently **no complete PO + GRN + invoice set**. At least 15–20 complete sets are needed, including sets without a PO number, handwritten refs, multi-page invoices, a bundle and a re-scan pair. To reduce effort, the bench can prefill truth from the extraction output and the owner only corrects it.
+Card fields: **Status** · **Size** (one session unless split) · **Deps** · **Owner approval** (Y = needs an explicit go, N = no). Done work is not carded; it is in §13 with its decision ID. Every card that calls the server needs a go and a budget logged in the decision log first (vLLM budgets are set by the engineer, one go per run; Gemini budgets stay with the owner). No task commits, pushes or opens a PR unless the owner asks.
 
-### 8.1 Running the bench (built in AC-0)
+### 7.1 Measurement
 
-- Samples go in `work/accuracy-samples/` and the truth file in `work/accuracy-truth/truth.json` (both git-ignored).
-- `make accuracy-bench` runs `scripts/accuracy_bench.py` in the worker image (same Tesseract/OCRmyPDF as the app) with the working tree mounted and `--network none`. Extra flags go in `BENCH_ARGS`, for example `BENCH_ARGS="--details"` (per-document outcome labels), `--refresh` (ignore the reader cache), `--prefill work/accuracy-truth/draft.json` (draft truth for files that have none yet; the owner corrects it), `--out work/accuracy-reports/<name>.json`.
-- Reader outputs are cached in `work/accuracy-cache/` by file bytes, parser hints, extraction code, engine version and OCR tool versions. A change to extraction code re-reads the files; a change to vendor, mapping or reconciliation code re-uses the cache.
-- One run = one fresh workspace in truth-file order: real parsers → `document_natural_key` identity (a re-upload with the same key is a new version) → vendor anchors as `_ensure_gstin_anchors` does them, then `resolve_vendors` → `resolve_links` (GRNs first) → `evaluate_components` with the app's config and the truth file's `buyer_entities`.
-- Exit code 1 when any §1 hard metric is non-zero. The report hash is stable across re-runs.
+#### WI-D5 — Truth set v3: Tier H and Tier S, labelling protocol, dev/held-out split
+**Open** · L (owner time; several sessions of tooling) · Deps: none · Approval: **Y** (collection and labelling are the owner's)
+- **Problem / evidence:** 26 truth documents, 2 complete sets: four critical fields (doc no., date, GSTIN, refs) cannot be proven ≥ 95% (§3.2, §3.4); no held-out data exist; the old targets (15–20 sets, then ~5) conflict (O-1 replaces both).
+- **Approach:**
+  1. Counts-only tally of truth entries by type (closes the "~18 invoices" unverified item).
+  2. Truth format `reconbench-accuracy-truth/v3`: v2 plus `tier` (`H`/`S`), `split` (`dev`/`heldout`), per-source `scan_type` (`digital|searchable_scan|scan_clean|scan_tilted|scan_rotated|phone_photo|low_dpi`), `handwritten`, a pseudonymous `vendor_ref`, per-line `uom` (Tier S); Tier H documents are header-only (lines not scored). The bench accepts v2 and v3.
+  3. Collect to the quotas in §5.1 (80 invoices; 8–10 sets).
+  4. **Labelling protocol.** Labeller A (Finance) enters each Tier H field from the page image in a form that shows no extraction output (no prefill; the older "prefill then correct" habit invites automation bias and would inflate accuracy). Allowed entries: value as printed, "not present", "illegible". Labeller B independently labels the critical fields of the first 25 invoices in full, then a random ≥ 25% sample, plus every field where the system and label A disagree. A–B disagreements are adjudicated by the owner and the agreement rate is recorded (target ≥ 95% on critical fields). "Illegible" fields leave the denominator and are counted separately. A label error found later is corrected by a logged change and every dependent result is re-run. Tier S keeps the v2 process (links, status, lines) with the same two-person review (main plan 6.1).
+  5. **Split.** Held-out membership is drawn by vendor and a recorded random seed **before** any system run; ≥ 1/3 of held-out invoices come from vendors absent from DEV-CORE; Tier S held-out ≥ 4 new sets. The file SHA-256 is written to the decision log when frozen; a later change needs the owner's approval and retires dependent evidence.
+  6. **Escalation.** If a claimed field shows ≥ 1 error on held-out, collect +30 invoices and re-evaluate (n = 110 for a 95% bound with one error).
+- **Files:** `scripts/accuracy_bench.py` (`load_truth`), new `scripts/truth_tally.py` (counts only), `work/accuracy-truth/` (private).
+- **Acceptance:** loader tests on synthetic v3 files; Tier H ≥ 80 invoices with quotas met; double-label agreement report; split frozen with its hash; Tier S ≥ 8 sets with the §5.1 scenarios.
+- **Risk / rollback:** labelling effort; truth stays in `work/`. **Impact:** makes every target claimable (§5.4).
 
-Truth v2 rules: a field key that is absent is **unknown** and not scored; `null` means **known to be absent** (an extracted value then counts as wrong). `po_refs` holds printed PO references only; marketplace order numbers and handwritten refs are kept as `marketplace_order_no` / `annotation_refs` (not scored until AC-5/AC-9). A file can be a source of several truth documents (a bundle), and a truth document can have several source files (copies and re-scans).
+#### WI-EV3 — Metric suite and regression gate
+**Open** · M–L (split in two sessions if needed: metrics, then gate/export) · Deps: none · Approval: **Y** (running local benches, no network)
+- **Problem:** MT-2, MT-3, MT-5, MT-8, MT-9, MT-12, MT-13, MT-15, MT-17 are not computed; per-field tables with Wilson bounds are hand-built; no single gate command.
+- **Approach:** implement MT-1 … MT-17 as defined in §5.2; add `critical_false_accept` (HZ-5) and server-epoch fields to report meta; add `scripts/accuracy_gate.py` (+ `make accuracy-gate`) that runs §5.3 steps 1–4 and prints the §3.2 table; export metric reads the generated workbook and the Tier S expected values; record any difference between the bench's current scoring and §5.2.
+- **Files:** `scripts/accuracy_bench.py`, `scripts/accuracy_vision_eval.py`, new `scripts/accuracy_gate.py`, `Makefile`, tests under `backend/tests/unit/test_accuracy_*.py`.
+- **Acceptance:** PH1 exit (1) and (2); default report hash unchanged when no new flag is given; synthetic tests for every metric (including Wilson, rule of three).
+- **Risk / rollback:** none to runtime (scripts only); revert files. **Impact:** a trustworthy pass/fail for every later task.
 
-Metric definitions:
+#### WI-EV0 — Offline re-score of stored Gemini answers (optional)
+**Open, low priority** · S–M · Deps: none · Approval: Y (local run)
+Fills the Gemini per-scan-type and per-cell gaps (audit §4) from `work/accuracy-cache/vision`. Only worthwhile if Gemini arms E1–E4 are pursued; the stored answers need `--vision-cache-compat v1` (D63) and may no longer map after D59–D61. Stop and report if 0 answers map.
 
-| Metric | Definition |
+### 7.2 Integration, diagnosis and the live switch
+
+#### WI-T1 — `test_ai_h1::test_ai_first_suggests_for_a_clean_pdf…` fails
+**Open** · S · Deps: disposable PG · Approval: N (test-only)
+- **Problem / evidence:** failing since before D62 and still open at D66 (D62: "rules-only clean PDF now `needs_verification`"); the test asserts `expected["version"]["needs_verification"] is False` for the rules-only world (`backend/tests/integration/test_ai_h1.py:858`).
+- **Hypothesis (unverified):** the test world has no buyer entities, so WI-3 (D59/D60) marks the supplier GSTIN unverified and the document `needs_verification` (`BUYER_ENTITIES_NOT_CONFIGURED`), which is the intended behaviour.
+- **Approach:** run the test on a disposable PG; print the document's warning codes and review fields; confirm or refute. If confirmed, either give the fixture's workspace a buyer entity that differs from the synthetic supplier (preferred) or change the expectation with a comment naming D59; no production change. If refuted, find the root cause before touching anything.
+- **Files:** `backend/tests/integration/test_ai_h1.py` (and its fixtures).
+- **Acceptance:** `test_ai_h1.py` passes (14/14) on PG; root cause and the chosen fix are in the decision-log entry; default bench hash unchanged.
+- **Risk:** hiding a real rules-path regression; mitigated by the root-cause step and the bench hash. **Impact:** removes a standing red test from the integration group.
+
+#### WI-INT0 — Why `consensus_run` = 0 on live data
+**Open** · S–M · Deps: none for the read-only part · Approval: Y for any run on a copy; **AC-INT1 cannot be called done until this is closed**
+- **Problem / evidence:** live DB has 26 `h6_vision` requests with `apply_outcome = applied` (9 Oct), `auto_verify_field_types` set, the consensus code present in the ai-worker image (`ai/consensus.py`, wired at `ai/worker/main.py:83`), and 0 `consensus_run` rows; all 47 page-image rows are purged.
+- **Hypotheses:** (a) the 9 Oct containers ran code older than the wiring (images were rebuilt on 16 Oct); (b) `consensus_enqueue` raised inside `begin_nested` and was swallowed (`ai/worker/hooks/vision.py:152-…`); (c) `apply` returned `applied` through the `subject is None or consensus_enqueue is None` branch (`:146-151`); (d) `enqueue_consensus_run` found an existing row or returned early; (e) rows were never created because the answers were not `accepted` (but `applied` was recorded).
+- **Approach (read-only first):** read the exact `apply` branches; read `ai_request`/`ai_call_log` columns for the 26 rows (counts and states only); check container log retention; then on a **disposable copy** (AC-INT1a) replay one stored answer through `VisionReadHandler.apply` with consensus wired and observe the run row. Add a regression test and a monitor ("vision answers applied > 0 and `consensus_run` = 0 after N minutes" raises a status).
+- **Acceptance:** one hypothesis proven by evidence (not by elimination); a test or monitor in place; in live, the first applied answer after AC-LIVE-M produces a `consensus_run` row (RG-6/RG-7).
+- **Risk:** none read-only. **Impact:** tells us whether AC-6 works in the app at all (auto-verified rate on live data is unknown).
+
+#### AC-INT1a — Backup, tested restore and dry-run migration
+**Open** · M · Deps: none · Approval: **Y** (O-8 conditions)
+- **Approach:** (1) full backup of the live Postgres (`pg_dump -Fc`) and a copy of the object-store data; (2) **tested restore** into a disposable Postgres (port ≠ 15432) with row counts per table, `alembic_version`, and an application read check compared to live; (3) **dry-run `0024 → 0027`** on that copy with the tree's migrations (safety, drift, catalog, index, decision, table-count checks; contract counts 51 tables, 40 enums, 28 triggers, 170 FKs, 264 ACLs, 7 default privileges per D66); (4) record durations, the fixed-forward rule (rollback = restore the dump) and the exact image digests to tag as the previous state; (5) read the effective `RB_AI_EXTERNAL_CALLS` value.
+- **Acceptance:** restore matches live counts; dry-run passes all checks; written runbook in the decision log. No live change.
+- **Risk:** a backup taken while another session writes; mitigated by stating the time and re-checking counts. **Rollback:** discard the copy.
+
+#### AC-INT1b — Rebuild, migrate, configure, verify the ladder in shadow
+**Open** · M · Deps: AC-INT1a, WI-INT0 root cause, WI-OPS1, WI-BE9 decision (O-13) · Approval: **Y**
+- **Approach:** announce a window (other sessions share the containers); tag the previous image IDs; build from the approved tree and record its snapshot hash; the `setup` service applies `0025–0027`; set `RB_AI_VLLM_CALLS=synthetic_only` first, then `enabled` after the real-page go; forward `RB_AI_VLLM_ENDPOINTS` (and `RB_AI_VLLM_BASE_URL` if still required) and `RB_VISION_READER` in `compose.yaml`; owner creates the first release tag (§4.12); verify RG-1 … RG-5 with commands and file evidence; hold the shadow switch for AC-LIVE-S.
+- **Acceptance:** all five rungs evidenced; `lint-imports`/schema checks green on the live DB; row counts of documents and versions unchanged; previous images still tagged for rollback.
+- **Risk:** migrating the live DB; compose edit; **Rollback:** restore the dump and retag the previous images. **Impact:** the first time any D62–D77 code runs in the app.
+
+#### WI-BE9 — Gemini off while Qwen vision is on
+**Open (new finding)** · M · Deps: O-13 · Approval: Y (decision)
+- **Problem / evidence:** `HOOKS_BY_MODE` keeps H1–H4 in both active modes (`ai/consent.py:44-49`); disabling Gemini with a non-`rules_only` mode is refused with `gemini_required` (`ai/settings_service.py:943-953`); `rules_only` means no LLM at all. So Qwen vision cannot run with Gemini fully off, and the consent text would still describe Gemini.
+- **Options (O-13):** (A) per-hook switches stored on `ai_setting`; (B, recommended) a new mode `vision_only` that has only the vision hook, allows the Gemini card disabled and the key removed; (C) leave H2–H4 on Gemini (rejected: contradicts "Gemini off").
+- **Files:** `ai/consent.py`, `ai/settings_service.py`, migration for the new `ai_mode` value, `db/metadata.py`, web settings.
+- **Acceptance:** a workspace with Gemini disabled and no Gemini key runs Qwen vision; no request ever names provider `gemini` (test); legacy consent fingerprints for existing modes byte-identical (test); consent text names only the company server.
+- **Risk:** consent/migration surface; **Rollback:** switch the workspace back to `ai_assisted`. **Impact:** makes "Gemini off" true.
+
+#### AC-LIVE-S — Move the live app from Gemini `ai_first` to Qwen: shadow
+**Open** · S–M · Deps: AC-INT1b, WI-OPS2, WI-FE1 (or API-only), consent · Approval: **Y** (consent, back-fill budget)
+- **What changes:** workspace → provider card `vllm` (allow-listed URL, model `qwen3.5:9b`), `reader_strategy = shadow`, `primary_reader = vllm`; the owner re-consents (new fingerprint). **Gemini page-image reading stops** (shadow leaves `vision_enabled` false, so H6-Gemini no longer sends images); Gemini text hooks keep running exactly as today until WI-BE9. Existing stored Gemini suggestions stay visible until their 30-day cache expiry, labelled with provider.
+- **The 40 live documents:** untouched. A new back-fill command (this task builds it, `python -m reconbench_app.ai.backfill_shadow --workspace <uuid>`) renders pages from the stored source file and enqueues **shadow-only** reads for current versions; it does not re-parse (no new `document_version`; `PARSER_VERSION` unchanged). Budget: the number of page images the dry-run reports (≈ 67 if the live files equal the bench PDFs: unverified), one read, concurrency 1, logged before the go.
+- **Evidence:** `reader_comparison` rows and the shadow report (labels and counts only); MT-15 coverage; outage behaviour.
+- **Acceptance:** PH3 shadow exit; `document_version`, `doc_line`, `consensus_run`, `vendor`, `link` row counts unchanged by shadow (D66 test, plus a live before/after); no Gemini image call after the switch.
+- **Rollback:** `reader_strategy = off` (or `single` + `gemini` to restore today's behaviour). **Impact:** real-traffic evidence with zero risk to documents.
+
+#### AC-LIVE-M — Move the live app to Qwen: merge
+**Open** · M · Deps: PH4 prerequisites (WI-BE7a/b/c, WI-G3, WI-FE2, DP-L1 numbers, shadow criteria met, WI-BE9) · Approval: **Y**
+- **What changes:** deployment flag `RB_AI_LLM_MERGE=enabled`, workspace `apply_mode = merge`, `reader_strategy = single`, `primary_reader = vllm`; `auto_verify_field_types` limited to the field types that pass DP-L1 (starting from none); Gemini off (WI-BE9) — its key removed from the live workspace, kept only as an optional bench arm (`BENCH_GEMINI_KEY`).
+- **The 40 live documents:** keep their current OCR/rules versions; nothing re-merges automatically. A per-workspace, owner-triggered "re-read existing documents" merges the shadow results into **new versions only where** the current version has no manual correction and no verified field the merge would change (MG-7); otherwise the merged reading is stored as an alternative. A before/after report (counts: fields filled, changed, flagged `LLM_DISAGREEMENT`, vendors/links/cases changed) is written to the decision log. No Gemini value is ever merged.
+- **Acceptance:** RG-7 and RG-8 on the 40 documents; first applied answer produces a `consensus_run` (WI-INT0); end-to-end bench hard zeros 0; export parity MT-12.
+- **Rollback:** `apply_mode = suggest`, `RB_AI_LLM_MERGE=disabled`, and the "restore OCR version" action (appends a copy of the OCR version; history is never deleted).
+
+### 7.3 Qwen reading quality
+
+#### WI-BE8 — Cropped two-pass reading for dense pages
+**Open (Stage 4 first)** · M (split: crop render + core mapping; then bench arm) · Deps: none (design in §4.5) · Approval: **Y** (server run)
+- **Problem / evidence:** dense pages hit the answer cap under every prompt (16 failed calls: S06-INV, S08-INV, S09-PO, S10-PO, S02-INV recurring); line qty/rate/amount each miss ≈ 33 rows; §4.5.
+- **Approach:** per §4.5. The prompt stays `vision.prompt.v4.qwen`; the band context ("page p, band k of m, kind") goes in the per-call user text, not the system prompt, so only the strategy changes.
+- **Files:** `extraction/vision_pages.py` (crop render from masked bytes; mask boxes inside a crop stay black), `document_page_image.render.crop`, `reconbench_core/extraction/vision.py` (`map_crop_box`, `merge_regions`), `ai/worker/hooks/vision.py`, `scripts/accuracy_vision.py` (`--vision-strategy crops` is accepted by argparse and refused today).
+- **Acceptance:** §4.5 (a)–(d); dense subset all usable; scan-page line amount +5 points over the same-day control; non-dense documents not lower by > 1 field in total; wrong-when-answered not above the control; unit tests for `map_crop_box`, overlap dedupe, the no-heading fallback, and masked-crop integrity.
+- **Risk:** latency and call count; boxes mapping errors; **Rollback:** strategy `full`. **Impact (hypothesis):** recovers the lost rows; target line amount ≥ 105/123.
+
+#### WI-EV2 — Close the decision matrix
+**Open** · S–M · Deps: WI-BE8 result, D77 control · Approval: Y for any further server run
+- **Evidence now:** arms run: E0 (rules + OCR), E5 (Qwen, thinking off, card sampling, full pages; v4, v5, v6, v7). Not run: E1–E4 (Gemini; PH6, optional), E7 (presence penalty 0; optional single-variable), E9 (Qwen3-VL; not planned), E8 (crops; WI-BE8). Policies P1–P4 and `dual_agree` are out of scope (D62–D67).
+- **Pre-registered rule (a Qwen arm may be the primary reader on scans):** (a) scan-page headers ≥ OCR + 5 points and lines ≥ OCR + 10 points; (b) simulated false-safe 0 and LLM×OCR agree-wrong ≤ 1; (c) wrong-when-answered ≤ 2% of answered critical fields; (d) latency not judged until accuracy is decided (D72); (e) GPU time within the owner's budget; (f) variance within one server epoch ≤ 2%.
+- **Current verdict (E5 v4 + D77):** (a) headers +10.6 points, lines mixed (amount −3.3, quantity +12.3, rate +15.3, description −11.1, HSN −20.0), so **not yet met**; (b) 0 and 0; (c) 3/278 = 1.1% (critical 0/141); (f) 0 within an epoch.
+- **Acceptance:** matrix filled with every arm's header, line, agree-wrong, wrong-when-answered, unreadable→null, latency, cost/GPU, variance, verdict; the choice recorded in the decision log.
+
+#### WI-V1 — Validators for Qwen values: HSN shape and reference existence
+**Open** · M · Deps: WI-EV3 · Approval: N (code), Y (bench)
+- **Problem:** 3 wrong Qwen HSN values and 3 missing/wrong refs have no independent check; V-HSN exists only on the OCR table path.
+- **Approach:** `check_reading` marks `check_failed:hsn_shape` (4/6/8-digit HSN, 6-digit SAC starting `99`); V-REFEXIST: the app layer supplies the workspace's open same-vendor PO/GRN numbers to consensus, which records "reference exists" as validator evidence (never creates a link). Bump `CONSENSUS_VERSION` (O-5).
+- **Files:** `reconbench_core/extraction/vision.py`, `consensus.py`, `reconbench_app/ai/consensus.py`, tests.
+- **Acceptance:** synthetic unit/property tests; dev: no correct HSN flagged (false-reject 0), references ≥ 13/15 with 0 wrong accepted; flag-off hash identical.
+- **Risk:** over-flagging; **Rollback:** revert the two checks. **Impact:** a deterministic gate for HSN and references; precondition for refs reaching AA.
+
+#### WI-V2 — Marketplace order number post-check (D72 lifted for this task only, O-4)
+**Open** · S · Deps: none · Approval: given (O-4); Stage 4 authorisation needed
+- **Problem / evidence:** v4 misses 5/5 marketplace order numbers (they come back as `po_ref`/`sales_order_ref`); the v7 prompt sentence fixed them but caused 4 accepted-wrong values on S03-INV (D77).
+- **Approach:** in the pure check, rename a `po_ref`/`sales_order_ref` to `marketplace_order_ref` when its label contains "Order" **and** the value matches `^\d{3}-\d{7}-\d{7}$` (pattern generalised only if Tier H shows other marketplace formats). No prompt change.
+- **Acceptance:** dev 5/5; the field-level diff against the v4 control equals exactly the 5 renames; property test: never renames without both conditions. Bump `CONSENSUS_VERSION`.
+- **Risk:** a rule on extracted values (the freeze concern); bounded by the two conditions. **Rollback:** remove the rename.
+
+#### WI-Q1 — Line description lever (RULE-DESC stays until this passes)
+**Open** · M · Deps: WI-BE8 (table crops) · Approval: Y (server run)
+- **Problem:** 40 of 108 descriptions are wrong, not missing (extra text merged, 34); v5's wording made it worse (47 → 39).
+- **Approach:** hypothesis: reading the description column band per row removes the merged text. Single variable on top of the BE8 table crop: description band instruction. Control: same-day crops run without it.
+- **Acceptance (pre-registered):** correct ≥ 65/108 and wrong ≤ 20 on dev; confirmation on held-out Tier S lines before RULE-DESC can be lifted (and then only through DP-L1).
+- **Impact:** description is the weakest field (43.5%); also feeds linking by item similarity.
+
+#### WI-Q2 — Handwritten-reference lever (hints only)
+**Open** · M · Deps: WI-BE8 (optional margin band) · Approval: Y
+- **Problem:** 1/18 found on v4; 17 are not in the OCR text; v6 found 6/16 but lost CGST/SGST.
+- **Approach:** annotations-rule-only variant on v4 (single rule), then a margin-band crop if BE8 passed. Output is `annotations[]`, never a field (MG-9); used as link hints.
+- **Acceptance:** recall ≥ 6/16 with no header group net < −1 and accepted-wrong 0.
+
+#### WI-Q3 — Own-number lever for `doc_no`
+**Open** · S–M · Deps: none · Approval: Y
+- **Problem:** 7 of the 12 pre-D77 doc-no nulls were the document's own number returned as `po_ref`/`grn_ref` (D75).
+- **Approach:** single-rule prompt variant on v4 ("`doc_no` is this document's own number; on a PO its PO number, on a GRN its GRN number"), same-day control.
+- **Acceptance:** doc no. ≥ 36/39, other groups net ≥ −1, accepted-wrong 0 (§4.7 rule).
+
+### 7.4 Server reliability
+
+#### WI-OPS1 — Company vLLM server checklist and smoke test
+**Open** · S + owner · Deps: none (smoke 3 needs the v4 prompt/schema, available) · Approval: Y (server calls, synthetic data)
+- **Deliver:** `docs/ops/vllm-server.md` (facts of §3.5 kept current, plus the checklist answers: vLLM version, reasoning parser, default thinking, JSON-schema support, max images per prompt, pixel limit, request logging and retention, shared-GPU rules) and `scripts/local_llm_smoke.py` (synthetic page only; counts printed). Smoke: models, text JSON with thinking off, synthetic image at 1,600/1,280/1,024 px (decides `box_order` and image size), and reachability from the compose `ai-worker` container.
+- **Acceptance:** every checklist item answered or marked UNKNOWN; smoke 2–4 pass; chosen image size and `box_order` written into the `vision_openai_compat` registry entry.
+
+#### WI-OPS2 — Health, backoff, fallback in operation
+**Open** · S–M · Deps: AC-INT1b for the live check · Approval: N
+- **Approach:** §4.8: `LOCAL_PROVIDER_DOWN` status and Home banner; one deferred retry after 60 s; skip new requests while health has failed > 5 min; document-level `LLM_UNAVAILABLE` flag visible in review; per-card limits applied (D65 stored but not applied); ledger in-flight per provider.
+- **Acceptance:** unit tests with a fake clock; integration with a mock server returning 503 then 200; outage drill in PH3.
+
+#### WI-OPS3 — Canary and server-epoch detection
+**Open (new)** · S · Deps: WI-OPS1 · Approval: Y (synthetic server calls)
+- **Problem:** the server changed once (16 → 17 Oct) without notice; cached answers and comparisons would silently mix epochs.
+- **Approach:** a daily job reads 3 synthetic pages; stores the answer digest, `/version`, `/models` fingerprint in `ai_call_log` provenance; a change opens a new "epoch" record; the gate (§5.3 step 6) and reports refuse cross-epoch comparisons.
+- **Acceptance:** unit tests; ≥ 7 days of canary records; an induced digest change opens an epoch.
+
+### 7.5 User interface
+
+#### WI-FE1 — AI settings with two provider cards
+**Open** · L → split **FE1a** (provider cards, key handling, test connection, URL/model, limits) and **FE1b** (reader strategy, consent per provider, usage, states, phone width) · Deps: WI-BE3 (done), WI-BE9 for the Gemini-off wording · Approval: N
+Details as in the retired LLM plan: a Settings-page section for `ai.manage` users; react-hook-form + Zod + TanStack Query; types from `generated.ts`; the key field never pre-filled and never rendered after save; vLLM key hidden unless "server needs a key"; strategy off/shadow/single with disabled options explained; consent block that blocks save until accepted when the fingerprint changes; 375 px layout. **Acceptance:** WI-FE3 tests; Playwright screenshot at 375 px.
+
+#### WI-FE3 — Frontend tests and type-drift guard
+**Open** · M · Deps: FE1 · Approval: N
+Vitest: Zod rules, key never rendered, strategy options and reasons, non-manager read-only. Playwright: both providers, test connection, strategy change, 375 px. Replace hand-written `web/src/api/ai.ts` interfaces with aliases of `generated.ts` so `make check-static` covers them.
+
+#### WI-FE2 — Review UI: provenance and reader disagreement
+**Open** · M · Deps: WI-BE6 (done), WI-BE7 · Approval: N
+Suggestions carry `origin {provider, model, prompt, schema}`; a provenance chip; side-by-side OCR/Qwen values with "use this value" (draft only; save through `PUT /documents/{id}/correction`); filter "LLM disagreement"; no route can set `verified`. **Acceptance:** Vitest and Playwright disagreement case.
+
+### 7.6 Merge
+
+#### WI-G3 — Regression guards and rollback switches
+**Open** · S–M · Deps: WI-BE7a design · Approval: N
+Scenario tests in `tests/scenarios/test_hard_zero_guards.py`: an LLM-only value is never verified; two LLM readings never verify; a merged version never replaces a manual correction (MG-7); a non-allow-listed endpoint never receives a request; shadow writes no document rows; `page_conflict` never leads (MG-3); the review flag stays unless Σ lines = taxable (MG-4); a grown `po_refs` set is not auto-accepted (MG-5); descriptions never auto-accepted (MG-6). Property test on `merge_readings`. Switches default off: `RB_AI_VLLM_CALLS`, `RB_AI_LLM_MERGE`, `reader_strategy`, `apply_mode`; `RB_VISION_READER=vision_gemini` restores the old reader set.
+
+#### WI-BE7a — Merge core (pure) with the D77 guards
+**Open (Stage 4 third)** · M · Deps: WI-EV2 decision, WI-V1 · Approval: N (code)
+`reconbench_core/extraction/llm_merge.py`: `merge_readings(ocr, readings, policy) -> MergeResult` per §4.10 with guards MG-1 … MG-9 and `arb.v1` as data. **Acceptance:** unit test per rule; property tests (no `source=AI` field with only LLM readers has confidence ≥ 0.70 or `verified`; values of manual/verified fields never change); the S08-INV pattern (all critical accepted, lines wrong) keeps its review flag; the bench `--vision-primary-sim` equals the app merge on synthetic documents.
+
+#### WI-BE7b — Merge job and persistence
+**Open** · M · Deps: BE7a, AC-INT1b (integration) · Approval: N
+Procrastinate task `merge_llm_reading` in the **general** worker (no SDK import; import-linter test) queued from the ai-worker's `apply` when `apply_mode = merge`; appends the new `document_version` with per-field evidence `{origin, schema_version, reader_params_digest, ai_request_id, page, box}`; becomes current only under MG-7; vendor/link/recon recompute as for any version. **Acceptance:** integration tests on PG: cached answer → new flagged version; manual correction present → alternative only; consensus raises verification only for opted-in field types; flag off → bench hash identical.
+
+#### WI-BE7c — Flag, rollback and restore
+**Open** · S–M · Deps: BE7b · Approval: N
+`RB_AI_LLM_MERGE` deployment flag (default `disabled`) so `apply_mode = merge` stops returning 422 `merge_not_enabled` only when enabled; "restore OCR version" action; audit events. **Acceptance:** tests for each switch; a restore appends a copy and deletes nothing.
+
+### 7.7 Matching and identity
+
+#### WI-D4 — Link-recall regression (AC-9a)
+**Open** · M · Deps: none · Approval: N
+- **Problem:** recall fell 7/10 → 3/10 with identical extraction; lost: S09-GRN→PO, S14/S15/S16-GRN→PO (diagnosis §5.7). Cause in `reconbench_core/mapping/links.py` unknown.
+- **Approach:** add `--link-trace` to the bench (labels per expected pair: candidate generated, vendor gate, anchor type, verified, ambiguity count, final state); find the failing stage; fix there; keep D-6.
+- **Acceptance:** links ≥ 7/10 on dev, `FALSE_AUTO_LINKS` 0, `false_suggestions` 0.
+
+#### WI-D6 — AC-3 page-split integration defect
+**Open** · S–M · Deps: disposable PG · Approval: N
+`MultipleResultsFound` in `_current()` with duplicate PO rows (D57: 2 failures in `test_page_split.py`). **Acceptance:** `test_page_split.py` all pass; no other integration group regresses.
+
+#### AC-8b — Identity and re-scan guard: close or accept
+**Implemented, gate open** · M–L · Deps: better extraction (PH2/PH4) · Approval: Y (accept a residual)
+Bench: 8 extra documents (GRN 3, PO 3, invoice 2), 0 wrong merges, duplicates 0 of 2 caught (D55). Re-measure on Qwen-merged documents; close the gap or record the owner-accepted residual (the exit says "re-scans make 0 new documents").
+
+#### AC-9b — Matching v2 app/UI
+**Not started** · M · Deps: WI-D4 · Approval: N
+Score explanation in `mapping_service.py`, one-click confirm of suggestions (a generic Confirm exists, `MappingPage.tsx:244`); fixes B6 (confirmed content link becomes suggested again after a changed input hash) and B10 (manual evidence text differs).
+
+#### AC-10a/b — Vendor profile (learning loop)
+**Not started** · L → **AC-10a** core profile (number pattern, where the PO ref sits, tax type, usual items; V-DOCNO-PATTERN) and **AC-10b** table/app/UI · Deps: AC-9b, AC-7 corrections, Tier H · Approval: N
+Migration for `vendor_profile`; used as validators and hints; the look-alike exception for a document number only when the vendor pattern accepts it. **Acceptance:** repeat-vendor documents need fewer touches (MT, measured on Tier H unseen-vs-seen vendors).
+
+#### AC-12 — GSTR-2B cross-check (optional)
+**Not started, optional** · M–L · Deps: D-10, AC-6b · Approval: Y (D-10)
+Import the monthly GSTR-2B JSON; a matching row makes supplier GSTIN, number, date and values L0; also lists invoices never received.
+
+### 7.8 Hygiene, owner items and the gate
+
+#### WI-D3 — Version guards and bulk re-parse
+**Open** · S–M · Deps: none · Approval: N
+Parser-hash guard (`PARSER_VERSION` must change when extraction code changes; `scripts/check_parser_version.py`, `PARSER_HASH`), extended to vision-check/consensus code (`CONSENSUS_VERSION`), comparison base = last release tag (§4.12), retroactive `consensus.v2` bump for D77, `reparse_outdated` CLI (dry run by default, owner-triggered per workspace, FP DP-8). **Acceptance:** CI fails when guarded code changes without a bump; an integration test proves a re-parse keeps manual corrections and verified refs.
+
+#### WI-QR1 — E-invoice NIC public key (owner)
+**Open** · S · Approval: Y — signed QR is L0 only when `RB_EINVOICE_PUBLIC_KEY_FILE` is supplied (bench shows `signed 0`, D34). Check whether the app has it.
+
+#### AC-7c — Verify-screen timing (owner)
+**Open** · S · Approval: Y — time the "verify a document in under 30 s" target (D50: never timed).
+
+#### AC-11 — Real-set end-to-end and the Phase 4 exit gate (= PH7)
+**Not started** · L + owner · Deps: PH4, PH5 · Approval: Y
+Runs the full path in the live stack on Tier S (and a full real month if available); reports MT-13; closes or carries B4 (payment terms not applied to the due date), B12 (Vendor Summary counts Needs Review inside Exceptions; auth tests not in hosted CI; flaky 10k-row frame budget) and the main plan's exit-gate items; updates [`gates/phase-4.md`](gates/phase-4.md).
+
+### 7.9 Frozen work (D72) and its unfreeze condition
+
+| ID | Content | Status | Unfreeze condition |
+|---|---|---|---|
+| WI-D1 (= fix-plan WI-4 … 7) | doc-no/PO-ref choice, vendor name, totals/tax, line tables for the rules reader | **frozen** | owner reopens, with Tier H showing OCR-side misses that Qwen cannot cover |
+| WI-D2 (= fix-plan WI-8 steps 3, 4, 5) | force OCR on poor/tiled text layers; > 20-page warning; UTF-8 decode | **frozen** | same |
+| WI-D2b (= fix-plan WI-8 steps 1, 2) | low-confidence header/table re-OCR; GSTIN checksum-guided repair (target: 4 GSTINs missing in both readers) | **frozen** | same; step 2 first if GSTIN misses persist on Tier H |
+| WI-D2c (= fix-plan WI-8 step 6) | skew > 5°, dewarp, upscale | **frozen, conditional** | ≥ 5 documents of that scan type in Tier H with OCR-absent misses |
+
+---
+
+## 8. Dependencies, critical path, parallel tracks
+
+```
+WI-D5 (owner, longest) ───────────────────────────────────────────────────────────┐ held-out for PH4, PH7
+WI-EV3 ─► gate command for everything
+WI-T1 ──┐
+WI-INT0 (read-only) ─► replay on copy ─┐
+AC-INT1a ──────────────────────────────┴► AC-INT1b ─► AC-LIVE-S ─► shadow ≥ 14 d, ≥ 100 ─┐
+WI-OPS1 ─► WI-OPS3 ;  WI-OPS2 ─────────────────────────┘                                     │
+WI-BE9 (O-13) ─────────────────────────────► AC-INT1b / AC-LIVE-M                            │
+WI-BE8 ─► WI-EV2 close ─► WI-BE7a ─► BE7b ─► BE7c ─► WI-G3 ─────────────────────────────► AC-LIVE-M ─► AC-11 (PH7)
+WI-V1, WI-V2 ─► WI-BE7a ;  WI-Q1/Q2/Q3 (after BE8) ─► arb.v1
+WI-D4 ─► AC-9b ─► AC-10a/b ;  WI-D6 ;  AC-8b (after PH2/PH4) ──────────────────────────► AC-11
+WI-D3 ─► (release tag base) before AC-INT1b ;  WI-FE1/FE3 ─► WI-FE2 ─► AC-LIVE-M
+```
+
+- **Critical path:** WI-BE8 → WI-EV2 → WI-BE7a/b/c → (AC-INT1a → AC-INT1b → AC-LIVE-S → shadow period) → AC-LIVE-M → AC-11. The longest chain outside engineering is WI-D5 (80 labelled invoices), which gates every per-field claim at PH4.
+- **Parallel tracks:** A truth (WI-D5); B Qwen quality (BE8 → Q1/Q2/Q3, V1, V2); C integration (T1, INT0, INT1a, OPS1–3); D matching (D4, D6, 9b, 8b, 10); E UI (FE1, FE3, FE2); F hygiene (D3, QR1, 7c).
+- **One writer per file area.** BE8, V1, V2 and BE7a all touch `reconbench_core/extraction/vision.py`; they run one after another, not in parallel. A task that shares a file with another running session's work stops and reports.
+- **Why AC-INT1 sits before WI-BE7b:** shadow mode and the merge job cannot run on images that lack the code; WI-BE7a (pure core, flag off) can proceed first.
+
+---
+
+## 9. Owner decisions
+
+### 9.1 Decided on 20 Oct 2026 (recorded in D78)
+
+| ID | Decision |
 |---|---|
-| False-safe document | Not flagged for verification, and a critical field is wrong or unexpected (invoice: number, date, supplier GSTIN, grand total, PO refs; PO: number, date, supplier GSTIN, grand total; GRN: number, date, supplier GSTIN, PO refs), or number/date/grand total is missing, or lines are incomplete or spurious |
-| Trusted-but-wrong field | A wrong value whose confidence is at the verified level (≥ 0.98); diagnostic, feeds AC-1/AC-6 |
-| Fields to touch / to confirm | Touch: wrong, unexpected or missing header values plus wrong/missing line cells and spurious lines. Confirm: correct values below the verified level |
-| Wrong auto-created vendor | A vendor whose GSTIN is a buyer entity or not any truth supplier's, or whose name is a label, GSTIN-shaped, or < 0.80 similar to the truth supplier name |
-| False auto-link | An automatic or confirmed link whose (source, PO) truth pair is not expected; suggestions are counted separately |
-| False Matched | A Matched / Matched-with-flags case whose truth status is different, that belongs to a duplicate copy, or whose invoice has a wrong critical field |
-| Missed / spurious documents | Truth documents in a file that no parsed document was assigned to (for example the PO and GRN pages of a bundle) / parsed documents with no truth document |
-| Extra documents, duplicates | Extra = system documents beyond one per truth document (re-scans that did not collapse into versions); each extra invoice copy should be flagged `duplicate` of the same truth invoice |
+| O-1 | Two-tier truth: Tier H ≈ 80 invoices (header-only), Tier S 8–10 complete sets; ~5 sets = indicative only until then; labelling protocol and split in WI-D5. Arithmetic note: 80 error-free values give a 95.4% lower bound; one error needs 110 (escalation batch planned). |
+| O-2 | Auto-accept thresholds accepted, plus: critical-field auto-accept only when (Qwen and OCR agree) or (a deterministic validator confirms), in addition to the lower-bound threshold, 0 critical wrong and a shadow period. DP-L1 arithmetic corrected (§9.3). |
+| O-3 | D-8 does not block Qwen; it gates Gemini production only. |
+| O-4 | D72 lifted for WI-V2 only; WI-D1/D2 (and D2b/D2c) stay frozen. |
+| O-5 | Version rule: `CONSENSUS_VERSION` (or a check version) for vision/consensus changes; guards compare against the last release tag, not HEAD (§4.12). |
+| O-6 | Qwen down → rules + OCR with a visible flag; no automatic Gemini failover. |
+| O-7 | `audit-llm-extraction.md` is retired after its findings are merged (§4.13, §12, §13); archive copy per Option B. |
+| O-8 | Live rebuild/migration approved only inside AC-INT1: full DB backup, a tested restore, and a dry-run 0024→0027 on a copy first. No rebuild in Stages 2–3. |
+| O-9 | Carried items keep their existing defaults (B4, B12, FP DP-6/7/8, FP DP-4). |
+| Recoverability | Option A′ (docs-only commit, explicit pathspecs, tag `pre-plan-merge-20261020`) **and** Option B (copy to `work/plan-archive-20261020/`). Nothing else is committed. |
+
+### 9.2 Old owner decisions D-1 … D-10 (status)
+
+| ID | Decision | Status |
+|---|---|---|
+| D-1 | Masked page images to Gemini | decided 7 Oct (paid, `store=False`); D39 allows free tier for testing only; moot for production while Gemini is off |
+| D-2 | Machine-verified without a person | decided D42; amended in scope by O-2 |
+| D-3 | AI extraction for PO/GRN | decided 7 Oct (vision reader; suggestions until corrections exist) |
+| D-4 | `buyer_entities` | resolved: configured in the live workspace (1 entity, count only); warning exists (`SettingsPage.tsx:240`) |
+| D-5 | Marketplace vendor rule | decided D36: seller GSTIN is the vendor |
+| D-6 | Non-PO matching | decided: suggestion-only; enforced in AC-9a |
+| D-7 | Truth set 15–20 sets | **superseded by O-1** |
+| D-8 | Vision cost cap (Gemini calls/tokens, GPU time for Qwen) | open; does not block Qwen (O-3); GPU-time budget is the owner's before AC-LIVE-M |
+| D-9 | Bundles: suggest the split | decided D35 |
+| D-10 | GSTR-2B verifier (AC-12) | open, optional |
+
+### 9.3 Open decisions (each with options, recommended default and what stays blocked)
+
+| ID | Decision | Options | Recommended default | Blocked until decided |
+|---|---|---|---|---|
+| DP-L1 | Auto-accept thresholds per field type | (A) lower bound ≥ 95% on held-out, n ≥ 73 error-free (110 with one error), coverage ≥ 50%, critical wrong 0; (B) lower bound ≥ 98%, n ≥ 189 error-free; precision ≥ 99.5% | (A) for first enablement of critical IDs and totals; (B) as the later target for payment-affecting totals. **Correction:** the retired text asked for a 98% bound on "≥ 100 values", which is arithmetically impossible (100 error-free values give 96.3%; 98% needs 189). Shadow agreement is not accuracy: correctness evidence comes only from labelled sets and verify-screen corrections. | any auto-accept, AC-LIVE-M |
+| O-10 | Confirm the O-2 reading: the validator-only path (no OCR agreement) exists only for supplier GSTIN and arithmetic-closed amounts, still needs D42 rules 2, 3, 5 and the gate; it amends D42 rule 1 for those two classes | confirm / narrow to agreement-only | confirm | consensus change in WI-BE7 |
+| O-11 | Shadow period and a circuit breaker | ≥ 14 days and ≥ 100 comparisons; a person correcting an auto-accepted critical field switches that field type's auto-accept off until reviewed | accept both | AC-LIVE-M |
+| O-12 | Tier H quotas (§5.1) | adjust numbers; decide whether phone photos/low-DPI occur in production | as listed | WI-D5 collection |
+| O-13 | How Gemini is turned off (WI-BE9) | (A) per-hook switches; (B) new `vision_only` mode; (C) keep H2–H4 on Gemini | (B) | AC-INT1b wording, AC-LIVE-M |
+| O-14 | Back-fill of the 40 live documents | shadow-only back-fill; none; full re-read after merge | shadow-only back-fill, budget from the dry run, one go and a log entry | AC-LIVE-S |
+| O-15 | First release tag | create at AC-INT1b | yes | version guards (WI-D3) |
+| O-16 | Held-out policy | each look is logged; an item that influenced a rule or prompt is retired | accept | PH4 |
+| O-17 | AC-8b: close the gap or accept the residual (8 extra documents, 2 missed duplicates) | close / accept with numbers | decide after PH4 measurement | AC-8 phase closure, AC-11 |
+| DP-L4 | Approvals per run | standing approval vs one go per run | one go and a log entry per run (vLLM budgets set by the engineer; Gemini budgets by the owner) | each server run |
+| DP-L5 | Gemini tier for production | paid / not used | not used (O-3, O-6) | PH6 arms only |
+| DP-L6 | Pin vLLM image and Qwen revision | pin / record fingerprint | the server is shared, so record `/version`, `/models` and the canary digest (WI-OPS3); pin only if the admin agrees | none |
+| DP-L7 | Default strategy for new workspaces | off / shadow | off; shadow ≥ 14 days before `single` | AC-LIVE-S |
+| DP-L8 | Local model for PO/GRN | yes / no | yes in shadow, same gates | AC-LIVE-M for PO/GRN |
+| DP-L9 | GPU-time budget | owner sets | before AC-LIVE-M | AC-LIVE-M |
+| DP-L10 / FP DP-4 | Is "correctly flagged for a person" acceptable where no reader is sure | yes/no per class | yes for handwriting; decide printed fields after WI-EV2 | AC-11 wording |
+| FP DP-3 | Delete `scripts/measure_extraction.py` (deprecated stub, exit 2) | delete / keep | delete after WI-EV3 gate exists | none |
+| FP DP-6 | Files over 20 pages | support / explicit warning | warning (frozen with WI-D2) | WI-D2 |
+| FP DP-7 | GST slab list (40% missing; seed replaces the parser default; 12/28 kept for old documents) | owner tax policy | owner supplies | GST slab validators |
+| FP DP-8 | Bulk re-parse after a parser bump | per file / bulk per workspace | bulk, owner-triggered | WI-D3 CLI use |
+| B4 / B12 | Payment terms not applied to the due date; Vendor Summary counts Needs Review in Exceptions; auth tests not in hosted CI; flaky 10k-row frame budget | carry to AC-11 | carry | AC-11 |
+
+Answered or superseded earlier decision points: DP-L2 No (two LLMs are one reader kind); DP-L3 resolved (company vLLM server; the owner approved real invoices on 16 Oct, first run recorded in D68); FP DP-1 (Gemini experiment) → PH6 optional arms; FP DP-2 done (buyer entities set); FP DP-5 → O-1; FP DP-9 = D-8.
 
 ---
 
-## 9. Phases (one per session, in this order)
+## 10. Risks, red-team results, operations
 
-Each phase ends with: unit, property, scenario and golden suites green; the benchmark run; a decision-log entry; and a memory update. Effort: **high** for AC-5, AC-6 and AC-9; medium or high for the rest.
+### 10.1 Red-team findings (Pass 4) and what changed in the plan
 
-| Phase | Scope | Main files | Exit criteria |
+| ID | Attack | Finding | Fix in this plan |
 |---|---|---|---|
-| **AC-0** Benchmark + baseline | Truth v2 format, `accuracy_bench.py`, reader cache, baseline report. Owner sets `buyer_entities` (D-4). | `scripts/`, `work/accuracy-truth/` | Baseline numbers recorded; the bench re-runs deterministically |
-| **AC-1** Deterministic guards | Party roles and the buyer-entity guard in extraction; label-as-value reject; ₹-glyph rule; Tally PO/GRN labels (Voucher No., Dated, Reference No. & Date, Supplier (Bill from), Order No.); GRN reference capture; GST state/slab validator; amount in words everywhere; XML item name (not category) + GRN serials; `buyer_entities` in `ParserHints` | `reconbench_core/extraction/{extract,values,verify}.py`, `parsers/{pdf,xml}.py`, `ingestion._parser_hints`, `vendor_resolution._ensure_gstin_anchors` | Header accuracy up; false-safe 0; buyer GSTIN never a vendor |
-| **AC-2** e-invoice QR | Decode the signed QR from page images (seller/buyer GSTIN, number, date, total, IRN, item count, main HSN). Verify the signature if the NIC public key is configured; otherwise treat the result as L1 together with the OCR reading. Dependency review (G-24) for the decoder library | new `reconbench_core/extraction/qr.py` (pure payload parsing), `extraction/local_hybrid.py` (image decode), `pipeline.py` | Invoices with a QR get L0/L1 header fields |
-| **AC-3** Page split + classify | Page types and document boundaries; multi-document `ParseResult` from the layout path; split prompt for wrong-zone files | new `reconbench_core/extraction/pages.py`, `pipeline.layout_parse`, `ingestion` type-mismatch flow, upload UI | A bundle gives correct separate documents; no document mixes pages |
-| **AC-4** Vendor hygiene | Verified-only vendor creation; vendor-pending state; name quality; marketplace rule (D-5); cleanup script + merge/assign UI | `vendor_resolution.py`, `reconbench_core/mapping/vendor.py`, `api/mapping.py`, `MappingPage.tsx` | 0 junk vendors after re-ingesting the real set |
-| **AC-5** Vision reader | Engine adapter `vision_gemini` behind the D17 port (async in the ai-worker); image input to Gemini (first an owner-run probe for the SDK image form and cost per page, like D31); schema with bbox, as-printed text, roles and annotations; image masking; invoice + PO + GRN (D-3); consent text update | `extraction/engine.py`, `ai/contracts.py`, `ai/worker/gemini.py`, `ai/redaction.py`, new hook, `ai/consent.py`, `ai/limits.py` | Benchmark with cached responses; vision alone measured per field |
-| **AC-6** Consensus + verify loop | Pure consensus module, trust levels L0–L3, crop re-read cross-check, targeted re-read loop, new verified version, per-field provenance (migration on evidence), D18 → D18b | new `reconbench_core/extraction/consensus.py`, `pipeline.py`, `ingestion._persist_parse`, `db/metadata.py` + migration | Auto-verified rate up, false-safe 0, H1 "suggestion only" replaced for L0/L1 fields (D-2) |
-| **AC-7** Verify screen v2 | Show only unverified fields, with the source crop beside each value; A/B pick for conflicts; keyboard-first flow; split confirm; vendor-pending assign; local export of corrections into truth | `IngestionPreview.tsx`, `PdfPreview.tsx`, `api/review.py`, Playwright spec | Owner can verify a document in under 30 s; corrections reach the bench |
-| **AC-8** Identity + duplicates | Verified-only natural key; perceptual page hash + content fingerprint; re-scan = new version with a conflict guard; fingerprint duplicate suspicion | `ingestion._upsert_document`, `recon/engine._duplicate_map`, migration | Re-scans make 0 new documents; real duplicates flagged |
-| **AC-9** Matching v2 | New anchors (handwritten, GRN↔invoice no, challan, marketplace order); multi-signal scorer with explanation; invoice↔GRN edge; period-wide assignment; one-click confirm (D-6) | `reconbench_core/mapping/links.py`, `align/`, `mapping_service.py`, `MappingPage.tsx` | Link recall ≥ 95%, false auto-links 0 on the benchmark |
-| **AC-10** Learning loop | Vendor profile from verified documents: number pattern, where the PO ref sits, tax type, usual items. Used as validators and extraction hints; aliases learned from confirmations | new `vendor_profile` table + core module | Repeat-vendor documents need fewer touches |
-| **AC-11** Real-set E2E + exit gate | Full upload → verify → map → recon on the truth sets; then the Phase 4 exit gate | (none) | §1 hard metrics 0; targets met or the gap reported |
+| RT-1 | A wrong value silently accepted through the validator-only GSTIN path (a checksum-valid GSTIN of the ship-to or a transporter) | real risk | V-GSTIN includes role, state consistency and equality with the linked PO vendor's GSTIN; crop re-read and the lower-bound gate still apply; O-10 asks the owner to confirm the path |
+| RT-2 | Qwen and OCR agree and are both wrong (shared look-alike) | agree-wrong 0 in 243 on the dev set but D41 had one (Gemini vendor name) | look-alike guard stays; crop re-read; agree-wrong tracked on Tier H; DP-L1 bounds apply to accepted values |
+| RT-3 | Review cleared because the rules' lines are wrong (S08-INV) | seen (D75(e)) | MG-4 |
+| RT-4 | Order date taken as document date | seen under v5–v7 | OCR leads dates; disagreement never auto-accepts |
+| RT-5 | Hallucinated buyer GSTIN (v7, S03-INV) | seen | V-NOTINOCR + crop re-read; MT-10 tracked |
+| RT-6 | Cached answers from before a server change mixed with later ones | one drift event documented | WI-OPS3 epochs; no cross-epoch comparisons |
+| RT-7 | Merged description text accepted | 40 wrong of 108 | RULE-DESC, MG-6 |
+| RT-8 | A change regresses the rules/OCR path | the conflict rule (D77) also changes Gemini suggestions; WI-V1/V2 act only on LLM values | flag-off hash identity (§5.3); version guards |
+| RT-9 | Targets that cannot be measured with the current truth set | per-field proof for 4 critical fields plus vendor name; links (10 pairs); reconciliation and export accuracy; descriptions on held-out; auto-verified rate in the app (consensus never ran) | §5.4, WI-D5, WI-INT0, MT-12/13; shadow agreement is not accuracy |
+| RT-10 | A task too big for one session | WI-BE7, WI-FE1, AC-10, AC-INT1, AC-LIVE, WI-EV3, WI-BE8 | split into BE7a/b/c, FE1a/b, AC-10a/b, INT1a/b, LIVE-S/M, EV3 (two sessions), BE8 (two steps) |
+| RT-11 | Qwen down for a week | no fallback signal today | §4.8: documents processed on rules + OCR and flagged; queue skip after 5 min; `llm_coverage` metric; owner chooses back-fill |
+| RT-12 | An old item dropped | fix-plan WI-8 steps 1, 2, 6; WI-3 steps 4–5; AC-6c exit; DP-L1 arithmetic; D43; AC-L labels | all homed in §13 (steps 1, 2, 6 → WI-D2b/D2c frozen; WI-3 steps 4–5 → done and verified) |
+| RT-13 | Migrating the live database; shared containers | real | O-8 conditions, AC-INT1a, announced window, previous images retagged |
+| RT-14 | Privacy: pages leave the machine | masked images go to the company server over the VPN; owner approved real invoices on 16 Oct (retired LLM plan §0.5; D68 records the first run) | consent re-fingerprint, endpoint allowlist, no key in responses |
+| RT-15 | Truth labels biased by the system's output | prefill invites agreement | blind labelling for Tier H (WI-D5) |
+| RT-16 | Held-out contamination | any tuning on it | O-16, look log, retirement rule |
+| RT-17 | DP-L1 internally inconsistent | confirmed | corrected (§9.3) |
+| RT-18 | Version guard vacuous (HEAD 0.1.4 vs tree 0.1.7) | confirmed | release-tag base (§4.12, WI-D3) |
+| RT-19 | "Gemini off" impossible while Qwen vision is on | confirmed in code | WI-BE9 |
+| RT-20 | Consensus never ran on live data | confirmed | WI-INT0 |
+| RT-21 | A standing red test hides a rules-path regression | open since D62 | WI-T1 |
 
-AC-0 to AC-4 are **local only** and need no AI approval, so they can start immediately. AC-5 onward needs D-1/D-2/D-3 (D-1 and D-3 decided 7 Oct 2026; D-2 is AC-6's).
+### 10.2 Risks
 
-Optional AC-12, **GSTR-2B cross-check** (D-10): import the monthly GSTR-2B JSON downloaded from the GST portal (no external call). It lists supplier GSTIN, invoice number, date and values filed by the supplier, so a matching row turns those header fields into L0 and also exposes invoices that were never received. It arrives late (around the 14th of the next month), so it serves the month-end check, not day-one entry.
+| Risk | Mitigation |
+|---|---|
+| Shared vLLM server is slow, changes or disappears | canary and epochs; fallback; health banner; no dependence on latency for correctness |
+| Qwen gains come with hidden regressions on another field | one variable per run, same-day control, paired field-group comparison (§4.7) |
+| Over-flagging from new validators raises review load | MT-9(b) tracked; false-reject must be 0 on dev for V-HSN |
+| Small samples mislead | counts with denominators; Wilson bounds; claim rules (§2.2) |
+| Many uncommitted changes lost | Option A′ snapshot + Option B archive for plan docs; the code tree still needs an owner decision to commit |
+| Consent text drifts from behaviour | fingerprint tests pinned per variant (D65–D77) |
+
+### 10.3 Operations and monitoring (from AC-LIVE-S onwards)
+
+Metrics: `llm_coverage`, share of documents flagged `LLM_UNAVAILABLE`, vLLM health and last-failure code counts, cap-hit rate, drop reasons, per-field Qwen×OCR agreement, p50/p95 latency, tokens, canary digest and epoch, consensus runs vs applied vision answers (must be equal), `critical_false_accept` (a person correcting an auto-accepted field is an incident), reviews cleared without Σ lines = taxable (must be 0). Status codes appear in Settings and Home; counts only, never values.
+
+### 10.4 Stale artefacts to know about
+
+- `CODEBASE_CONTEXT.md` (repo root, untracked) is a **9 Oct snapshot** and predates D59–D78 (it still says link recall 3/10 as its P1 item and does not mention the vLLM path). It is not edited by this consolidation; regenerate it or treat it as history.
+- [`gates/phase-4.md`](gates/phase-4.md) was last edited 5 Oct and does not reflect the accuracy work; Stage 3 adds a pointer section only.
+- The auto-memory note for D77 ("in progress") was stale; D77 is complete.
+
+### 10.5 Accepted gap
+
+B11: same-type scanned documents inside one file split only on "Page 1 of N" (D35). Not planned; revisit if Tier H contains such a file.
 
 ---
 
-## 10. Owner decisions needed
+## 11. Session protocol
 
-| ID | Decision | Needed before | Recommendation |
+- Each session reads §0, §2 and the task card; does one task (or a documented split); updates §0 (status line, last decision) and appends **one** entry to [`decision-log.md`](decision-log.md) (counts only, no real values); the plan never copies the main plan's task list.
+- Never `git add`, commit, push, stash, reset, clean, switch branches or open pull requests unless the owner asks; the tree holds weeks of uncommitted work shared with other sessions.
+- [`ReconBench_*.md`](ReconBench_Implementation_Plan.md) are read-only. `work/` is private: read bench reports for counts and labels only; never print or copy truth, samples, cached answers or page images; tests use synthetic data only.
+- Never edit `.env` or `deploy/secrets/**`; read `.env` key names only. No model call or benchmark without the go and budget logged in the decision log first. Stop and report when a check fails for an environmental reason, an owner decision is needed, or a flag-off hash changes unexpectedly.
+- Verification order: static checks, offline suites, migration safety (if a migration), disposable-PG integration groups, OpenAPI regeneration (if an API changed), web checks, bench. Never claim a check that was not run.
+
+**Runbook (Windows host; PowerShell has no `&&`; `uv` is not on PATH; use the venv tools; Node 24 for web via `C:\Users\jainm\AppData\Local\nvm\v24.19.0`).**
+
+| Purpose | Command (from the repo root) |
+|---|---|
+| Static | `backend\.venv\Scripts\ruff.exe check reconbench_core reconbench_app tests ..\scripts` (from `backend\`); `mypy.exe --strict`; `lint-imports.exe`; `python scripts\check_core_purity.py`; `python scripts\check_rules_hash.py`; `python scripts\check_engine_version.py --base-ref <release-tag>` |
+| Offline tests | `backend\.venv\Scripts\python.exe -m pytest backend\tests\unit backend\tests\property backend\tests\scenarios backend\tests\parsers -q -p no:cacheprovider` (never collect `unit` and `integration` together) |
+| Disposable PG | `docker run -d --rm --name rb-ephemeral-pg -e POSTGRES_PASSWORD=phase2-ephemeral-local-only -p 127.0.0.1:15499:5432 --tmpfs /var/lib/postgresql/data postgres:16.15-bookworm`, then `alembic upgrade head`, `seed_database.py`, queue schema; migration-safety checks on a second cluster at 15497. **Never point anything at port 15432 (live).** |
+| Rules hash update | after any core `.py` change: write `calculate_rules_hash()` to `backend/reconbench_core/RULES_HASH` (64 hex + LF) |
+| Bench (no network) | `MSYS_NO_PATHCONV=1 make accuracy-bench BENCH_ARGS="--workers 1 --out work/accuracy-reports/<name>.json"`; cached vLLM replay needs `--vision-provider vllm --vision-prompt-variant qwen` and a model matching the stored answers |
+| Bench (company vLLM, network on) | `RB_AI_VLLM_ENDPOINTS=http://43.242.226.63/vllm/v1 make accuracy-bench-vllm BENCH_ARGS="--vision-base-url http://43.242.226.63/vllm/v1 --max-provider-pages <N> --vision-eval --workers 1 --out /app/work/accuracy-reports/<name>.json"` (needs the go first) |
+| OpenAPI + types | `scripts\export_openapi.py`, `npm run api:generate --prefix web`, `git diff --stat -- backend/openapi.json web/src/api/generated.ts` |
+| Migration checklist | revision file with fixed-forward `downgrade`; mirror in `db/metadata.py`; workspace-owned tables get `workspace_id`; append-only triggers where required; CI previous-schema revision = head − 1; add the head to the phase 4.11/4.13 revision set; PG-SAFETY with contract regeneration at head **before** seed and queue schema; add an entry to `schema-errata.md` |
+
+Decision-log template: heading `## Dnn — <task id> <title> (<date>)`, two to four sentences, a decision table, a before/after table with report name and first 12 hash characters, checks run and not run, open items.
+
+---
+
+## 12. Experiment history (what was tried and why it stopped)
+
+| Experiment | Decision | Result | Outcome |
 |---|---|---|---|
-| D-1 | Standing approval to send masked **page images** of real documents to Gemini (paid tier, `store=False`), or use a local vision model instead | AC-5 | **Decided 7 Oct 2026:** yes, Gemini with masking; the key comes through the existing AI settings flow; the port stays open for a local model (D37) |
-| D-2 | AI-read values may become **verified without a person** when an independent reader or a deterministic check confirms them (changes D11/D21 "suggestion only") | AC-6 | **Decided 8 Oct 2026 (D42):** yes per field, only with two independent readers agreeing, all deterministic validators passing and the crop re-read agreeing; never for handwritten marks, new vendor names or corrected fields; switched on per field type only after the bench shows 0 false-safe, behind a workspace setting (off by default) |
-| D-3 | AI extraction for **PO/GRN PDFs** (closes D13) | AC-5 | **Decided 7 Oct 2026:** yes for the vision reader (read-only suggestions until AC-7 adds PO/GRN corrections); XML stays the preferred source (D37) |
-| D-4 | `buyer_entities`: all own GSTINs and legal names | AC-1 | Set it in Settings before AC-1 |
-| D-5 | Marketplace vendor rule (seller GSTIN = vendor?) | AC-4 | **Decided 7 Oct 2026:** the seller GSTIN printed on the invoice is the vendor (D36) |
-| D-6 | Non-PO matching: suggestion-only or automatic after proof | AC-9 | Suggestion-only first |
-| D-7 | Truth set: at least 15–20 complete PO+GRN+invoice sets, labelled | AC-0 (can grow later) | Bench prefills; owner corrects |
-| D-8 | Vision cost cap (pages per document, monthly budget, model) | AC-5 | Open: probe measured about 1,100 input tokens per page (`image_tokens_estimate` now 1,200, D38); the proposal follows the AC-5b bench run (output tokens per document) and the owner's price and monthly volume. The limits file already takes `h6_vision.max_pages` and `per_month_calls/tokens` (D37) |
-| D-9 | Bundles: auto-split or ask | AC-3 | **Decided 7 Oct 2026:** suggest the split, person confirms (D35) |
-| D-10 | Use GSTR-2B as a verifier (AC-12) | optional | Yes, if 2B JSON is available |
+| Gemini vision v1/v2/v3, flash-lite, free tier | D37, D38, D40, D41 | v3: headers 271/313, lines 80/123, handwritten 6/18, agree-wrong 1 | kept as comparison; production use not decided (D-1/D-8) |
+| Qwen E5 smoke, 5 documents | D68 | headers 72/80 vs 62/80 on 9 documents; 1 call at the output cap | superseded |
+| Qwen E5 on 15 more invoices | D69, D70 | p95 244 s; 3 invoices unusable (strict parse) | led to D71, D73 |
+| Page answers kept; re-read of 3 invoices | D71 | still unusable: empty `text`, over-long description | led to the tolerant parse and length limits |
+| Answer-format root fix (tolerant per-item parse + `minLength`/`maxLength` in the vLLM schema) | D73 | all 3 invoices usable; D74 fresh read: 0 schema drops, headers 255/313 | **kept** |
+| D72 focus decision | D72 | OCR + rules frozen except as second reader and fallback; order (1) format, (2) prompt, (3) repeats, (4) truth, (5) merge | in force (O-4 lifts WI-V2 only) |
+| Prompt `v5.qwen` | D75 | headers −6, every line cell lower, 4 accepted-wrong values; marketplace 5/5, handwritten 4/18 | **rejected** |
+| Prompt `v6.qwen` + repeats ×3 | D76 | accepted-wrong 1 (`doc_date`), lower amount/rate/qty; handwritten 6/16; marketplace 5/5; the server answered identical requests identically within a day | **rejected**; v4 stays |
+| Prompt `v7.qwen` (marketplace sentence only) | D77 | one sentence changed the whole page: 4 accepted-wrong buyer GSTINs on S03-INV | **rejected**; led to WI-V2 |
+| Cross-page conflict resolution | D77 | headers 255 → 275/313; accepted-wrong 0; 23 values marked `page_conflict` | **kept** (needs the version bump of §4.12) |
+| `dual_agree`, LLM × LLM agreement, `secondary_reader`, policies P3/P4, merge rule 3, DP-L2 | owner decision §0.6 of the retired LLM plan (16 Oct); D62–D67 | two LLMs are one reader kind; no request calls both providers | **rejected / out of scope** |
+| Frozen scan rules WI-4 … 8 (fix-plan) | D72 | not started | **frozen** (§7.9) |
+| Gemini experiment WI-12 and vision-primary WI-13 (fix-plan) | superseded by AC-L (D62–D67) | — | **superseded**; Gemini arms E1–E4 optional (PH6) |
+| Qwen weights/quantisation arm E6, Qwen3-VL arm E9 | plan-llm | the server's weights are not ours to change; E9 unplanned | **dropped** |
 
 ---
 
-## 11. Non-goals and risks
+## 13. Traceability appendix
 
-- Reading arbitrary handwriting as **verified** is a non-goal. Handwritten refs remain hints that must agree with data.
-- Vision models can be confidently wrong. The validators, independence rule and benchmark gate are the defence, not the model's own confidence.
-- A small truth set makes the percentages noisy. Report counts as well as rates, and grow the set with every verify-screen correction.
-- Open items found earlier that are outside this plan but should not be lost: the D22 `recon_case_aged_ck` violation (aged + GRN_PENDING), the `ai_request.ai_cache_id` NULL linkage seen in the AI-first test, and payment terms not wired to the due date (D27).
+Every ID-bearing item of every merged document has a row. Status words: **done (Dnn)** · **open → task** · **frozen** · **superseded by …** · **rejected (Dnn)** · **kept (evidence)** · **carried** (stays an owner item). Source documents (all archived and listed in §14): AP = old `accuracy-plan.md` (this file's previous version); IP = `accuracy-implementation-plan.md`; FP = `accuracy-fix-plan-scan-extraction.md`; PG = `progress-accuracy-plan.md`; PL = `plan-llm-extraction-call.md`; AU = `audit-llm-extraction.md`. `diagnosis-scan-extraction.md` (Dx) is kept as evidence and is cited, not merged.
+
+### 13.0 Notes on numbering and labels
+
+- **D43.** IP lines 3 and 178 cite "decision-log D43" as the entry that wrote the implementation plan. No `D43` heading exists in the log (D42 → D44). It is a numbering gap: the plan it names was written on 8 Oct and sits in the file itself, so no content was lost. This plan does not cite D43 and does not reuse the number; old entries are not edited.
+- **AC-L phase labels.** The decision log labels work as "AC-L0 part 1" (D62: WI-G2, G1, BE1), "AC-L0 part 2" (D63: BE5, BE4), "AC-L0 part 3" (D64: BE2), "AC-L0 part 4" (D65: BE3), "AC-L0 part 5" (D66: BE6) and "AC-L1 part 1" (D67: EV1). PL §1 puts BE5, G1, G2, BE1 and EV0 in AC-L0, BE2/BE3/BE4/BE6 and WI-OPS/FE1 in AC-L1, EV1/EV2/BE8 in AC-L2, and BE7/FE2/G3 in AC-L3; D77's remaining-work table follows PL. **This plan uses the PL labels** (AC-L0 … AC-L3) and refers to work by task ID, so the D62–D67 headings are read as dates and task IDs, not as phase membership.
+- **Reading old status lines.** AP line 3 stops at D58, PG describes the tree as of 16 Oct ("107 entries, no change after 9 Oct"), and IP §1.1 stops at D58; all three are superseded by §0 and §3.
+
+### 13.1 AP — old `accuracy-plan.md`
+
+| Old ID | Title | New location / status |
+|---|---|---|
+| R1 | handwriting never read; ₹ glyph; rotated page; garbled columns | AC-5 vision done (D37); AC-1 glyph rule done (D33); handwriting remains hints → WI-Q2 |
+| R2 | buyer GSTIN as vendor; label as vendor name | AC-1, AC-4 done (D33, D36) |
+| R3 | O/0 and I/1 in numbers; same scan read differently | AC-6 done (D44–D47); vendor patterns → AC-10a (open) |
+| R4 | totals wrong on non-standard layouts | AC-1 validators done (D33), AC-6 done; rules-side remainder frozen (WI-D1) |
+| R5 | 6-page bundle as one invoice | AC-3 done (D35) |
+| R6 | Tally PO/GRN labels not wired | AC-1, AC-5 done (D33, D37) |
+| R7 | AI invented IGST / kept GSTIN typos / buyer as vendor | AC-1 validators, AC-6 done |
+| R8 | correct AI values rejected by H1 grounding | AC-5/6 box-crop grounding done (D37, D45) |
+| R9 | re-scans create new documents; duplicates missed | AC-8a done (D51); AC-8b open → O-17 |
+| R10 | vendor master polluted | AC-4 done (D36); cleanup run by owner (unverified) |
+| R11 | no PO number means no link | AC-9a implemented (D57–D58); WI-D4; AC-9b |
+| R12 | XML shows category not item; GRN serials dropped | AC-1 done (D33) |
+| AC-0 | benchmark + baseline | done (D32) |
+| AC-1 | deterministic guards | done (D33) |
+| AC-2 | e-invoice QR | done at L1 (D34); L0 needs the NIC key → WI-QR1 |
+| AC-3 | page split + classify | done (D35); integration defect → WI-D6 |
+| AC-4 | vendor hygiene | done (D36) |
+| AC-5, AC-5b | vision reader | done (D37–D41); D-8 open (§9) |
+| AC-6, AC-6a, AC-6b, AC-6c | consensus, crop re-read, opt-in verify loop | 6a done (D44), 6b done (D45), 6c implemented (D46, D47); exit "auto-verified rate up in the app" → WI-INT0, AC-LIVE-M, MT-13; the D59 self-confirmation gap closed by WI-G1 (D62) |
+| AC-7, AC-7a, AC-7b | verify screen | 7a done (D48–D50); 7b implemented, 30 s untimed → AC-7c |
+| AC-8, AC-8a, AC-8b | identity and duplicates | 8a done (D51); 8b implemented, gate open (D52–D55) → AC-8b, O-17 |
+| AC-9, AC-9a, AC-9b | matching v2 | 9a implemented, gate open (D57–D58) → WI-D4; 9b open → AC-9b |
+| AC-10 | learning loop | open → AC-10a/b |
+| AC-11 | real-set E2E + exit gate | open → AC-11 (PH7) |
+| AC-12 | GSTR-2B cross-check (optional) | open, optional → AC-12 |
+| D-1, D-2, D-3, D-4, D-5, D-6, D-7, D-8, D-9, D-10 | owner decisions | §9.2 (D-2 decided D42; D-3 decided 7 Oct; D-5 decided D36; D-9 decided D35) |
+| §1 hard guarantees and targets | false-safe, false auto-link, false Matched, wrong vendor; 98/95/95 | §2.1, §2.2 (HZ-1 … HZ-4 carried; HZ-5, HZ-6 added) |
+| §3 architecture, §3.1 trust levels | L0–L3, Rejected, two rules | §2.3, §4.1 |
+| §3.2 validators | arithmetic tree, GST structure, parties, names, dates, references | §4.4 (existing validators listed; new V-HSN, V-REFEXIST) |
+| §3.3 verify loop | targeted re-read, max 2 rounds, local OCR only (D45, D47) | done (D45–D47); carried as §2.3 rule 3 |
+| §4 matching without a PO number | anchors, provenance, identity score 40/35/25, variance split, period assignment, auto-link policy | AC-9a done (D57–D58); rules carried in §4.9 and the code; AC-9b open |
+| §5 vendor master hygiene | verified-only vendors, marketplace rule, cleanup | done (D36); carried in §2.4 |
+| §6 identity, re-scans, duplicates, bundles | natural key, fingerprints, DUP_SUSPECTED | AC-8a done, AC-8b open |
+| §7 AI guardrails and privacy | vision contract, grounding, hard rejects, cache, masking, async | done (D37–D41); carried in §2.3, §4.8, §4.11 |
+| §8 benchmark harness, §8.1 running the bench | truth v2, `accuracy_bench.py`, reports, metric definitions, hard-metric gate | done (D32); metric definitions carried and extended in §5.2; commands in §11 |
+| §11 non-goals and risks | handwriting not verified; vision can be confidently wrong; small truth set | §1, §10 |
+| §11 loose item: `recon_case_aged_ck` violation | aged GRN_PENDING | fixed (D51; IP B2) |
+| §11 loose item: `ai_request.ai_cache_id` NULL | by design (IP B3) | no change; D44 explains |
+| §11 loose item: payment terms not wired to due date | B4 | carried → AC-11 (§9.3) |
+
+### 13.2 IP — `accuracy-implementation-plan.md`
+
+| Old ID | Title | New location / status |
+|---|---|---|
+| §0.1 rules 1–10 | session rules | §11 |
+| §0.2 machine facts | shell, Python, Node, Docker, `.env`, formatting, test collection, mypy scope | §11 runbook (condensed); the 19-file `ruff format` exception list is **not** copied: re-check with `ruff format --check` before relying on it |
+| §0.3 command blocks | CHK-PY, TEST-OFFLINE, RULES-HASH-UPDATE, PG-UP, INT-TEST, PG-DOWN, PG-SAFETY, CONTRACT-REGEN, OPENAPI, WEB, E2E, BENCH-OFFLINE, BENCH-PROVIDER | §11 runbook (condensed; full text archived, §14) |
+| §0.4 hashes, versions, fingerprints | `RULES_HASH`, `ENGINE_VERSION`, check versions, `PARSER_VERSION`, vision contract, consent fingerprint | §4.12 (rewritten under O-5) |
+| §0.5 decision-log entries | template | §11 |
+| §0.6 common exit order | verification order | §11 |
+| §0.7 migration checklist 1–8 | revision file, metadata mirror, workspace tables, append-only, CI head − 1, revision set, PG-SAFETY, errata | §11 runbook |
+| §1.1 phase state rows | AC-6a … AC-12 | §13.1 |
+| §1.2 bench numbers | 8 Oct bench | superseded by §3 |
+| §1.3 code baseline | tests, schema counts, append-only tables | superseded; schema counts re-checked in AC-INT1a |
+| B1 | `canonicalize_po_number` not idempotent | fixed (D57) |
+| B2 | aged GRN_PENDING violates `recon_case_aged_ck` | fixed (D51) |
+| B3 | `ai_cache_id` NULL | by design (D44) |
+| B4 | payment terms not applied | carried → AC-11 |
+| B5 | CI migration safety built the wrong schema | fixed 8 Oct; repeat per migration (checklist, §11) |
+| B6 | confirmed content link becomes suggested again | open → AC-9b |
+| B7 | OCR-read ref created an auto labeled link | fixed (D57) |
+| B8 | corrections did not re-run vendor/link mapping | fixed (D48, D49) |
+| B9 | lower-quality re-scan replaces a clean version | AC-8b implemented (D52–D55); residual → O-17 |
+| B10 | manual "change" link evidence text differs | open → AC-9b |
+| B11 | same-type scans split only on "Page 1 of N" | accepted gap (§10.5) |
+| B12 | Vendor Summary counts; auth tests not in hosted CI; flaky frame budget | carried → AC-11 |
+| §2 order and sessions | dependency table | superseded by §8 |
+| AC-6a spec: goal, exit criteria 1–5, preconditions | consensus core + shadow bench | done (D44) |
+| AC-6a design c.1 | trust levels as implemented | carried in §2.3 |
+| AC-6a invariants I1, I2, I3, I4, I5, I6 | values never change; L0 untouched; policy off = same object; vision-only never written; order independence; never-automatic names | carried as CI-1 … CI-6 (§2.3), tests in the tree |
+| AC-6a tests 1 – 24 and bench tests 1 – 4 | consensus unit/property tests | present in the tree (`test_consensus_core.py`, `test_accuracy_consensus.py`); done (D44) |
+| AC-6a f–i | verification, risks, size, docs | done (D44) |
+| AC-6b … AC-12 specifics | the file's §3 holds only AC-6a although titled "AC-6 to AC-11"; AC-6b … AC-12 specifications are absent from it | done work is in the tree and D45–D58; open items are carded in §7 |
+
+### 13.3 FP — `accuracy-fix-plan-scan-extraction.md`
+
+| Old ID | Title | New location / status |
+|---|---|---|
+| §0.1 invariants (8) | AI never decides; core pure; SDK only in the ai-worker; sandbox no network; Decimal; D-6; append-only; hard zeros | §1, §2.1, MG-guards; import-linter contracts in code |
+| §0.2 privacy, §0.3 environment, §0.4 baseline | rules, commands, frozen baseline `9cd8137fd7c1` / 302/373 | §11, §3.1 |
+| WI-1 | bench/upload parity, attribution tooling, baseline freeze | done (D59) |
+| WI-2 | test infrastructure and hard-zero guards | done (D59, D61) |
+| WI-3 steps 1–3 | role guard when entities are empty; `BUYER_ENTITIES_NOT_CONFIGURED` warning (`parsers/parties.py:363`) | done (D59, D60) |
+| WI-3 step 4 | Settings readiness warning when buyer entities are empty | **done, verified 20 Oct**: `web/src/pages/SettingsPage.tsx:240`, test `SettingsPage.test.tsx:94` |
+| WI-3 step 5 | owner enters the company's GSTINs | **done, verified 20 Oct**: live config has 1 buyer entity (count only) |
+| WI-4 | doc-no / PO-ref candidate selection | **frozen** (D72) → WI-D1 |
+| WI-5 | vendor name | **frozen** → WI-D1 (Qwen vendor name 39/39, so the need has shifted) |
+| WI-6 | header totals and tax | **frozen** → WI-D1 |
+| WI-7 | line-table extraction | **frozen** → WI-D1 |
+| WI-8 steps 3, 4, 5 | force OCR on poor/tiled layers; > 20 pages; UTF-8 decode | **frozen** → WI-D2 |
+| WI-8 step 1 | low-confidence header/table re-OCR | **frozen** → WI-D2b |
+| WI-8 step 2 | GSTIN checksum-guided repair | **frozen** → WI-D2b (first to unfreeze if GSTIN misses persist) |
+| WI-8 step 6 | skew > 5°, dewarp, upscale | **frozen, conditional** → WI-D2c |
+| WI-9 | parser-version guard and re-parse | open → WI-D3 (extended, §4.12) |
+| WI-10 | link-recall regression | open → WI-D4 |
+| WI-11 | truth-set expansion | open → WI-D5 (replaced by the two-tier design, O-1) |
+| WI-12 | gated Gemini experiment | **superseded by AC-L** (D62–D67); Gemini arms E1–E4 optional in PH6 |
+| WI-13 | vision as primary reader on scans | **superseded by WI-BE7** (Qwen) |
+| §2 regression guards | hard-zero guards in CI | WI-G3, §5.3 |
+| DP-1 | approve the Gemini experiment | superseded (PH6 optional) |
+| DP-2 | enter `buyer_entities` | done |
+| DP-3 | delete `scripts/measure_extraction.py` | open, §9.3 |
+| DP-4 | is "flagged" acceptable where no reader is sure | §9.3 (DP-L10 / FP DP-4) |
+| DP-5 | supply 15–20+ complete sets | superseded by O-1 |
+| DP-6 | files over 20 pages | carried, frozen with WI-D2 |
+| DP-7 | GST slab list | carried (owner tax policy) |
+| DP-8 | bulk re-parse | carried → WI-D3 |
+| DP-9 | monthly cost caps | = D-8 (§9) |
+| §3a owner answers (9 Oct) | Docker running; entities set; free-tier key for tests; ~5 sets; LLM path expected to close the gap | recorded; superseded where §9 says so |
+| §4 out of scope | AC-8b, reconciliation rules, XML/CSV, GSTR-2B, production rollout, heavy dependencies | §1 |
+| §5 definition of done (8 items) and the ceiling note (OCR-only ceiling 96.8% / 95.5%) | | §2.2, §6 PH4/PH7; ceiling note carried in §4.6 reasoning |
+
+### 13.4 PG — `progress-accuracy-plan.md`
+
+| Old ID | Title | New location / status |
+|---|---|---|
+| §1 headline and targets table | status and numbers at 16 Oct | superseded by §3 (numbers re-verified 20 Oct) |
+| §2 phase table (18 rows) | plan claim vs evidence | §13.1 statuses |
+| §2.1 scan-fix rows (WI-1 … WI-13) | | §13.3 |
+| §2.2 owner decisions | | §9.2 |
+| C1 | plan said "today ≈ 89% / 84%" | stale; replaced by §3.1 (headers 81.0% all documents; 79.2% scan pages; lines 68.1%) |
+| C2 | "only the paid tier is used" | stale; D39 allows the free tier for testing; the code cannot tell the tier |
+| C3 | "D-4: set it in Settings before AC-1" | superseded; D59 warning; live value present |
+| C4 | "D-7: 15–20 sets" | superseded by O-1 |
+| C5 | README does not mention vision, AI-first, consensus, bench | open; Stage 3 adds one README paragraph |
+| C6 | newest reports have an empty vision block (bench default model ≠ stored answers) | understood: `--vision-model`/`--vision-prompt-variant` must match the stored answers; the WI-EV3 gate pins them |
+| §3 remaining work (14 rows) | | all in §7 |
+| §5 dependency map | | §8 |
+| §6 "LLM feature: what already exists" | | §4.13, §13.6 |
+| §7 per-stage attribution of the D57/D58 misses | | §4.2 ST-10, diagnosis §5.7 (kept) |
+
+### 13.5 PL — `plan-llm-extraction-call.md`
+
+| Old ID | Title | New location / status |
+|---|---|---|
+| §0.1 invariants 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 | AI never decides; untrusted evidence; core pure; SDK only in the ai-worker; sandbox no network; Decimal; D-6; versioned corrections; provenance; settings/keys/SSRF/audit; hard zeros | §1, §2, MG-1 … MG-10, code contracts |
+| §0.2 privacy and approvals | | §11 |
+| §0.3 commands | | §11 |
+| §0.4 baseline | | §3 |
+| §0.5 server facts and consequences | | §3.5, §4.8 |
+| §0.6 owner decision: providers are separate | no `dual_agree`, no combination | §1, §12 |
+| §1 amendment 1 | AC-L0 … AC-L3 phases | §13.0, §6 |
+| §1 amendment 2 | order (L0/L1 parallel with deterministic work; L3 after) | §8 |
+| §1 amendment 3 | plan text corrections (C1 … C4, AC-L in §9) | done by this plan |
+| §1 amendment 4 | D42: two LLMs are one reader kind | §2.3 (DP-L2: No) |
+| AC-L0 | provider layer | done except WI-EV0 (open, optional) |
+| AC-L1 | local provider, settings, shadow | WI-BE2 … BE6 done; open: WI-FE1, FE3, OPS1, OPS2 |
+| AC-L2 | evaluation and decision | WI-EV1 done; open: WI-EV2, WI-BE8 |
+| AC-L3 | LLM values on scans | open: WI-BE7, WI-FE2, WI-FE3, WI-G3 |
+| WI-D1 | scan rules (= FP WI-4 … 7) | frozen (D72) |
+| WI-D2 | force OCR, > 20 pages, UTF-8 | frozen (D72) |
+| WI-D3 | parser-version guard and re-parse | open (extended) |
+| WI-D4 | link-recall regression | open |
+| WI-D5 | truth set v3 | open (two-tier) |
+| WI-D6 | AC-3 page-split defect | open |
+| WI-G1 | consensus self-confirmation gap | done (D62) |
+| WI-G2 | import guard for HTTP clients | done (D62) |
+| WI-G3 | regression guards and rollback switches | open |
+| WI-BE1 | provider interface; Gemini behind it | done (D62) |
+| WI-BE2 | `vision_openai_compat` provider for vLLM | done (D64) |
+| WI-BE3 | settings model, API, migration, consent, audit | done (D65) |
+| WI-BE4 | prompt/schema v4, standalone validators | done (D63) |
+| WI-BE5 | provenance and cache key v2 | done (D63) |
+| WI-BE6 | shadow mode and comparison store (one reader) | done (D66) |
+| WI-BE7 | merge with OCR | open → WI-BE7a/b/c |
+| WI-BE8 | cropped two-pass strategy | open (Stage 4 first) |
+| WI-EV0 | offline re-score of stored Gemini answers | open, optional |
+| WI-EV1 | evaluation harness, one provider per run | done (D67) |
+| WI-EV2 | experiments and decision matrix | open → close (arms E0, E5 run; E1 – E4 optional PH6; E7 optional; E8 = crops; E6 dropped; E9 unplanned) |
+| arms E0, E1, E2, E3, E4, E5, E6, E7, E8, E9 | experiment arms | §7.3 WI-EV2, §12 |
+| agreement policies P1, P2, P3, P4 | agreement policies | rejected / out of scope (§0.6; D67 keeps only `single` and `llm_x_ocr`) |
+| WI-FE1 | AI settings UI, two provider cards | open → FE1a/b |
+| WI-FE2 | review UI provenance and disagreement | open |
+| WI-FE3 | frontend tests and type-drift guard | open |
+| WI-OPS1 | server checklist and smoke test | open |
+| WI-OPS2 | health, concurrency, fallback in operation | open |
+| §4 sequence and dependencies | | §8 |
+| DP-L1 | auto-accept thresholds | open, corrected arithmetic (§9.3) |
+| DP-L2 | do two LLMs count as independent | answered: No |
+| DP-L3 | GPU host | resolved (company vLLM, 16 Oct) |
+| DP-L4 | approvals | §9.3 |
+| DP-L5 | Gemini tier for production | §9.3 |
+| DP-L6 | pin vLLM and Qwen | §9.3 |
+| DP-L7 | default strategy | §9.3 |
+| DP-L8 | local model for PO/GRN | §9.3 |
+| DP-L9 | D-8 caps and GPU budget | §9.3 |
+| DP-L10 | "flagged" acceptable | §9.3 |
+| §6 out of scope | training, text hooks on the local model, reconciliation changes, GSTR-2B, AC-10, AC-9b UI, production rollout | §1 (AC-9b and AC-10 are planned in §7.7) |
+| §7 definition of done (8 items) | | §2.2, §6 PH4/PH7, §5.3 |
+
+### 13.6 AU — `audit-llm-extraction.md` (retired, O-7)
+
+| Old ID | Title | New location / status |
+|---|---|---|
+| P1, P2, P3, P4, P5, P6, P7, P8, P9, P10 | drop points for a correct LLM value | §4.13 (each with its answer) |
+| §2 coupling map | SDK import, import rule, provider port, instance, request shape, error mapping, transport, settings, consent, gate, reader switch, enqueue, eligibility, prompt, schema, validators, cache key, ledger, limits, worker, key, tables | §4.13 summary; the gaps it found are closed (D62–D66) except text-hook binding → WI-BE9 |
+| §3 output path | how a value is used today | §4.2 ST-13, §4.10 |
+| §4 baseline (4.1 header table, 4.2 lines, 4.3 by scan type) | stored Gemini numbers | kept in §12 (Gemini row) and `after-d41-lite.json`; Qwen per-field table §3.2 |
+| M1, M2, M3, M4, M5, M6 | miss classes (misread, prompt ambiguity, image quality, pipeline dropped, label error, party-role) | classes carried in WI-EV3 attribution; counts for Qwen **unverified** (§3.7) |
+| §5 wiring: upload path vs scripts, mismatches (a) – (d) | bench runs vision on every PDF while the app uses eligibility; bench default model ≠ stored answers; bench never exercises the consensus job; live model id unknown | (a) WI-EV3 and WI-BE7b eligibility; (b) pinned in the gate; (c) WI-INT0 / AC-LIVE-M; (d) answered: `gemini-3.5-flash-lite` (live check) |
+| §6 local serving readiness | gate, concurrency/timeouts, GPU contention, health, deployment, network rules, dependencies, this machine as server | done in D64, D65; deployment and network → AC-INT1b; the dev machine cannot serve the model (RTX 2050, 4 GB: documented), the company server is used |
+| §7 cross-check inventory | arithmetic, GSTIN, role, tax type, reference shape, value-in-OCR, null-on-unreadable, date window, crop re-read, two readers | §4.4; gaps closed in D63 (marks) and D62 (self-confirmation); gate → MG-4 |
+| §8 frontend / settings audit | location, state, types, fields, "AI first" meaning, who may edit, audit, key handling, test endpoint, usage, provenance, phone width | WI-FE1, FE2, FE3; "AI first" explained in §7.2 (AC-LIVE-S); phone width **unverified** → FE1b |
+| §9 tests | existing coverage and gaps | WI-G3, WI-FE3, WI-OPS2 |
+| §10 external facts | model card, thinking, sampling, structured outputs, `--api-key`, quantised variants, Gemini facts | §4.13 (condensed; unverified items listed) |
+| §11 top findings 1 – 3 | worker hard-wired; "AI first" widens eligibility only and consensus had a false-safe gap; cache key/UI/arithmetic/unreadable gaps | all closed or tasked (D62 – D66; WI-FE2; WI-BE9) |
+
+### 13.7 Dx — `diagnosis-scan-extraction.md` (kept as evidence)
+
+Not merged. Its numbers are cited here as Dx §5 (per-stage attribution), §5.7 (link misses), §6 (config audit) and §8 (test gaps). Its mismatches M1, M2, M3, M4, M5, M6 between the bench and the upload path were closed by FP WI-1 (D59). Items from §6 still open and not tasked: line UOM dropped when it contains a digit; charge keywords fixed list; day-first dates only on the layout path; OCR languages (`hin` installed, unused); `verification_score` has a hard-coded 0.70 floor. All sit in the frozen rules path (WI-D1/D2) and are recorded there.
+
+---
+
+## 14. Removed documents
+
+Removed in Stage 3 after approval of this plan. Each is archived byte for byte in `work/plan-archive-20261020/` (Option B; SHA-256 list in `SHA256SUMS.txt` in that folder) and, after the owner's yes, in a docs-only snapshot commit tagged `pre-plan-merge-20261020` (Option A′).
+
+| File | Git state before removal | Preserved in |
+|---|---|---|
+| `docs/accuracy-implementation-plan.md` | tracked, modified | §4.12, §7, §11, §13.2 |
+| `docs/plan-llm-extraction-call.md` | untracked | §2, §3.5, §4, §7, §9, §13.5 |
+| `docs/accuracy-fix-plan-scan-extraction.md` | untracked | §7.7 – 7.9, §9, §12, §13.3 |
+| `docs/progress-accuracy-plan.md` | untracked | §3, §8, §13.4 |
+| `docs/audit-llm-extraction.md` | untracked | §4.13, §12, §13.6 |
+
+The previous version of `docs/accuracy-plan.md` (this file before the rewrite) is archived in the same folder. Recovery: `git show pre-plan-merge-20261020:docs/<file>` or copy back from `work/plan-archive-20261020/`. Kept: `ReconBench_*.md`, `decision-log.md`, `gates/*`, `diagnosis-scan-extraction.md`, `schema-errata.md`, `ai-gemini-protocol.md`, `database-roles-and-seeding.md`, `dependency-review.md`, `engine-cli.md`, `index-review.md`, `schema-drift-check.md`, `schemas/*`.
