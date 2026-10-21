@@ -12,6 +12,7 @@ import sqlalchemy as sa
 from botocore.config import Config  # type: ignore[import-untyped]
 from botocore.exceptions import BotoCoreError  # type: ignore[import-untyped]
 from procrastinate import App, JobContext, PsycopgConnector, SyncPsycopgConnector
+from procrastinate.exceptions import AlreadyEnqueued
 from procrastinate.manager import JobManager
 from procrastinate.retry import RetryStrategy
 from sqlalchemy.engine import Connection, Engine, make_url
@@ -72,18 +73,42 @@ class ProcrastinateJobQueue(QueuePort):
         *,
         connection: Connection,
         task_kwargs: dict[str, str],
+        queueing_lock: str | None = None,
     ) -> int:
         task = self.tasks.get(task_name)
         if task is None:
             raise RuntimeError(f"unknown ingestion task: {task_name}")
+        if queueing_lock is not None:
+            # A waiting job with the same lock reads the latest state when it runs,
+            # so a second one would only repeat its work (one per key, not per call).
+            waiting = connection.scalar(
+                sa.text(
+                    "SELECT id FROM procrastinate_jobs "
+                    "WHERE queueing_lock = :lock AND status = 'todo' LIMIT 1"
+                ),
+                {"lock": queueing_lock},
+            )
+            if waiting is not None:
+                return int(waiting)
         psycopg_connection = connection.connection.driver_connection
-        deferrer = task.configure(connection=psycopg_connection)
+        if queueing_lock is None:
+            deferrer = task.configure(connection=psycopg_connection)
+        else:
+            deferrer = task.configure(connection=psycopg_connection, queueing_lock=queueing_lock)
         if self.sync_job_manager is not None:
             # Worker tasks run on Procrastinate's async connector, but their
             # services use synchronous SQLAlchemy transactions. Use the
             # connector's sync JobManager for this transaction-bound enqueue.
             deferrer.job_manager = self.sync_job_manager
-        return int(deferrer.defer(**task_kwargs))
+        if queueing_lock is None:
+            return int(deferrer.defer(**task_kwargs))
+        try:
+            # A savepoint keeps the caller's transaction usable if another
+            # transaction queued the same waiting job first.
+            with connection.begin_nested():
+                return int(deferrer.defer(**task_kwargs))
+        except AlreadyEnqueued:
+            return 0
 
     def enqueue(self, task_name: str, *, file_id: UUID, connection: Connection) -> int:
         return self._defer(
@@ -106,6 +131,7 @@ class ProcrastinateJobQueue(QueuePort):
                 "workspace_id": str(workspace_id),
                 "po_document_id": str(po_document_id),
             },
+            queueing_lock=f"recompute_po:{workspace_id}:{po_document_id}",
         )
 
     def enqueue_dirty_scopes(self, *, workspace_id: UUID, connection: Connection) -> int:
@@ -113,6 +139,7 @@ class ProcrastinateJobQueue(QueuePort):
             "drain_dirty_scopes",
             connection=connection,
             task_kwargs={"workspace_id": str(workspace_id)},
+            queueing_lock=f"drain_dirty_scopes:{workspace_id}",
         )
 
     def enqueue_reconciliation(self, *, run_id: UUID, connection: Connection) -> int:
