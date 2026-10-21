@@ -5,6 +5,11 @@ call only when its subject is a repository fixture *and* the exact outgoing
 payload digest is in the compiled allowlist, so an uploaded document is refused
 even if its text matches a fixture. ``enabled`` also requires an approval
 reference; real-document calls stay unapproved until compliance supplies one.
+
+Self-hosted model servers (vLLM, LLM plan WI-BE2) have their own switch,
+``RB_AI_VLLM_CALLS`` with the same three modes, and an endpoint allowlist
+``RB_AI_VLLM_ENDPOINTS``. They need no approval reference (the server is the
+company's own), but the call's base URL must be allowlisted.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from reconbench_app.ai.endpoint_policy import EndpointNotAllowed, check_allowed, parse_allowlist
 from reconbench_app.ai.fixtures import SYNTHETIC_FIXTURE_DIGESTS
 
 ExternalCallsMode = Literal["disabled", "synthetic_only", "enabled"]
@@ -25,6 +31,8 @@ _APPROVAL_REF = re.compile(r"[A-Z0-9][A-Z0-9._/-]{2,63}\Z")
 SKIP_EXTERNAL_CALLS_DISABLED = "EXTERNAL_CALLS_DISABLED"
 SKIP_SYNTHETIC_ONLY = "SYNTHETIC_ONLY"
 SKIP_UNKNOWN_FIXTURE = "UNKNOWN_SYNTHETIC_FIXTURE"
+SKIP_LOCAL_CALLS_DISABLED = "LOCAL_CALLS_DISABLED"
+SKIP_ENDPOINT_NOT_ALLOWED = "ENDPOINT_NOT_ALLOWED"
 
 
 class GateConfigurationError(ValueError):
@@ -65,12 +73,34 @@ def payload_digest(
 class DeploymentGate:
     mode: ExternalCallsMode
     approval_ref: str | None = None
+    vllm_mode: ExternalCallsMode = "disabled"
+    vllm_endpoints: tuple[str, ...] = ()
+    """Normalised base URLs a self-hosted provider may be called at."""
 
     @classmethod
-    def from_values(cls, mode: str, approval_ref: str | None) -> DeploymentGate:
+    def from_values(
+        cls,
+        mode: str,
+        approval_ref: str | None,
+        *,
+        vllm_mode: str = "disabled",
+        vllm_endpoints: str | None = None,
+    ) -> DeploymentGate:
         if mode not in EXTERNAL_CALLS_MODES:
             raise GateConfigurationError(
                 f"RB_AI_EXTERNAL_CALLS must be one of {', '.join(EXTERNAL_CALLS_MODES)}"
+            )
+        if vllm_mode not in EXTERNAL_CALLS_MODES:
+            raise GateConfigurationError(
+                f"RB_AI_VLLM_CALLS must be one of {', '.join(EXTERNAL_CALLS_MODES)}"
+            )
+        try:
+            endpoints = parse_allowlist((vllm_endpoints or "").split(","))
+        except EndpointNotAllowed as exc:
+            raise GateConfigurationError(f"RB_AI_VLLM_ENDPOINTS: {exc}") from None
+        if vllm_mode != "disabled" and not endpoints:
+            raise GateConfigurationError(
+                "RB_AI_VLLM_CALLS requires RB_AI_VLLM_ENDPOINTS (comma-separated base URLs)"
             )
         reference = (approval_ref or "").strip() or None
         if mode == "enabled":
@@ -81,14 +111,43 @@ class DeploymentGate:
                 )
         else:
             reference = None
-        return cls(mode=mode, approval_ref=reference)
+        return cls(
+            mode=mode,
+            approval_ref=reference,
+            vllm_mode=vllm_mode,
+            vllm_endpoints=endpoints,
+        )
 
-    def refusal(self, *, subject_type: str, fixture_id: str | None, digest: str) -> str | None:
-        """Return a skip code when this call must not be sent, otherwise ``None``."""
+    def endpoint_allowed(self, endpoint: str | None) -> bool:
+        if endpoint is None:
+            return False
+        try:
+            check_allowed(endpoint, self.vllm_endpoints)
+        except EndpointNotAllowed:
+            return False
+        return True
 
-        if self.mode == "disabled":
-            return SKIP_EXTERNAL_CALLS_DISABLED
-        if self.mode == "synthetic_only":
+    def refusal(
+        self,
+        *,
+        subject_type: str,
+        fixture_id: str | None,
+        digest: str,
+        external: bool = True,
+        endpoint: str | None = None,
+    ) -> str | None:
+        """Return a skip code when this call must not be sent, otherwise ``None``.
+
+        ``external`` calls follow ``RB_AI_EXTERNAL_CALLS``; a self-hosted provider
+        follows ``RB_AI_VLLM_CALLS`` and its ``endpoint`` must be allowlisted.
+        """
+
+        mode = self.mode if external else self.vllm_mode
+        if mode == "disabled":
+            return SKIP_EXTERNAL_CALLS_DISABLED if external else SKIP_LOCAL_CALLS_DISABLED
+        if not external and not self.endpoint_allowed(endpoint):
+            return SKIP_ENDPOINT_NOT_ALLOWED
+        if mode == "synthetic_only":
             if subject_type != "fixture" or fixture_id is None:
                 return SKIP_SYNTHETIC_ONLY
             if SYNTHETIC_FIXTURE_DIGESTS.get(fixture_id) != digest:
@@ -106,7 +165,9 @@ class DeploymentGate:
 
 __all__ = [
     "EXTERNAL_CALLS_MODES",
+    "SKIP_ENDPOINT_NOT_ALLOWED",
     "SKIP_EXTERNAL_CALLS_DISABLED",
+    "SKIP_LOCAL_CALLS_DISABLED",
     "SKIP_SYNTHETIC_ONLY",
     "SKIP_UNKNOWN_FIXTURE",
     "DeploymentGate",

@@ -10,6 +10,7 @@ import time
 import zipfile
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -39,10 +40,26 @@ from reconbench_app.ingestion import (
 )
 from reconbench_app.ledger_service import LedgerRebuildService
 from reconbench_app.mapping_service import MappingService
+from reconbench_app.pdf_sandbox import page_image_hashes_isolated
 from reconbench_app.settings import Settings
 from reconbench_app.storage import LocalObjectStore, S3ObjectStore
 from reconbench_app.vendor_resolution import VendorResolutionService
-from reconbench_core.schema import FileFormat
+from reconbench_core.parsers.types import PageImageHash
+from reconbench_core.schema import (
+    DocLine,
+    DocType,
+    Document,
+    ExtractionMethod,
+    FieldEvidence,
+    FieldOrigin,
+    FieldSource,
+    FieldValue,
+    FieldVerification,
+    FileFormat,
+    InvoiceHeader,
+    POHeader,
+    ReasonCode,
+)
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from sqlalchemy.engine import Engine, make_url
@@ -519,11 +536,13 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                 service.parse_file(uploaded_id, job_id=job_base + 3)
             return uploaded_id
 
-        upload_and_parse("po", "purchase-order.csv", _PO_CSV, 30)
+        upload_and_parse(
+            "po", "purchase-order.csv", _PO_CSV.replace(b"Widget A", b"Widget A MOD-100"), 30
+        )
         upload_and_parse(
             "invoice",
             "invoice-with-po.csv",
-            _LINKABLE_INVOICE_CSV,
+            _LINKABLE_INVOICE_CSV.replace(b"Widget A", b"Widget A MOD-100"),
             32,
             mapping={
                 "PO Ref": "po_refs",
@@ -721,11 +740,16 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                 == link_count_before_replay
             )
 
-        upload_and_parse("po", "beta-purchase-order.csv", _BETA_PO_CSV, 80)
+        upload_and_parse(
+            "po",
+            "beta-purchase-order.csv",
+            _BETA_PO_CSV.replace(b"Widget B", b"Widget B MOD-777"),
+            80,
+        )
         upload_and_parse(
             "invoice",
             "beta-invoice.csv",
-            _BETA_INVOICE_CSV,
+            _BETA_INVOICE_CSV.replace(b"Widget B", b"Widget B MOD-777"),
             82,
             mapping={
                 "PO Ref": "po_refs",
@@ -784,7 +808,7 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         grn_file_id = upload_and_parse(
             "grn",
             "beta-receipt.csv",
-            _BETA_GRN_CSV,
+            _BETA_GRN_CSV.replace(b"Widget B", b"Widget B MOD-777"),
             90,
             mapping={"PO Ref": "po_refs", "GRN No": "doc_no", "GRN Date": "doc_date"},
         )
@@ -1737,8 +1761,6 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             )
         assert len(order_results) == 2
         business_fields = (
-            "status",
-            "reason_codes",
             "invoice_taxable",
             "invoice_total",
             "expected_taxable",
@@ -1750,6 +1772,11 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         )
         assert tuple(order_results[0][key] for key in business_fields) == tuple(
             order_results[1][key] for key in business_fields
+        )
+        first_reasons = set(order_results[0]["reason_codes"])
+        second_reasons = set(order_results[1]["reason_codes"])
+        assert (ReasonCode.DUP_SUSPECTED.value in first_reasons) != (
+            ReasonCode.DUP_SUSPECTED.value in second_reasons
         )
 
         repeated = client.post(
@@ -2056,6 +2083,7 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
 
         source_pdf_details = client.get(f"/api/v1/documents/{pdf_document_id}")
         original_pdf_version = UUID(source_pdf_details.json()["version"]["id"])
+        resolve_jobs_before_correction = queue.jobs.count(("resolve_vendors", pdf_file_id))
         corrected_pdf = client.put(
             f"/api/v1/documents/{pdf_document_id}/correction",
             json={
@@ -2078,6 +2106,9 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             },
         )
         assert corrected_pdf.status_code == 200, corrected_pdf.text
+        assert queue.jobs.count(("resolve_vendors", pdf_file_id)) == (
+            resolve_jobs_before_correction + 1
+        )
         corrected_details = corrected_pdf.json()
         corrected_version_id = UUID(corrected_details["version"]["id"])
         assert corrected_version_id != original_pdf_version
@@ -2144,11 +2175,22 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         with ingestion_engine.connect() as connection:
             shell_document = (
                 connection.execute(
-                    sa.select(metadata.tables["document"]).where(
+                    sa.select(metadata.tables["document"])
+                    .where(
                         metadata.tables["document"].c.workspace_id == workspace_id,
-                        metadata.tables["document"].c.natural_key
-                        == hashlib.sha256(shell_content).hexdigest(),
                     )
+                    .join(
+                        metadata.tables["document_version"],
+                        sa.and_(
+                            metadata.tables["document_version"].c.workspace_id
+                            == metadata.tables["document"].c.workspace_id,
+                            metadata.tables["document_version"].c.document_id
+                            == metadata.tables["document"].c.id,
+                            metadata.tables["document_version"].c.id
+                            == metadata.tables["document"].c.current_version_id,
+                        ),
+                    )
+                    .where(metadata.tables["document_version"].c.source_file_id == shell_file_id)
                 )
                 .mappings()
                 .one()
@@ -2163,8 +2205,18 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                 .mappings()
                 .one()
             )
+            shell_page_hashes = connection.scalar(
+                sa.select(metadata.tables["document_identity"].c.page_hashes).where(
+                    metadata.tables["document_identity"].c.workspace_id == workspace_id,
+                    metadata.tables["document_identity"].c.document_version_id
+                    == shell_version["id"],
+                )
+            )
+        expected_shell_hashes = page_image_hashes_isolated(shell_content, (1,))
         assert shell_version["needs_verification"] is True
         assert "NO_TEXT_LAYER" in shell_version["verification_reasons"]
+        assert expected_shell_hashes is not None
+        assert shell_page_hashes == [item.value for item in expected_shell_hashes]
 
         unreadable_pdf = b"%PDF-1.4\nThis is not a readable PDF body."
         unreadable_upload = client.post(
@@ -2194,6 +2246,7 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             json={
                 "doc_no": "MANUAL-SYN-001",
                 "vendor_name": "Synthetic Manual Vendor",
+                "po_refs": ["PO/MANUAL/SYN/001"],
                 "grand_total": "118.00",
                 "lines": [
                     {
@@ -2216,6 +2269,47 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         assert manual_details["version"]["doc_no"] == "MANUAL-SYN-001"
         assert manual_details["lines"][0]["description"] == "Manual entry test item"
         assert all(item["source"] == "manual" for item in manual_details["field_evidence"])
+        manual_doc_no_evidence = next(
+            item for item in manual_details["field_evidence"] if item["field_name"] == "doc_no"
+        )
+        assert manual_doc_no_evidence["origin"] == FieldOrigin.MANUAL.value
+        assert manual_doc_no_evidence["confidence"] is None
+        assert manual_doc_no_evidence["verification"] == FieldVerification.USER.value
+        assert manual_doc_no_evidence["verified_by"] is not None
+        assert manual_doc_no_evidence["verified_at"] is not None
+        manual_po_evidence = next(
+            item for item in manual_details["field_evidence"] if item["field_name"] == "po_refs"
+        )
+        assert manual_po_evidence["origin"] == FieldOrigin.MANUAL.value
+        assert manual_po_evidence["confidence"] is None
+        assert manual_po_evidence["verification"] == FieldVerification.USER.value
+
+        from reconbench_app.ingestion import _preserve_user_verified_references
+
+        extracted_reference = FieldValue(
+            value=("PO-MANUAL-SYN-001",),
+            confidence=Decimal("0.99"),
+            source=FieldSource.RULE,
+            evidence=FieldEvidence(snippet="Synthetic OCR text"),
+            origin=FieldOrigin.OCR,
+        )
+        extracted_document = Document(
+            header=InvoiceHeader(doc_type=DocType.INVOICE, po_refs=extracted_reference)
+        )
+        with ingestion_engine.begin() as connection:
+            preserved_document, conflict = _preserve_user_verified_references(
+                connection,
+                workspace_id=workspace_id,
+                version_id=UUID(manual_details["version"]["id"]),
+                document=extracted_document,
+            )
+        assert not conflict
+        preserved_reference = preserved_document.header.po_refs
+        assert preserved_reference is not None
+        assert preserved_reference.value == ("PO/MANUAL/SYN/001",)
+        assert preserved_reference.origin is FieldOrigin.MANUAL
+        assert preserved_reference.confidence is None
+        assert preserved_reference.verification is FieldVerification.USER
         updated_unreadable = client.get(f"/api/v1/files/{unreadable_file_id}").json()
         assert updated_unreadable["status"] == "parsed"
         assert updated_unreadable["docs_found"] == 1
@@ -2280,6 +2374,423 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         assert mapped_documents.status_code == 200
         assert len(mapped_documents.json()) == 1
         assert mapped_documents.json()[0]["doc_no"] == "SYN-MAPPED-001"
+
+
+def test_po_and_grn_corrections_save_versions_and_refresh_reconciliation(
+    ingestion_engine: Engine,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RB_AI_EXTERNAL_CALLS", "disabled")
+    workspace_id, user_id = _seed_workspace(ingestion_engine)
+    fake_s3 = _FakeObjectStoreClient()
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: fake_s3)
+    storage = LocalObjectStore(tmp_path / "objects")
+    settings = Settings(
+        _env_file=None,
+        environment="ci",
+        database_url=ingestion_engine.url.render_as_string(hide_password=False),
+        s3_endpoint_url="http://127.0.0.1:1",
+        s3_region="us-east-1",
+        s3_bucket="synthetic-corrections",
+        s3_api_access_key="synthetic-access",
+        s3_api_secret_key="synthetic-secret",
+        public_base_url="https://example.invalid",
+        argon2_time_cost=1,
+        argon2_memory_cost_kib=8192,
+        argon2_parallelism=1,
+    )
+    app = create_app(settings)
+    queue = _FakeQueue()
+    service = IngestionService(ingestion_engine, storage, queue)
+    app.state.ingestion_service = service
+    context = AuthContext(
+        session_id=new_id(),
+        workspace_id=workspace_id,
+        user_id=user_id,
+        display_name="Synthetic Ingestion Manager",
+        role="manager",
+        csrf_token="synthetic-csrf",
+    )
+    app.state.auth_service.authenticate = lambda *args, **kwargs: AuthenticationCheck(context, True)
+
+    with TestClient(app, base_url="https://testserver") as client:
+        app.state.file_storage = storage
+        client.cookies.set(COOKIE_NAME, "synthetic-session", path="/api/v1")
+        batch_response = client.post(
+            "/api/v1/batches",
+            json={"label": "Synthetic PO and GRN corrections"},
+            headers={"X-CSRF-Token": "synthetic-csrf"},
+        )
+        assert batch_response.status_code == 201, batch_response.text
+        batch_id = UUID(batch_response.json()["id"])
+
+        def upload_and_parse(
+            zone: str,
+            name: str,
+            content: bytes,
+            job_base: int,
+            mapping: dict[str, str] | None = None,
+        ) -> UUID:
+            uploaded = client.post(
+                f"/api/v1/files?batch_id={batch_id}&zone={zone}",
+                content=content,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-File-Name": name,
+                    "X-CSRF-Token": "synthetic-csrf",
+                },
+            )
+            assert uploaded.status_code == 201, uploaded.text
+            file_id = UUID(uploaded.json()["file_id"])
+            processed = client.post(
+                f"/api/v1/batches/{batch_id}/process",
+                headers={"X-CSRF-Token": "synthetic-csrf"},
+            )
+            assert processed.status_code == 202, processed.text
+            service.ingest_file(file_id, job_id=job_base)
+            service.parse_file(file_id, job_id=job_base + 1)
+            if mapping is not None:
+                saved = client.post(
+                    f"/api/v1/files/{file_id}/column-mapping",
+                    json={"column_mapping": mapping},
+                    headers={"X-CSRF-Token": "synthetic-csrf"},
+                )
+                assert saved.status_code == 202, saved.text
+                service.ingest_file(file_id, job_id=job_base + 2)
+                service.parse_file(file_id, job_id=job_base + 3)
+            return file_id
+
+        po_file_id = upload_and_parse("po", "synthetic-po.csv", _PO_CSV, 1)
+        grn_content = _BETA_GRN_CSV.replace(b"GRN-2026-777", b"GRN-2026-001").replace(
+            b"PO-2026-777", b"PO-2026-001"
+        )
+        grn_file_id = upload_and_parse(
+            "grn",
+            "synthetic-grn.csv",
+            grn_content,
+            5,
+            mapping={"PO Ref": "po_refs", "GRN No": "doc_no", "GRN Date": "doc_date"},
+        )
+        vendor_resolution = VendorResolutionService(ingestion_engine)
+        vendor_resolution.resolve_workspace(workspace_id)
+        mapping_service = MappingService(ingestion_engine, queue)
+        mapping_service.resolve_workspace(workspace_id)
+
+        documents = client.get(f"/api/v1/documents?batch_id={batch_id}")
+        assert documents.status_code == 200, documents.text
+        document_ids = {item["doc_type"]: UUID(item["id"]) for item in documents.json()}
+        po_id = document_ids["po"]
+        grn_id = document_ids["grn"]
+        with ingestion_engine.connect() as connection:
+            active_grn_po = connection.scalar(
+                sa.select(metadata.tables["link_current"].c.current_link_id).where(
+                    metadata.tables["link_current"].c.workspace_id == workspace_id,
+                    metadata.tables["link_current"].c.from_document_id == grn_id,
+                    metadata.tables["link_current"].c.to_document_id == po_id,
+                    metadata.tables["link_current"].c.link_type == "grn_po",
+                )
+            )
+            dirty_scope = metadata.tables["dirty_scope"]
+            scope_before_po = connection.scalar(
+                sa.select(dirty_scope.c.mark_count).where(
+                    dirty_scope.c.workspace_id == workspace_id,
+                    dirty_scope.c.scope_kind == "po",
+                    dirty_scope.c.scope_id == po_id,
+                    dirty_scope.c.processed_at.is_(None),
+                )
+            )
+        assert active_grn_po is not None
+
+        po_before = client.get(f"/api/v1/documents/{po_id}")
+        assert po_before.status_code == 200, po_before.text
+        po_old_version = UUID(po_before.json()["version"]["id"])
+        po_line = po_before.json()["lines"][0]
+        po_jobs_before = queue.jobs.count(("resolve_vendors", po_file_id))
+        corrected_po = client.put(
+            f"/api/v1/documents/{po_id}/correction",
+            json={
+                "revision": "Revision 2",
+                "status": "closed",
+                "lines": [{"id": po_line["id"], "line_no": po_line["line_no"], "quantity": "3"}],
+                "verified": True,
+                "reason": "Synthetic PO correction.",
+            },
+            headers={
+                "If-Match": po_before.headers["etag"],
+                "X-CSRF-Token": "synthetic-csrf",
+            },
+        )
+        assert corrected_po.status_code == 200, corrected_po.text
+        po_saved = corrected_po.json()
+        assert UUID(po_saved["version"]["id"]) != po_old_version
+        assert po_saved["version"]["revision"] == "Revision 2"
+        assert po_saved["version"]["po_status"] == "closed"
+        assert po_saved["lines"][0]["quantity"] == "3.0000"
+        assert po_saved["version"]["needs_verification"] is False
+        assert {
+            item["field_name"] for item in po_saved["field_evidence"] if item["source"] == "manual"
+        } >= {
+            "revision",
+            "status",
+            "quantity",
+        }
+        assert queue.jobs.count(("resolve_vendors", po_file_id)) == po_jobs_before + 1
+        with ingestion_engine.connect() as connection:
+            scope_after_po = connection.scalar(
+                sa.select(dirty_scope.c.mark_count).where(
+                    dirty_scope.c.workspace_id == workspace_id,
+                    dirty_scope.c.scope_kind == "po",
+                    dirty_scope.c.scope_id == po_id,
+                    dirty_scope.c.processed_at.is_(None),
+                )
+            )
+        assert scope_after_po is not None and scope_after_po > (scope_before_po or 0)
+
+        grn_before = client.get(f"/api/v1/documents/{grn_id}")
+        assert grn_before.status_code == 200, grn_before.text
+        grn_old_version = UUID(grn_before.json()["version"]["id"])
+        grn_line = grn_before.json()["lines"][0]
+        grn_jobs_before = queue.jobs.count(("resolve_vendors", grn_file_id))
+        scope_before_grn = scope_after_po
+        corrected_grn = client.put(
+            f"/api/v1/documents/{grn_id}/correction",
+            json={
+                "challan_no": "SYN-CHALLAN-001",
+                "lines": [
+                    {
+                        "id": grn_line["id"],
+                        "line_no": grn_line["line_no"],
+                        "accepted_qty": "1",
+                    }
+                ],
+                "verified": True,
+                "reason": "Synthetic GRN correction.",
+            },
+            headers={
+                "If-Match": grn_before.headers["etag"],
+                "X-CSRF-Token": "synthetic-csrf",
+            },
+        )
+        assert corrected_grn.status_code == 200, corrected_grn.text
+        grn_saved = corrected_grn.json()
+        assert UUID(grn_saved["version"]["id"]) != grn_old_version
+        assert grn_saved["version"]["challan_no"] == "SYN-CHALLAN-001"
+        assert grn_saved["lines"][0]["accepted_qty"] == "1.0000"
+        assert grn_saved["version"]["needs_verification"] is False
+        assert {
+            item["field_name"] for item in grn_saved["field_evidence"] if item["source"] == "manual"
+        } >= {
+            "challan_no",
+            "accepted_qty",
+        }
+        assert queue.jobs.count(("resolve_vendors", grn_file_id)) == grn_jobs_before + 1
+        with ingestion_engine.connect() as connection:
+            scope_after_grn = connection.scalar(
+                sa.select(dirty_scope.c.mark_count).where(
+                    dirty_scope.c.workspace_id == workspace_id,
+                    dirty_scope.c.scope_kind == "po",
+                    dirty_scope.c.scope_id == po_id,
+                    dirty_scope.c.processed_at.is_(None),
+                )
+            )
+        assert scope_after_grn is not None and scope_after_grn > (scope_before_grn or 0)
+
+
+def test_rescan_fingerprint_creates_version_and_lower_confidence_stays_alternative(
+    ingestion_engine: Engine,
+    tmp_path: Any,
+) -> None:
+    workspace_id, user_id = _seed_workspace(ingestion_engine)
+    service = IngestionService(
+        ingestion_engine, LocalObjectStore(tmp_path / "objects"), _FakeQueue()
+    )
+    source = metadata.tables["source_file"]
+    document_table = metadata.tables["document"]
+    version_table = metadata.tables["document_version"]
+    identity_table = metadata.tables["document_identity"]
+    page_hashes = (PageImageHash(page=1, value="0123456789abcdef"),)
+
+    def _value(value: Any, *, manual: bool) -> FieldValue[Any]:
+        return FieldValue(
+            value=value,
+            confidence=Decimal("1.00") if manual else Decimal("0.80"),
+            source=FieldSource.MANUAL if manual else FieldSource.RULE,
+            evidence=FieldEvidence(page=1, snippet="synthetic identity value"),
+            origin=FieldOrigin.MANUAL if manual else FieldOrigin.OCR,
+            verification=FieldVerification.USER if manual else FieldVerification.NONE,
+            verified_by="synthetic-owner" if manual else None,
+            verified_at=datetime(2026, 4, 1, tzinfo=UTC) if manual else None,
+        )
+
+    def _invoice(
+        *,
+        manual: bool,
+        grand_total: Decimal = Decimal("118.00"),
+    ) -> Document:
+        return Document(
+            header=InvoiceHeader(
+                doc_type=DocType.INVOICE,
+                doc_no=_value("INV-SYN-AC8B-001", manual=manual),
+                doc_date=_value(date(2026, 4, 1), manual=manual),
+                vendor_name=_value("Synthetic Identity Supplier", manual=manual),
+                grand_total=_value(grand_total, manual=manual),
+            ),
+            lines=(
+                DocLine(
+                    line_no=1,
+                    description=_value("Synthetic identity item", manual=manual),
+                    quantity=_value(Decimal("1"), manual=manual),
+                    rate=_value(Decimal("100.00"), manual=manual),
+                    amount=_value(Decimal("100.00"), manual=manual),
+                ),
+            ),
+            source_locator="pdf:synthetic-ac8b:pages:1",
+            needs_verification=not manual,
+        )
+
+    source_files: dict[int, tuple[UUID, str]] = {}
+
+    def _source_file(index: int) -> tuple[UUID, str]:
+        if index in source_files:
+            return source_files[index]
+        file_id = new_id()
+        file_sha = hashlib.sha256(f"synthetic-ac8b-file-{index}".encode()).hexdigest()
+        with ingestion_engine.begin() as connection:
+            connection.execute(
+                sa.insert(source).values(
+                    id=file_id,
+                    workspace_id=workspace_id,
+                    sha256=file_sha,
+                    display_name=f"synthetic-{index}.pdf",
+                    zone="invoice",
+                    zone_uploaded="invoice",
+                    format="pdf",
+                    status="parsed",
+                    size_bytes=128,
+                    object_key=f"synthetic/{file_id}",
+                    uploaded_by=user_id,
+                )
+            )
+        source_files[index] = (file_id, file_sha)
+        return file_id, file_sha
+
+    def _upsert(
+        index: int,
+        *,
+        manual: bool,
+        page_hashes_override: tuple[PageImageHash, ...] | None = None,
+        grand_total: Decimal = Decimal("118.00"),
+    ) -> tuple[str, UUID, UUID | None]:
+        file_id, file_sha = _source_file(index)
+        with ingestion_engine.begin() as connection:
+            return service._upsert_document(
+                connection,
+                workspace_id=workspace_id,
+                batch_id=None,
+                file_id=file_id,
+                actor_id=user_id,
+                document=_invoice(
+                    manual=manual,
+                    grand_total=grand_total,
+                ),
+                file_sha=file_sha,
+                page_hashes=(page_hashes if page_hashes_override is None else page_hashes_override),
+                job_id=None,
+                parser_version=PARSER_VERSION,
+                layout_signature="a" * 64,
+                extraction_method=(ExtractionMethod.MANUAL if manual else ExtractionMethod.PDF_OCR),
+                uom_aliases={},
+                charge_keywords=(),
+            )
+
+    first = _upsert(1, manual=False)
+    second = _upsert(
+        2,
+        manual=False,
+        page_hashes_override=(PageImageHash(page=1, value="0123456789abcdee"),),
+    )
+    verified = _upsert(3, manual=True)
+    alternative = _upsert(4, manual=False)
+    verified_changed_content = _upsert(8, manual=True, grand_total=Decimal("119.00"))
+    different_page = _upsert(
+        5,
+        manual=False,
+        page_hashes_override=(PageImageHash(page=1, value="fedcba9876543210"),),
+    )
+    different_content = _upsert(
+        6,
+        manual=False,
+        page_hashes_override=(PageImageHash(page=1, value="fedcba9876543210"),),
+        grand_total=Decimal("119.00"),
+    )
+    fallback_unhashed = _upsert(7, manual=False, page_hashes_override=())
+    fallback_hashed = _upsert(
+        7,
+        manual=False,
+        page_hashes_override=(PageImageHash(page=1, value="aaaaaaaaaaaaaaaa"),),
+    )
+    fallback_po = Document(
+        header=POHeader(),
+        source_locator="pdf:synthetic-ac8b:pages:1",
+    )
+    file_id, file_sha = _source_file(7)
+    with ingestion_engine.begin() as connection:
+        different_type_fallback = service._upsert_document(
+            connection,
+            workspace_id=workspace_id,
+            batch_id=None,
+            file_id=file_id,
+            actor_id=user_id,
+            document=fallback_po,
+            file_sha=file_sha,
+            page_hashes=(),
+            job_id=None,
+            parser_version=PARSER_VERSION,
+            layout_signature="a" * 64,
+            extraction_method=ExtractionMethod.PDF_OCR,
+            uom_aliases={},
+            charge_keywords=(),
+        )
+
+    assert first[0] == "new"
+    assert second[0] == "updated" and second[1] == first[1]
+    assert different_page[0] == "new" and different_page[1] != first[1]
+    assert different_content[0] == "new" and different_content[1] != first[1]
+    assert verified_changed_content[0] == "updated" and verified_changed_content[1] == first[1]
+    assert verified[0] == "updated" and verified[1] == first[1]
+    assert alternative[0] == "alternative" and alternative[1] == first[1]
+    assert fallback_unhashed[0] == "new"
+    assert fallback_hashed[0] == "skipped" and fallback_hashed[1] == fallback_unhashed[1]
+    assert different_type_fallback[0] == "new"
+    assert different_type_fallback[1] != fallback_unhashed[1]
+    with ingestion_engine.connect() as connection:
+        current_version_id = connection.scalar(
+            sa.select(document_table.c.current_version_id).where(
+                document_table.c.workspace_id == workspace_id,
+                document_table.c.id == first[1],
+            )
+        )
+        versions = connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(version_table)
+            .where(
+                version_table.c.workspace_id == workspace_id,
+                version_table.c.document_id == first[1],
+            )
+        )
+        identities = connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(identity_table)
+            .join(version_table, version_table.c.id == identity_table.c.document_version_id)
+            .where(
+                identity_table.c.workspace_id == workspace_id,
+                version_table.c.document_id == first[1],
+            )
+        )
+    assert current_version_id == verified_changed_content[2]
+    assert versions == 5
+    assert identities == 5
 
 
 def test_content_sniffing_and_zip_path_guards_use_bytes_and_archive_names() -> None:

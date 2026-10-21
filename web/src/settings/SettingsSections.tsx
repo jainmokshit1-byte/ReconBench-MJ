@@ -31,8 +31,8 @@ function DefaultNote({ current, initial, onReset, label }: { current: string; in
   return <span className="settings-default settings-default-changed">Default {initial} <button className="button button-subtle settings-reset" type="button" aria-label={`Reset ${label} to default`} onClick={onReset}><RotateCcw size={12} /> Reset</button></span>;
 }
 
-function Section({ kicker, title, children, description }: { kicker: string; title: string; description: ReactNode; children: ReactNode }) {
-  return <section className="panel settings-panel" aria-label={title}><div className="panel-heading"><div><div className="panel-kicker">{kicker}</div><h2>{title}</h2></div></div><p>{description}</p>{children}</section>;
+function Section({ kicker, title, children, description, id }: { kicker: string; title: string; description: ReactNode; children: ReactNode; id?: string }) {
+  return <section className="panel settings-panel" aria-label={title} id={id}><div className="panel-heading"><div><div className="panel-kicker">{kicker}</div><h2>{title}</h2></div></div><p>{description}</p>{children}</section>;
 }
 
 export function TolerancesSection({ engine, defaults, errors, update, vendors }: SectionProps & { vendors: MappingVendor[] }) {
@@ -182,7 +182,7 @@ export function UomSection({ engine, errors, update }: SectionProps) {
 }
 
 export function BuyerEntitiesSection({ engine, errors, update }: SectionProps) {
-  return <Section kicker="TAX" title="Buyer entities" description="Your own GSTINs. Used by the buyer-entity check and to decide intra- or inter-state tax. An empty list skips the buyer check.">
+  return <Section id="buyer-entities" kicker="TAX" title="Buyer entities" description="Your own GSTINs. Used by the buyer-entity check, to tell your GSTIN apart from the supplier's on scanned documents, and to decide intra- or inter-state tax. While the list is empty, every supplier GSTIN read from a PDF needs review.">
     <table className="recon-table settings-table"><thead><tr><th>Entity name</th><th>GSTIN</th><th /></tr></thead><tbody>{engine.buyer_entities.map((entity, index) => {
       const live = entity.gstin ? gstinProblem(entity.gstin) : null;
       return <tr key={index}><td><input aria-label={`Buyer entity ${index + 1} name`} value={entity.name} onChange={(event) => { const value = event.currentTarget.value; update((next) => { const target = next.buyer_entities[index]; if (target) target.name = value; }); }} /><FieldError errors={errors} path={`engine.buyer_entities.${index}.name`} /></td>

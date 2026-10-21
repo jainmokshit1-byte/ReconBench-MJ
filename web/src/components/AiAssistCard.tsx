@@ -15,7 +15,7 @@ import {
   saveAiSettings,
   startAiProviderTest,
 } from "../api/ai";
-import type { AiConsentPreview, AiKeyStorage, AiMode, AiSettingsUpdate, AiSettingsView, AiUsage } from "../api/ai";
+import type { AiAutoVerifyFieldType, AiConsentPreview, AiKeyStorage, AiMode, AiSettingsUpdate, AiSettingsView, AiUsage } from "../api/ai";
 import { useAuth } from "../auth/useAuth";
 
 type Settings = { view: AiSettingsView; etag: string };
@@ -43,6 +43,10 @@ function message(cause: unknown, fallback: string): string {
 function limitNumber(limits: Record<string, unknown> | null, key: string): number | null {
   const value = limits?.[key];
   return typeof value === "number" ? value : null;
+}
+
+function sameFieldTypes(left: readonly AiAutoVerifyFieldType[], right: readonly AiAutoVerifyFieldType[]): boolean {
+  return left.length === right.length && left.every((fieldType, index) => fieldType === right[index]);
 }
 
 function testOutcome(state: string, code: string | null): string {
@@ -91,7 +95,7 @@ export function AiAssistCard() {
       {loadError ? <p role="alert">{loadError}</p> : (
         <p>
           {!view ? "Loading AI Assist status…" : on
-            ? `${view.mode_label}.${view.model ? ` Provider: Google Gemini (${view.model}).` : ""} AI output stays advisory until a person confirms it.`
+            ? `${view.mode_label}.${view.model ? ` Provider: Google Gemini (${view.model}).` : ""} ${view.auto_verify.field_types.length ? "Selected fields may be marked verified after strict reader, validator and crop checks; their values are never changed." : "AI output stays advisory until a person confirms it."}`
             : "Rules-only mode is active. AI Assist can add advisory suggestions once a manager chooses a Gemini model, enters a key and consents to what is sent."}
         </p>
       )}
@@ -118,6 +122,7 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
   const [mode, setMode] = useState<AiMode>(view.mode);
   const [model, setModel] = useState(view.model ?? "");
   const [vision, setVision] = useState(view.vision.enabled);
+  const [autoVerifyFieldTypes, setAutoVerifyFieldTypes] = useState<AiAutoVerifyFieldType[]>(view.auto_verify.field_types);
   const [keyDraft, setKeyDraft] = useState("");
   const [storage, setStorage] = useState<AiKeyStorage>(view.key.storage ?? "session");
   const [preview, setPreview] = useState<AiConsentPreview | null>(null);
@@ -158,18 +163,19 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
     if (mode === "rules_only" || !modelValid) return undefined;
     let active = true;
     const timer = window.setTimeout(() => {
-      getAiConsentPreview(mode, model, vision)
+      getAiConsentPreview(mode, model, vision, autoVerifyFieldTypes)
         .then((next) => { if (active) { setPreview(next); setPreviewError(null); } })
         .catch((cause: unknown) => { if (active) { setPreview(null); setPreviewError(message(cause, "The consent text could not be loaded.")); } });
     }, 250);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [mode, model, modelValid, vision]);
+  }, [mode, model, modelValid, vision, autoVerifyFieldTypes]);
 
-  const activePreview = mode !== "rules_only" && preview?.mode === mode && preview.model === model && preview.vision === vision ? preview : null;
+  const activePreview = mode !== "rules_only" && preview?.mode === mode && preview.model === model && preview.vision === vision && sameFieldTypes(preview.auto_verify_field_types, autoVerifyFieldTypes) ? preview : null;
   const consentOnRecord = activePreview !== null && view.consent.current && view.consent.required_fingerprint === activePreview.fingerprint;
   const needsConsent = mode !== "rules_only" && !consentOnRecord;
   const storageChangeNeedsKey = view.key.set && !keyDraft && view.key.storage !== null && storage !== view.key.storage;
-  const dirty = mode !== view.mode || model !== (view.model ?? "") || vision !== view.vision.enabled || keyDraft !== "" || storageChangeNeedsKey;
+  const autoVerifyChanged = !sameFieldTypes(autoVerifyFieldTypes, view.auto_verify.field_types);
+  const dirty = mode !== view.mode || model !== (view.model ?? "") || vision !== view.vision.enabled || autoVerifyChanged || keyDraft !== "" || storageChangeNeedsKey;
   const saveBlocked = busy
     || (mode !== "rules_only" && !modelValid)
     || (model !== "" && !modelValid)
@@ -182,6 +188,7 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
     setMode(next.view.mode);
     setModel(next.view.model ?? "");
     setVision(next.view.vision.enabled);
+    setAutoVerifyFieldTypes(next.view.auto_verify.field_types);
     setStorage(next.view.key.storage ?? storage);
     setConsentChecked(false);
     setNotice(text);
@@ -201,6 +208,7 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
     const body: AiSettingsUpdate = { mode };
     if (modelValid) { body.provider = "gemini"; body.model = model; }
     if (vision !== view.vision.enabled) body.vision = vision;
+    if (autoVerifyChanged) body.auto_verify_field_types = autoVerifyFieldTypes;
     if (keyDraft) { body.api_key = keyDraft; body.key_storage = storage; }
     else if (!view.key.set) body.key_storage = storage;
     if (needsConsent && activePreview && consentChecked) body.consent = { accept: true, fingerprint: activePreview.fingerprint };
@@ -299,7 +307,9 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
           <div>
             <div className="panel-kicker">OPTIONAL ASSIST</div>
             <h2 id="ai-card-title">AI Assist settings</h2>
-            <p>AI output is a suggestion or advisory opinion only. It never changes quantities, totals, links used in reconciliation or verdicts unless a person accepts it.</p>
+            <p>{autoVerifyFieldTypes.length
+              ? "Selected fields may be marked verified automatically only after two independent readers agree, validators pass and a local crop reread agrees. Their values are never changed. Other AI output stays advisory."
+              : "AI output is a suggestion or advisory opinion only. It never changes quantities, totals, links used in reconciliation or verdicts unless a person accepts it."}</p>
           </div>
           <button className="icon-button" type="button" aria-label="Close AI Assist settings" onClick={onClose}><X size={18} /></button>
         </div>
@@ -317,6 +327,31 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
                 <label key={value} className={mode === value ? "selected" : undefined}>
                   <input type="radio" name="ai-mode" value={value} checked={mode === value} onChange={() => { setMode(value); setConsentChecked(false); }} />
                   <span><strong>{label}</strong><small>{hint}</small></span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset className="ai-card-section">
+            <legend>Auto-verify selected fields</legend>
+            <p>Off by default. Only field types with a zero-false-safe benchmark gate are available. A selected field must pass every D42 reader, validator and crop check; conflicts stay for review.</p>
+            <div className="ai-card-options">
+              {view.auto_verify.available_field_types.map(({ type, label }) => (
+                <label key={type} className={autoVerifyFieldTypes.includes(type) ? "selected" : undefined}>
+                  <input
+                    type="checkbox"
+                    checked={autoVerifyFieldTypes.includes(type)}
+                    onChange={(event) => {
+                      const selected = new Set(autoVerifyFieldTypes);
+                      if (event.currentTarget.checked) selected.add(type);
+                      else selected.delete(type);
+                      setAutoVerifyFieldTypes(view.auto_verify.available_field_types
+                        .map((field) => field.type)
+                        .filter((field) => selected.has(field)));
+                      setConsentChecked(false);
+                    }}
+                  />
+                  <span><strong>{label}</strong><small>Requires fresh consent when AI Assist is on.</small></span>
                 </label>
               ))}
             </div>

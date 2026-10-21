@@ -251,9 +251,12 @@ def _merge_field(merge: _Merge, document: Document, name: str, value: Any, qr: E
         return
     agreement = _same(name, current.value, value)
     if agreement == "exact":
-        merge.updates[name] = current.model_copy(
-            update={"confidence": max(current.confidence, CONFIRMED_CONFIDENCE)}
+        confidence = (
+            max(current.confidence, CONFIRMED_CONFIDENCE)
+            if current.confidence is not None
+            else None
         )
+        merge.updates[name] = current.model_copy(update={"confidence": confidence})
         merge.statuses[name] = "confirmed"
         merge.verified.append(name)
     elif agreement == "lookalike":
@@ -267,9 +270,14 @@ def _merge_field(merge: _Merge, document: Document, name: str, value: Any, qr: E
         merge.conflicts[name] = str(current.value)
         merge.verified.append(name)
     else:
+        confidence = (
+            min(current.confidence, PREFILL_CONFIDENCE)
+            if current.confidence is not None
+            else PREFILL_CONFIDENCE
+        )
         merge.updates[name] = field_type(
             value=value,
-            confidence=min(current.confidence, PREFILL_CONFIDENCE),
+            confidence=confidence,
             source=FieldSource.RULE,
             evidence=_evidence(qr, value),
         )

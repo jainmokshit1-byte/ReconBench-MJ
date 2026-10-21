@@ -7,6 +7,7 @@ Each test creates its own workspace so committed rows never interfere.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -16,18 +17,20 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from reconbench_app.ai import cache as ai_cache
 from reconbench_app.ai import ledger
 from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.key_seal import SealingPublicKey, key_hint, seal
-from reconbench_app.ai.limits import AiLimits, LimitsState, Reservation
+from reconbench_app.ai.limits import AiLimits, CallKindLimits, LimitsState, Reservation
 from reconbench_app.ai.provider import ProviderFailure
 from reconbench_app.ai.stub import ScriptedProvider
 from reconbench_app.ai.worker.handlers import default_handlers
 from reconbench_app.ai.worker.key_open import Keyring
 from reconbench_app.ai.worker.keytool import KEYRING_NAME, PUBLIC_KEY_NAME, generate, reseal
+from reconbench_app.ai.worker.openai_compat import OpenAICompatProvider
 from reconbench_app.ai.worker.runner import AiRequestDeferred, AiRequestRunner
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
@@ -228,7 +231,7 @@ def _runner(
         gate=DeploymentGate.from_values(gate, None),
         limits=lambda: LimitsState(configured),
         prices=lambda: None,
-        provider=provider,
+        providers={provider.name: provider},
         handlers=default_handlers(),
         **({"clock": clock} if clock else {}),
     )
@@ -287,6 +290,48 @@ def test_disabled_gate_skips_without_calling_the_provider(engine: Engine, keys: 
     assert (result.state, result.code) == ("skipped", "EXTERNAL_CALLS_DISABLED")
     assert provider.calls == []
     assert _row(engine, request_id)["reserved_at"] is None
+
+
+def _registry_runner(keyring: Keyring, providers: dict[str, ScriptedProvider], engine: Engine):
+    return AiRequestRunner(
+        engine=engine,
+        keyring=keyring,
+        gate=DeploymentGate.from_values("synthetic_only", None),
+        limits=lambda: LimitsState(AiLimits()),
+        prices=lambda: None,
+        providers=providers,
+        handlers=default_handlers(),
+    )
+
+
+def test_request_goes_only_to_the_provider_it_names(engine: Engine, keys: Any) -> None:
+    keyring, public_key, _ = keys
+    workspace = _workspace(engine, public_key)
+    gemini = ScriptedProvider([OK], name="gemini")
+    other = ScriptedProvider([OK], name="synthetic_other")
+    request_id = _enqueue(engine, _new_test(workspace))
+
+    result = _registry_runner(keyring, {"gemini": gemini, "synthetic_other": other}, engine).run(
+        request_id
+    )
+
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied")
+    assert len(gemini.calls) == 1
+    assert other.calls == []
+
+
+def test_unregistered_provider_skips_before_any_reservation(engine: Engine, keys: Any) -> None:
+    keyring, public_key, _ = keys
+    workspace = _workspace(engine, public_key)
+    other = ScriptedProvider([OK], name="synthetic_other")
+    request_id = _enqueue(engine, _new_test(workspace))
+
+    result = _registry_runner(keyring, {"synthetic_other": other}, engine).run(request_id)
+
+    assert (result.state, result.code) == ("skipped", "PROVIDER_NOT_CONFIGURED")
+    assert other.calls == []
+    row = _row(engine, request_id)
+    assert row["reserved_at"] is None and row["skip_code"] == "PROVIDER_NOT_CONFIGURED"
 
 
 @pytest.mark.parametrize(
@@ -676,3 +721,186 @@ def test_keytool_reseals_old_keys_to_the_current_key(
         )
         == SENTINEL_KEY.encode()
     )
+
+
+# --------------------------------------------------------------------------- vLLM (WI-BE2)
+# The real OpenAI-compatible adapter over ``httpx.MockTransport``: no network, no model
+# server. ``ai_provider`` has no ``vllm`` value until WI-BE3, so the adapter is registered
+# under the workspace's provider name; the runner still takes its local path because the
+# adapter is ``external = False``.
+
+VLLM_URL = "http://vllm.example.test/vllm/v1"
+VLLM_MODEL_WINDOW = 8_192
+
+
+class _VllmServer:
+    def __init__(self, *posts: httpx.Response, window: int = VLLM_MODEL_WINDOW) -> None:
+        self.posts = list(posts)
+        self.window = window
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.method == "GET" and request.url.path == "/vllm/v1/models":
+            return httpx.Response(200, json={"data": [{"id": MODEL, "max_model_len": self.window}]})
+        assert request.url.path == "/vllm/v1/chat/completions"
+        return self.posts.pop(0)
+
+    @property
+    def completions(self) -> list[httpx.Request]:
+        return [request for request in self.requests if request.method == "POST"]
+
+
+def _completion(content: str = OK) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "model": MODEL,
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 90, "completion_tokens": 5},
+        },
+    )
+
+
+def _vllm_runner(
+    engine: Engine,
+    keyring: Keyring,
+    server: _VllmServer,
+    *,
+    vllm_mode: str = "synthetic_only",
+    allowlist: str = VLLM_URL,
+    limits: AiLimits | None = None,
+    clock: Any = None,
+) -> AiRequestRunner:
+    provider = OpenAICompatProvider(
+        VLLM_URL, frozenset({VLLM_URL}), inner_transport=httpx.MockTransport(server)
+    )
+    configured = limits or AiLimits()
+    return AiRequestRunner(
+        engine=engine,
+        keyring=keyring,
+        # External (Gemini) calls stay disabled: the local switch alone decides.
+        gate=DeploymentGate.from_values(
+            "disabled", None, vllm_mode=vllm_mode, vllm_endpoints=allowlist
+        ),
+        limits=lambda: LimitsState(configured),
+        prices=lambda: None,
+        providers={"gemini": provider},
+        handlers=default_handlers(),
+        **({"clock": clock} if clock else {}),
+    )
+
+
+def test_vllm_adapter_answers_through_the_local_gate(engine: Engine, keys: Any) -> None:
+    keyring, public_key, _ = keys
+    workspace = _workspace(engine, public_key)
+    server = _VllmServer(_completion())
+    request_id = _enqueue(engine, _new_test(workspace))
+
+    result = _vllm_runner(engine, keyring, server).run(request_id)
+
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied")
+    [post] = server.completions
+    body = json.loads(post.read())
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["max_tokens"] == 32  # the synthetic cap is below the context budget
+    row = _row(engine, request_id)
+    assert row["usage_known"] and row["request_state"] == "succeeded"
+    assert _test_result(engine, workspace)[0] is True
+
+
+@pytest.mark.parametrize(
+    ("vllm_mode", "allowlist", "code"),
+    [
+        ("synthetic_only", "http://other.example.test/vllm/v1", "ENDPOINT_NOT_ALLOWED"),
+        ("disabled", "", "LOCAL_CALLS_DISABLED"),
+    ],
+)
+def test_vllm_gate_refusals_happen_before_any_io(
+    engine: Engine, keys: Any, vllm_mode: str, allowlist: str, code: str
+) -> None:
+    keyring, public_key, _ = keys
+    workspace = _workspace(engine, public_key)
+    server = _VllmServer(_completion())
+    request_id = _enqueue(engine, _new_test(workspace))
+
+    result = _vllm_runner(engine, keyring, server, vllm_mode=vllm_mode, allowlist=allowlist).run(
+        request_id
+    )
+
+    assert (result.state, result.code) == ("skipped", code)
+    assert server.requests == []
+    assert _row(engine, request_id)["reserved_at"] is None
+
+
+def test_vllm_call_is_skipped_when_the_context_is_too_small(engine: Engine, keys: Any) -> None:
+    keyring, public_key, _ = keys
+    workspace = _workspace(engine, public_key)
+    server = _VllmServer(_completion(), window=1_200)
+    request_id = _enqueue(engine, _new_test(workspace))
+
+    result = _vllm_runner(engine, keyring, server).run(request_id)
+
+    assert (result.state, result.code) == ("skipped", "CONTEXT_TOO_SMALL")
+    assert [request.method for request in server.requests] == ["GET"]
+    assert _row(engine, request_id)["reserved_at"] is None
+
+
+def test_vllm_503_backs_off_the_provider(engine: Engine, keys: Any) -> None:
+    keyring, public_key, _ = keys
+    workspace = _workspace(engine, public_key)
+    limits = AiLimits(
+        synthetic=CallKindLimits(max_input_bytes=1_000, max_output_tokens=32, backoff_seconds=30)
+    )
+    server = _VllmServer(httpx.Response(503), _completion())
+    # The backoff spans workspaces; a shifted clock keeps other tests' answers out of it.
+    start = datetime.now(UTC) + timedelta(minutes=10)
+    runner = _vllm_runner(engine, keyring, server, limits=limits, clock=lambda: start)
+    first = runner.run(_enqueue(engine, _new_test(workspace, subject="a")))
+    assert (first.state, first.code) == ("failed", "PROVIDER_UNAVAILABLE")
+
+    second = _enqueue(engine, _new_test(workspace, subject="b"))
+    with pytest.raises(AiRequestDeferred) as caught:
+        runner.run(second)
+    assert caught.value.code == "PROVIDER_BACKOFF"
+    assert len(server.completions) == 1
+    later = _vllm_runner(
+        engine,
+        keyring,
+        server,
+        limits=limits,
+        clock=lambda: start + timedelta(seconds=31),
+    )
+    assert later.run(second).state == "succeeded"
+
+
+def test_provider_concurrency_cap_spans_workspaces(engine: Engine, keys: Any) -> None:
+    _keyring, public_key, _ = keys
+    first, second = _workspace(engine, public_key), _workspace(engine, public_key)
+    ids = [_enqueue(engine, _new_test(first)), _enqueue(engine, _new_test(second))]
+    now = datetime.now(UTC)
+    with engine.connect() as connection:
+        busy = int(
+            connection.scalar(
+                sa.select(sa.func.count()).where(
+                    ledger.REQUESTS.c.provider == "gemini",
+                    ledger.REQUESTS.c.request_state.in_(("reserved", "sending")),
+                )
+            )
+            or 0
+        )
+    statuses = [
+        ledger.reserve(
+            engine,
+            request_id,
+            reservation=Reservation(1_000, 100, True, None, None),
+            limits=AiLimits(),
+            now=now,
+            max_concurrency=busy + 1,
+        )
+        for request_id in ids
+    ]
+    assert [item.status for item in statuses] == ["reserved", "deferred"]
+    assert statuses[1].code == "PROVIDER_IN_FLIGHT_LIMIT"
+    for request_id in ids:
+        ledger.release(engine, request_id, "TEST_DONE", now)

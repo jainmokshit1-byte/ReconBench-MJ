@@ -135,6 +135,7 @@ source_modules = [
   "reconbench_app.ai.cache",
   "reconbench_app.ai.consent",
   "reconbench_app.ai.contracts",
+  "reconbench_app.ai.endpoint_policy",
   "reconbench_app.ai.enqueue",
   "reconbench_app.ai.fixtures",
   "reconbench_app.ai.gate",
@@ -158,4 +159,7 @@ source_modules = [
 forbidden_modules = [
   "reconbench_app.ai.worker",
   "google",
+  "httpx",
+  "openai",
+  "requests",
 ]

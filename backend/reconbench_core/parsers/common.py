@@ -21,6 +21,7 @@ from reconbench_core.schema import (
     DocType,
     Document,
     FieldEvidence,
+    FieldOrigin,
     FieldSource,
     FieldValue,
     GRNHeader,
@@ -306,12 +307,16 @@ def _field[T](
 def _reduce_confidence[T](field: FieldValue[T] | None, amount: Decimal) -> FieldValue[T] | None:
     if field is None:
         return None
+    if field.confidence is None:
+        return field
     return field.model_copy(update={"confidence": max(Decimal("0"), field.confidence - amount)})
 
 
 def _raise_confidence[T](field: FieldValue[T] | None, amount: Decimal) -> FieldValue[T] | None:
     if field is None:
         return None
+    if field.confidence is None:
+        return field
     return field.model_copy(update={"confidence": min(Decimal("1"), field.confidence + amount)})
 
 
@@ -363,6 +368,7 @@ def build_document(
     line_alternatives: Sequence[Mapping[str, Sequence[str]]] = (),
     locator: str,
     source: FieldSource,
+    origin: FieldOrigin | None = None,
     base_confidence: Decimal,
     same_file_dates: Sequence[str] = (),
     uom_aliases: Mapping[str, str] | None = None,
@@ -652,32 +658,38 @@ def build_document(
     if doc_type is DocType.INVOICE:
         critical_confidences: list[Decimal] = []
         missing_critical = False
-        if header.doc_no is None:
+        if header.doc_no is None or header.doc_no.confidence is None:
             missing_critical = True
         else:
             critical_confidences.append(header.doc_no.confidence)
-        if header.doc_date is None:
+        if header.doc_date is None or header.doc_date.confidence is None:
             missing_critical = True
         else:
             critical_confidences.append(header.doc_date.confidence)
         vendor_fields = [
             field for field in (header.vendor_name, header.vendor_gstin) if field is not None
         ]
-        if not vendor_fields:
+        vendor_confidences = [
+            field.confidence for field in vendor_fields if field.confidence is not None
+        ]
+        if not vendor_confidences:
             missing_critical = True
         else:
-            critical_confidences.append(max(field.confidence for field in vendor_fields))
+            critical_confidences.append(max(vendor_confidences))
         eligible_line_count = 0
         for line in parsed_lines:
             quantity_field = line.quantity
             numeric_field = line.rate if line.rate is not None else line.amount
             if quantity_field is None or numeric_field is None:
                 continue
+            if quantity_field.confidence is None or numeric_field.confidence is None:
+                missing_critical = True
+                continue
             eligible_line_count += 1
             critical_confidences.extend((quantity_field.confidence, numeric_field.confidence))
         if eligible_line_count == 0:
             missing_critical = True
-        if header.grand_total is None:
+        if header.grand_total is None or header.grand_total.confidence is None:
             missing_critical = True
         else:
             critical_confidences.append(header.grand_total.confidence)
@@ -702,6 +714,25 @@ def build_document(
         needs_verification=needs_verification,
         reason_codes=reason_codes,
     )
+    if origin is not None:
+        header = document.header.model_copy(
+            update={
+                name: value.model_copy(update={"origin": origin})
+                for name in type(document.header).model_fields
+                if isinstance((value := getattr(document.header, name)), FieldValue)
+            }
+        )
+        lines = tuple(
+            line.model_copy(
+                update={
+                    name: value.model_copy(update={"origin": origin})
+                    for name in type(line).model_fields
+                    if isinstance((value := getattr(line, name)), FieldValue)
+                }
+            )
+            for line in document.lines
+        )
+        document = document.model_copy(update={"header": header, "lines": lines})
     return document, tuple(warnings)
 
 
@@ -856,6 +887,8 @@ def _adjust_field_confidence[T](
 ) -> FieldValue[T] | None:
     if field is None:
         return None
+    if field.confidence is None:
+        return field
     value = field.confidence + amount if increase else field.confidence - amount
     return field.model_copy(update={"confidence": min(Decimal("1"), max(Decimal("0"), value))})
 

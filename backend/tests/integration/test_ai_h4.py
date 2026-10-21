@@ -249,7 +249,7 @@ def _runner(
         gate=DeploymentGate.from_values(gate, APPROVAL if gate == "enabled" else None),
         limits=lambda: LimitsState(AiLimits()),
         prices=lambda: None,
-        provider=provider,
+        providers={provider.name: provider},
         handlers=default_handlers(),
     )
 

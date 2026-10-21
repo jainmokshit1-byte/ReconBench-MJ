@@ -20,6 +20,10 @@
       "note",
       "release"
     ],
+    "ai_apply_mode": [
+      "suggest",
+      "merge"
+    ],
     "ai_hook": [
       "h1_extract",
       "h2_item",
@@ -56,7 +60,13 @@
     "ai_provider": [
       "claude",
       "openai",
-      "gemini"
+      "gemini",
+      "vllm"
+    ],
+    "ai_reader_strategy": [
+      "off",
+      "shadow",
+      "single"
     ],
     "alias_source": [
       "merge",
@@ -311,6 +321,10 @@
       "kind": "e",
       "owner": "reconbench_migrator"
     },
+    "ai_apply_mode": {
+      "kind": "e",
+      "owner": "reconbench_migrator"
+    },
     "ai_hook": {
       "kind": "e",
       "owner": "reconbench_migrator"
@@ -332,6 +346,10 @@
       "owner": "reconbench_migrator"
     },
     "ai_provider": {
+      "kind": "e",
+      "owner": "reconbench_migrator"
+    },
+    "ai_reader_strategy": {
       "kind": "e",
       "owner": "reconbench_migrator"
     },
@@ -506,7 +524,17 @@
       "is_partition": false,
       "owner": "reconbench_migrator"
     },
+    "ai_endpoint_allow": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
     "ai_line_opinion": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
+    "ai_provider_config": {
       "kind": "r",
       "is_partition": false,
       "owner": "reconbench_migrator"
@@ -571,6 +599,16 @@
       "is_partition": false,
       "owner": "reconbench_migrator"
     },
+    "consensus_decision": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
+    "consensus_run": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
     "dirty_scope": {
       "kind": "r",
       "is_partition": false,
@@ -582,6 +620,11 @@
       "owner": "reconbench_migrator"
     },
     "document": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
+    "document_identity": {
       "kind": "r",
       "is_partition": false,
       "owner": "reconbench_migrator"
@@ -661,7 +704,17 @@
       "is_partition": false,
       "owner": "reconbench_migrator"
     },
+    "provider_measurement": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
     "rate_limit_event": {
+      "kind": "r",
+      "is_partition": false,
+      "owner": "reconbench_migrator"
+    },
+    "reader_comparison": {
       "kind": "r",
       "is_partition": false,
       "owner": "reconbench_migrator"
@@ -758,6 +811,16 @@
     }
   },
   "routines": {
+    "app_user_last_manager_guard()": {
+      "kind": "f",
+      "owner": "reconbench_migrator",
+      "sha256": "59056e678a77c2cd248c2ec003d1f42ae94d4eb45e2a2040d4f7fff538bc20e1",
+      "security_definer": false,
+      "volatility": "v",
+      "strict": false,
+      "parallel": "u",
+      "config": []
+    },
     "audit_log_chain()": {
       "kind": "f",
       "owner": "reconbench_migrator",
@@ -1130,6 +1193,11 @@
     }
   },
   "triggers": {
+    "ai_endpoint_allow.ai_endpoint_allow_append_only": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "d659a5ab6a9398882f9986da5c3d43ac0f3287dd3ec35aa5e4b21f65f1d28569"
+    },
     "ai_line_opinion.ai_line_opinion_append_only": {
       "enabled": "O",
       "routine": "forbid_mutation()",
@@ -1139,6 +1207,11 @@
       "enabled": "O",
       "routine": "forbid_mutation()",
       "sha256": "1506ed057190d3fb08b570a3581b08a2e30ffc425e1a76065fbd90c03674eb6a"
+    },
+    "app_user.app_user_last_manager": {
+      "enabled": "O",
+      "routine": "app_user_last_manager_guard()",
+      "sha256": "08cfa2cdedb2d9a061b9687b8bcaef8a9efd2f2f736d17d1b1f18082fce4619f"
     },
     "audit_log.audit_log_append_only": {
       "enabled": "O",
@@ -1180,6 +1253,11 @@
       "routine": "forbid_mutation()",
       "sha256": "8935d11911f452d416acf6599af8dc2c9f14c49b60785dc6fe0b015d4e12b0be"
     },
+    "consensus_decision.consensus_decision_append_only": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "54cd3a5e16e57de325daa856823c57b4b0a5139103444d4cf0b32497276ae15c"
+    },
     "doc_line.doc_line_append_only": {
       "enabled": "O",
       "routine": "forbid_mutation()",
@@ -1189,6 +1267,16 @@
       "enabled": "O",
       "routine": "forbid_mutation()",
       "sha256": "48de2511506ddbdfbe60a243157ce9f4f1b5ab1bf080259ab7cb7d0a42b1eb3d"
+    },
+    "document_identity.document_identity_append_only": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "d00d762bb3e82d93062896a961eaa839a2418da37d0f71b099f6c222e7db47a9"
+    },
+    "document_identity.document_identity_append_only_truncate": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "783316bb57cbb3aa7ccf69893e581f9e847d9f95306ced885cab3ce782f06935"
     },
     "document_version.document_version_append_only": {
       "enabled": "O",
@@ -1219,6 +1307,16 @@
       "enabled": "O",
       "routine": "forbid_mutation()",
       "sha256": "66b3abfba776b7903d80544b9c726a10734800079c622f5e6513d7e90a7766fc"
+    },
+    "provider_measurement.provider_measurement_append_only": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "027c4400f9a3f6cb4c6505ecb3ff4b28ea81109c542b4f087e28dcc731bcb02a"
+    },
+    "reader_comparison.reader_comparison_append_only": {
+      "enabled": "O",
+      "routine": "forbid_mutation()",
+      "sha256": "5f45a18f4295b0e97bcfa0668d9f77794e34a1577d4192bb8412452f18150dac"
     },
     "recon_case.recon_case_append_only": {
       "enabled": "O",
@@ -1393,6 +1491,32 @@
       "options": {}
     },
     {
+      "table": "ai_endpoint_allow",
+      "name": "ai_endpoint_allow_added_by_fkey",
+      "columns": [
+        "added_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "app_user",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_endpoint_allow",
+      "name": "ai_endpoint_allow_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
       "table": "ai_line_opinion",
       "name": "ai_line_opinion_ai_call_id_fkey",
       "columns": [
@@ -1473,6 +1597,71 @@
     {
       "table": "ai_line_opinion",
       "name": "ai_line_opinion_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_provider_config",
+      "name": "ai_provider_config_consent_accepted_by_fkey",
+      "columns": [
+        "consent_accepted_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "app_user",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_provider_config",
+      "name": "ai_provider_config_key_secret_id_fkey",
+      "columns": [
+        "key_secret_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "secret",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_provider_config",
+      "name": "ai_provider_config_pending_key_secret_id_fkey",
+      "columns": [
+        "pending_key_secret_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "secret",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_provider_config",
+      "name": "ai_provider_config_updated_by_fkey",
+      "columns": [
+        "updated_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "app_user",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "ai_provider_config",
+      "name": "ai_provider_config_workspace_id_fkey",
       "columns": [
         "workspace_id"
       ],
@@ -1889,6 +2078,110 @@
       "options": {}
     },
     {
+      "table": "consensus_decision",
+      "name": "consensus_decision_consensus_run_id_fkey",
+      "columns": [
+        "consensus_run_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "consensus_run",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "consensus_decision",
+      "name": "consensus_decision_document_version_id_fkey",
+      "columns": [
+        "document_version_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "document_version",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "consensus_decision",
+      "name": "consensus_decision_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "consensus_run",
+      "name": "consensus_run_ai_call_id_fkey",
+      "columns": [
+        "ai_call_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "ai_call_log",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "consensus_run",
+      "name": "consensus_run_ai_request_id_fkey",
+      "columns": [
+        "ai_request_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "ai_request",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "consensus_run",
+      "name": "consensus_run_document_version_id_fkey",
+      "columns": [
+        "document_version_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "document_version",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "consensus_run",
+      "name": "consensus_run_result_version_id_fkey",
+      "columns": [
+        "result_version_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "document_version",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "consensus_run",
+      "name": "consensus_run_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
       "table": "dirty_scope",
       "name": "dirty_scope_workspace_id_fkey",
       "columns": [
@@ -1985,6 +2278,32 @@
     {
       "table": "document",
       "name": "document_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "document_identity",
+      "name": "document_identity_document_version_id_fkey",
+      "columns": [
+        "document_version_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "document_version",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "document_identity",
+      "name": "document_identity_workspace_id_fkey",
       "columns": [
         "workspace_id"
       ],
@@ -2726,6 +3045,32 @@
       "options": {}
     },
     {
+      "table": "provider_measurement",
+      "name": "provider_measurement_imported_by_fkey",
+      "columns": [
+        "imported_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "app_user",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "provider_measurement",
+      "name": "provider_measurement_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
       "table": "rate_limit_event",
       "name": "rate_limit_event_user_id_fkey",
       "columns": [
@@ -2741,6 +3086,45 @@
     {
       "table": "rate_limit_event",
       "name": "rate_limit_event_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "reader_comparison",
+      "name": "reader_comparison_ai_request_id_fkey",
+      "columns": [
+        "ai_request_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "ai_request",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "reader_comparison",
+      "name": "reader_comparison_document_version_id_fkey",
+      "columns": [
+        "document_version_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "document_version",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "reader_comparison",
+      "name": "reader_comparison_workspace_id_fkey",
       "columns": [
         "workspace_id"
       ],
@@ -3527,6 +3911,20 @@
     },
     {
       "kind": "table",
+      "object": "ai_endpoint_allow",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_endpoint_allow",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
       "object": "ai_line_opinion",
       "grantee": "reconbench_app",
       "privilege_type": "INSERT",
@@ -3541,6 +3939,34 @@
     },
     {
       "kind": "table",
+      "object": "ai_provider_config",
+      "grantee": "reconbench_app",
+      "privilege_type": "DELETE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_provider_config",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_provider_config",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "ai_provider_config",
+      "grantee": "reconbench_app",
+      "privilege_type": "UPDATE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
       "object": "ai_request",
       "grantee": "reconbench_app",
       "privilege_type": "DELETE",
@@ -3891,6 +4317,48 @@
     },
     {
       "kind": "table",
+      "object": "consensus_decision",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "consensus_decision",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "consensus_run",
+      "grantee": "reconbench_app",
+      "privilege_type": "DELETE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "consensus_run",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "consensus_run",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "consensus_run",
+      "grantee": "reconbench_app",
+      "privilege_type": "UPDATE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
       "object": "dirty_scope",
       "grantee": "reconbench_app",
       "privilege_type": "DELETE",
@@ -3977,6 +4445,20 @@
       "kind": "table",
       "object": "document",
       "grantee": "reconbench_report",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "document_identity",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "document_identity",
+      "grantee": "reconbench_app",
       "privilege_type": "SELECT",
       "is_grantable": false
     },
@@ -4472,6 +4954,20 @@
     },
     {
       "kind": "table",
+      "object": "provider_measurement",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "provider_measurement",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
       "object": "rate_limit_event",
       "grantee": "reconbench_app",
       "privilege_type": "DELETE",
@@ -4496,6 +4992,20 @@
       "object": "rate_limit_event",
       "grantee": "reconbench_app",
       "privilege_type": "UPDATE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "reader_comparison",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "reader_comparison",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
       "is_grantable": false
     },
     {
@@ -5139,17 +5649,17 @@
     }
   ],
   "object_counts": {
-    "application_tables": 46,
+    "application_tables": 53,
     "extensions": 2,
     "views": 4,
     "materialized_views": 0,
-    "routines": 37,
-    "triggers": 24,
-    "enums": 38,
+    "routines": 38,
+    "triggers": 31,
+    "enums": 40,
     "domains": 5,
     "sequences": 1,
-    "foreign_keys": 154,
-    "explicit_acls": 250,
+    "foreign_keys": 176,
+    "explicit_acls": 268,
     "default_privileges": 7
   }
 }

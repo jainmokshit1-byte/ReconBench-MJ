@@ -126,7 +126,7 @@ describe("Invoice preview corrections", () => {
     );
 
     expect(await screen.findByRole("heading", { name: "INV-1" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Edit extracted invoice" }));
+    fireEvent.click(screen.getByRole("button", { name: /Edit extracted invoice/i }));
     fireEvent.change(screen.getByLabelText("Document number"), { target: { value: "INV-1-CORRECTED" } });
     fireEvent.click(screen.getByLabelText(/I reviewed the source PDF/));
     fireEvent.click(screen.getByRole("button", { name: "Save and mark reviewed" }));
@@ -139,6 +139,7 @@ describe("Invoice preview corrections", () => {
     const body = JSON.parse(String(request.init.body)) as Record<string, unknown>;
     expect(body["doc_no"]).toBe("INV-1-CORRECTED");
     expect(body["verified"]).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Show all fields" }));
     expect(await screen.findByRole("heading", { name: "INV-1-CORRECTED" })).toBeInTheDocument();
     expect(await screen.findByRole("status")).toHaveTextContent("marked reviewed");
   });
@@ -187,6 +188,7 @@ describe("Invoice preview corrections", () => {
     expect(body["doc_no"]).toBe("MANUAL-INV-1");
     expect(body["vendor_name"]).toBe("Manual Vendor");
     expect(body["verified"]).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Show all fields" }));
     expect(await screen.findByRole("heading", { name: "MANUAL-INV-1" })).toBeInTheDocument();
   });
 });

@@ -8,7 +8,10 @@ from typing import Any
 from uuid import uuid4
 
 from reconbench_app.db.seed_data import DEFAULT_CONFIG
+from reconbench_core.parsers.types import PageImageHash
 from reconbench_core.schema import (
+    CaseResult,
+    CaseStatus,
     DocLine,
     DocType,
     Document,
@@ -17,7 +20,9 @@ from reconbench_core.schema import (
     FieldValue,
     InvoiceHeader,
     LinkState,
+    ReasonCode,
 )
+from reconbench_core.version import ENGINE_VERSION
 from scripts.accuracy_bench import (
     Parsed,
     SystemDocument,
@@ -25,8 +30,10 @@ from scripts.accuracy_bench import (
     TruthDocument,
     TruthFile,
     assign_truth,
+    build_workspace,
     score_document,
     score_links,
+    score_recon,
     score_vendors,
     simulate_vendors,
 )
@@ -61,7 +68,11 @@ def _invoice(
         grand_total=_field(Decimal(total)),
         po_refs=_field(po_refs) if po_refs is not None else None,
     )
-    line = DocLine(line_no=1, quantity=_field(Decimal("1")), amount=_field(Decimal(total)))
+    line = DocLine(
+        line_no=1,
+        quantity=_field(Decimal("1")),
+        amount=_field(Decimal(total)),
+    )
     return Document(header=header, lines=(line,), needs_verification=flagged)
 
 
@@ -118,6 +129,128 @@ def test_bundle_file_assigns_the_matching_truth_document_and_misses_the_rest() -
     assigned = assign_truth([po, invoice], (_invoice("INV-9", "100.00"),))
 
     assert assigned == {0: "S1-INV"}
+
+
+def test_workspace_groups_near_page_hashes_only_with_exact_content_fingerprint() -> None:
+    first = Parsed(
+        "F1",
+        0,
+        "sha-a",
+        _invoice("INV-1", "100.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="0000000000000000"),),
+    )
+    near = Parsed(
+        "F2",
+        0,
+        "sha-b",
+        _invoice("INV-2", "100.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="0000000000000001"),),
+    )
+    different_content = Parsed(
+        "F3",
+        0,
+        "sha-c",
+        _invoice("INV-3", "101.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="0000000000000001"),),
+    )
+
+    grouped = build_workspace([first, near, different_content])
+
+    assert len(grouped) == 2
+    assert sorted(len(item.versions) for item in grouped) == [1, 2]
+
+
+def test_workspace_uses_exact_verified_natural_identity_when_content_changes() -> None:
+    first = Parsed(
+        "F1",
+        0,
+        "sha-a",
+        _invoice("INV-1", "100.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="0000000000000000"),),
+    )
+    changed = Parsed(
+        "F2",
+        0,
+        "sha-b",
+        _invoice("INV-1", "101.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="ffffffffffffffff"),),
+    )
+
+    grouped = build_workspace([first, changed])
+
+    assert len(grouped) == 1
+    assert len(grouped[0].versions) == 2
+
+
+def test_workspace_refuses_ambiguous_near_page_hash_candidates() -> None:
+    first = Parsed(
+        "F1",
+        0,
+        "sha-a",
+        _invoice("INV-1", "100.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="000000000000ffff"),),
+    )
+    second = Parsed(
+        "F2",
+        0,
+        "sha-b",
+        _invoice("INV-2", "100.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="00000000ffff0000"),),
+    )
+    ambiguous = Parsed(
+        "F3",
+        0,
+        "sha-c",
+        _invoice("INV-3", "100.00"),
+        "S1-INV",
+        page_hashes=(PageImageHash(page=1, value="0000000000000000"),),
+    )
+
+    grouped = build_workspace([first, second, ambiguous])
+
+    assert len(grouped) == 3
+    assert [len(item.versions) for item in grouped] == [1, 1, 1]
+
+
+def test_benchmark_counts_suspected_duplicates_as_flagged() -> None:
+    original = _system(_invoice("INV-1", "100.00"), "S1-INV")
+    copy = _system(_invoice("INV-2", "100.00"), "S1-INV")
+    truth = Truth(
+        run_date=date(2026, 10, 1),
+        buyer_entities=(),
+        files=(TruthFile("F1", "synthetic.pdf", DocType.INVOICE),),
+        documents=(_truth_doc("S1-INV", {"doc_no": "INV-1"}),),
+        digest="0" * 64,
+    )
+    cases = (
+        CaseResult(
+            engine_version=ENGINE_VERSION,
+            rules_hash="0" * 64,
+            invoice_id=original.document_id,
+            status=CaseStatus.UNLINKED,
+        ),
+        CaseResult(
+            engine_version=ENGINE_VERSION,
+            rules_hash="0" * 64,
+            invoice_id=copy.document_id,
+            status=CaseStatus.UNLINKED,
+            duplicate_of_id=original.document_id,
+            reason_codes=(ReasonCode.DUP_SUSPECTED,),
+        ),
+    )
+
+    report = score_recon([original, copy], cases, truth, {})
+
+    assert report["duplicates_caught"] == 1
+    assert report["duplicates_missed"] == 0
+    assert report["false_duplicates"] == 0
 
 
 def _system(document: Document, truth_id: str) -> SystemDocument:

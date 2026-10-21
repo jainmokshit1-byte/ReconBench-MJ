@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Any, cast
@@ -54,12 +55,58 @@ def _as_date(value: object | None) -> date | None:
     return value if isinstance(value, date) else None
 
 
+@dataclass(frozen=True, slots=True)
+class _CurrentSnapshot:
+    """The current documents of one workspace and its governing POs (WI-PERF1, D98).
+
+    A drain batch rebuilds many POs in one transaction; ledger writes never change a
+    document or which PO revision governs, so the batch loads this once instead of once
+    per PO. A single ``rebuild_po`` still loads its own.
+    """
+
+    workspace_id: UUID
+    by_document: dict[UUID, tuple[RowMapping, Any]]
+    line_rows: dict[UUID, Any]
+    governing: frozenset[UUID]
+
+
 class LedgerRebuildService:
     """Rebuild ledgers from the current PO, active links and source versions."""
 
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
         self.mapping = MappingService(engine)
+        self._batch_snapshot: _CurrentSnapshot | None = None
+
+    def _current_snapshot(self, connection: Connection, workspace_id: UUID) -> _CurrentSnapshot:
+        batch = self._batch_snapshot
+        if batch is not None and batch.workspace_id == workspace_id:
+            return batch
+        rows, line_rows, text_by_version, header_evidence, line_evidence = (
+            self.mapping._load_current(connection, workspace_id)
+        )
+        by_document: dict[UUID, tuple[RowMapping, Any]] = {}
+        po_candidates: list[tuple[RowMapping, Any, UUID | None]] = []
+        for row in rows:
+            document_id = cast(UUID, row["document_id"])
+            version_id = cast(UUID, row["version_id"])
+            document = _make_document(
+                row,
+                line_rows.get(version_id, ()),
+                text_by_version.get(version_id, ""),
+                header_evidence.get(version_id, {}),
+                line_evidence,
+            )
+            by_document[document_id] = (row, document)
+            if document.header.doc_type is DocType.PO:
+                po_candidates.append((row, document, cast(UUID | None, row["vendor_id"])))
+        governing = self.mapping._governing_pos(connection, workspace_id, po_candidates)
+        return _CurrentSnapshot(
+            workspace_id=workspace_id,
+            by_document=by_document,
+            line_rows=dict(line_rows),
+            governing=frozenset(item.document_id for item in governing),
+        )
 
     @requires("links.edit")
     def rebuild_po(self, workspace_id: UUID, po_document_id: UUID) -> dict[str, int | bool]:
@@ -79,31 +126,15 @@ class LedgerRebuildService:
             sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_name, 0))"),
             {"lock_name": f"reconbench.po:{po_document_id}"},
         )
-        rows, line_rows, text_by_version, header_evidence, line_evidence = (
-            self.mapping._load_current(connection, workspace_id)
-        )
-        by_document: dict[UUID, tuple[RowMapping, Any]] = {}
-        po_candidates: list[tuple[RowMapping, Any, UUID | None]] = []
-        for row in rows:
-            document_id = cast(UUID, row["document_id"])
-            version_id = cast(UUID, row["version_id"])
-            document = _make_document(
-                row,
-                line_rows.get(version_id, ()),
-                text_by_version.get(version_id, ""),
-                header_evidence.get(version_id, {}),
-                line_evidence,
-            )
-            by_document[document_id] = (row, document)
-            if document.header.doc_type is DocType.PO:
-                po_candidates.append((row, document, cast(UUID | None, row["vendor_id"])))
+        snapshot = self._current_snapshot(connection, workspace_id)
+        by_document = snapshot.by_document
+        line_rows = snapshot.line_rows
 
         target = by_document.get(po_document_id)
         if target is None or target[1].header.doc_type is not DocType.PO:
             raise ValueError("PO document is not current in this workspace")
 
-        governing = self.mapping._governing_pos(connection, workspace_id, po_candidates)
-        if po_document_id not in {item.document_id for item in governing}:
+        if po_document_id not in snapshot.governing:
             return self._remove_obsolete_ledger(connection, workspace_id, po_document_id)
 
         po_row, po_document = target
@@ -316,10 +347,17 @@ class LedgerRebuildService:
                 else:
                     raise ValueError(f"unsupported dirty scope kind: {kind}")
 
-            results = [
-                self.rebuild_po_connection(connection, workspace_id, po_id)
-                for po_id in sorted(rebuilt, key=str)
-            ]
+            # One snapshot of the current documents for the whole batch (WI-PERF1, D98).
+            self._batch_snapshot = (
+                self._current_snapshot(connection, workspace_id) if len(rebuilt) > 1 else None
+            )
+            try:
+                results = [
+                    self.rebuild_po_connection(connection, workspace_id, po_id)
+                    for po_id in sorted(rebuilt, key=str)
+                ]
+            finally:
+                self._batch_snapshot = None
             if claimed:
                 connection.execute(
                     sa.update(scopes)

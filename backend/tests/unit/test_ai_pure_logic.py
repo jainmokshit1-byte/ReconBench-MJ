@@ -517,6 +517,32 @@ def test_consent_fingerprint_changes_with_every_consented_input(
     assert base not in variants and len(variants) == 5
 
 
+def test_auto_verify_consent_preserves_the_legacy_off_fingerprint() -> None:
+    legacy = "a699ad4f98fde8f51ca62562ee7c17a4484f92d5d1ec627637987518b2d6bd7e"
+    base = consent.consent_fingerprint(
+        provider="gemini", model="gemini-3.8-flash", mode="ai_assisted"
+    )
+    assert base == legacy
+    selected = consent.consent_fingerprint(
+        provider="gemini",
+        model="gemini-3.8-flash",
+        mode="ai_assisted",
+        auto_verify_field_types=("doc_no", "gstin"),
+    )
+    reordered = consent.consent_fingerprint(
+        provider="gemini",
+        model="gemini-3.8-flash",
+        mode="ai_assisted",
+        auto_verify_field_types=("gstin", "doc_no"),
+    )
+    assert selected != legacy and selected == reordered
+    assert "document number" in consent.consent_text(
+        provider="Google Gemini",
+        model="gemini-3.8-flash",
+        auto_verify_field_types=("doc_no",),
+    )
+
+
 def test_every_hook_in_a_mode_has_a_data_disclosure() -> None:
     for hooks in consent.HOOKS_BY_MODE.values():
         for hook in hooks:

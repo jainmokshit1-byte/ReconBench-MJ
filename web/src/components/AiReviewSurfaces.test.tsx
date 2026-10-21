@@ -128,16 +128,16 @@ describe("H1 AI suggestions in the invoice preview", () => {
     expect(await screen.findByText(label)).toBeInTheDocument();
     expect(screen.getAllByText("Advisory").length).toBeGreaterThan(0);
     expect(screen.getByText(/Page 1: “Invoice No: INV-1-AI”/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Apply Line 1 quantity to draft" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Use suggested Line 1 quantity" })).toBeDisabled();
     expect(screen.getByText("Line 1 is not in the draft")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Apply Document number to draft" }));
-    fireEvent.click(screen.getByRole("button", { name: "Apply PO references to draft" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use suggested Document number" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use suggested PO references" }));
     expect(screen.getByLabelText("Document number")).toHaveValue("INV-1-AI");
     expect(screen.getByLabelText("PO references")).toHaveValue("PO-77");
     expect(screen.getByRole("heading", { name: "INV-1" })).toBeInTheDocument();
     expect(writes).toHaveLength(0);
-    expect(screen.getByRole("button", { name: "Apply Document number to draft" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Use suggested Document number" })).toBeDisabled();
 
     // A value the person changes afterwards is no longer claimed as AI-suggested.
     fireEvent.change(screen.getByLabelText("Document number"), { target: { value: "INV-1-TYPED" } });
@@ -149,12 +149,12 @@ describe("H1 AI suggestions in the invoice preview", () => {
     expect(body["ai_suggestion_refs"]).toEqual([{ ai_call_id: "call-1", scope: "header", line_no: null, field: "po_refs" }]);
   });
 
-  it("blocks Apply when the suggestions belong to another document version", async () => {
+  it("blocks the suggested value when it belongs to another document version", async () => {
     const writes = installFetch(suggestionsView({ document_version: 2 }));
     renderPreview();
 
     expect(await screen.findByRole("alert")).toHaveTextContent("belong to version 2, but this preview shows version 1");
-    expect(screen.getByRole("button", { name: "Apply Document number to draft" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Use suggested Document number" })).toBeDisabled();
     expect(screen.queryByLabelText("Document number")).not.toBeInTheDocument();
     expect(writes).toHaveLength(0);
   });
@@ -163,10 +163,10 @@ describe("H1 AI suggestions in the invoice preview", () => {
     installFetch(suggestionsView());
     renderPreview();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Ignore Document number" }));
-    expect(screen.queryByRole("button", { name: "Apply Document number to draft" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Keep current for Document number" }));
+    expect(screen.queryByRole("button", { name: "Use suggested Document number" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Show 1 ignored" }));
-    expect(screen.getByRole("button", { name: "Apply Document number to draft" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Use suggested Document number" })).toBeEnabled();
   });
 
   it("explains pending suggestions and shows nothing when AI does not apply", async () => {
@@ -182,10 +182,10 @@ describe("H1 AI suggestions in the invoice preview", () => {
     expect(screen.queryByRole("region", { name: "AI suggestions" })).not.toBeInTheDocument();
   });
 
-  it("shows page-image readings as printed, with handwritten marks, and read-only for PO/GRN", async () => {
+  it("shows page-image readings as printed with current and suggested review choices", async () => {
     installFetch(suggestionsView({
       source: "vision",
-      correctable: false,
+      correctable: true,
       label: "AI page-image reading: documents the rules could not verify",
       suggestions: [
         { scope: "header", line_no: null, field: "doc_no", value: "GRN-9", current_value: "GRN-8", matches_current: false, page: 1, quote: "GRN-9", start: null, end: null, box: [80, 60, 100, 400] },
@@ -197,8 +197,9 @@ describe("H1 AI suggestions in the invoice preview", () => {
     expect(await screen.findByText(/read from the page image/)).toBeInTheDocument();
     expect(screen.getByText(/Page 1 \(as printed\): “GRN-9”/)).toBeInTheDocument();
     expect(screen.getByText(/“PO 26-27\/04-777” \(po number\)/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Apply Document number to draft" })).toBeDisabled();
-    expect(screen.getAllByText(/PO\/GRN corrections come with the verify screen/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Use suggested Document number" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Keep current for Document number" })).toBeEnabled();
+    expect(screen.queryByText(/Corrections are not enabled/)).not.toBeInTheDocument();
   });
 });
 

@@ -329,6 +329,63 @@ def test_ai_request_state_constraints(connection: Connection, seed: tuple[UUID, 
     )
 
 
+def test_revision_0025_reader_params_and_cache_provenance(
+    connection: Connection, seed: tuple[UUID, UUID]
+) -> None:
+    workspace_id, _user_id = seed
+    requests = metadata.tables["ai_request"]
+    plain = _request(workspace_id, request_key=_hash("reader-default"))
+    _insert_request(connection, plain)
+    stored = connection.scalar(
+        sa.select(requests.c.reader_params).where(requests.c.id == plain["id"])
+    )
+    assert stored == {}
+    _insert_request(
+        connection,
+        _request(
+            workspace_id,
+            request_key=_hash("reader-vision"),
+            reader_params={"reader": "vision_gemini", "pass": "full"},
+        ),
+    )
+    _rejects(
+        connection,
+        _request(workspace_id, request_key=_hash("reader-list"), reader_params=["full"]),
+    )
+
+    cache = metadata.tables["ai_cache"]
+    entry: dict[str, Any] = {
+        "workspace_id": workspace_id,
+        "hook": "h6_vision",
+        "model": "gemini-3.8-flash",
+        "prompt_version": "vision.prompt.synthetic",
+        "response": {},
+    }
+    # Entries written before 0025 have no provenance; they stay valid.
+    connection.execute(sa.insert(cache).values(id=new_id(), cache_key=_hash("legacy"), **entry))
+    connection.execute(
+        sa.insert(cache).values(
+            id=new_id(),
+            cache_key=_hash("v2"),
+            provider="gemini",
+            schema_version="vision.schema.synthetic",
+            reader_params={"reader": "vision_gemini"},
+            **entry,
+        )
+    )
+    for index, overrides in enumerate(
+        ({"reader_params": ["full"]}, {"schema_version": ""}, {"schema_version": "s" * 65})
+    ):
+        savepoint = connection.begin_nested()
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                sa.insert(cache).values(
+                    id=new_id(), cache_key=_hash(f"bad-{index}"), **entry, **overrides
+                )
+            )
+        savepoint.rollback()
+
+
 def test_one_live_attempt_per_request_until_uncertainty_is_acknowledged(
     connection: Connection, seed: tuple[UUID, UUID]
 ) -> None:

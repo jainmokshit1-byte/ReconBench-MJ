@@ -88,6 +88,14 @@ describe("SettingsPage", () => {
     expect(screen.queryByRole("region", { name: "Unsaved settings" })).toBeNull();
   });
 
+  it("warns while no buyer entity is configured and links to the field", async () => {
+    installFetch();
+    renderPage();
+    const note = await screen.findByRole("note", { name: "Buyer entities not configured" });
+    expect(within(note).getByRole("link", { name: "Add buyer entities" }).getAttribute("href")).toBe("#buyer-entities");
+    expect(document.getElementById("buyer-entities")).toBeTruthy();
+  });
+
   it("blocks saving an invalid buyer GSTIN and accepts a valid one", async () => {
     installFetch();
     renderPage();

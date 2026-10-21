@@ -8,7 +8,13 @@ from typing import Any
 
 from reconbench_core.parsers.csv import parse_csv
 from reconbench_core.parsers.pdf import parse_pdf
-from reconbench_core.parsers.types import PageText, ParseResult, ParserHints, ParseWarning
+from reconbench_core.parsers.types import (
+    PageImageHash,
+    PageText,
+    ParseResult,
+    ParserHints,
+    ParseWarning,
+)
 from reconbench_core.parsers.xml import parse_xml
 from reconbench_core.schema import FileFormat
 
@@ -58,4 +64,4 @@ def parse(content: bytes, hints: ParserHints | Mapping[str, Any] | None = None) 
         )
 
 
-__all__ = ["PageText", "ParseResult", "ParseWarning", "ParserHints", "parse"]
+__all__ = ["PageImageHash", "PageText", "ParseResult", "ParseWarning", "ParserHints", "parse"]

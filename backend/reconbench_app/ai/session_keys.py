@@ -9,6 +9,8 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
+from reconbench_app.ai.ledger import clear_provider_config_keys
+
 
 def delete_session_keys(
     connection: Connection, session_ids: Sequence[UUID], *, now: datetime
@@ -33,6 +35,7 @@ def delete_session_keys(
         ),
         {"now": now, "secrets": secret_ids},
     )
+    clear_provider_config_keys(connection, secret_ids, now=now)
     connection.execute(
         sa.text("DELETE FROM secret WHERE id = ANY(:secrets)"), {"secrets": secret_ids}
     )

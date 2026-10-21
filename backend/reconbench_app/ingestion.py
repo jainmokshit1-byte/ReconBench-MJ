@@ -35,23 +35,25 @@ from reconbench_core.normalize import (
 from reconbench_core.parsers import ParseResult, ParserHints, parse
 from reconbench_core.parsers.common import arithmetic_failures
 from reconbench_core.parsers.parties import party_hints_from_config
-from reconbench_core.parsers.types import PageSplit, ParseWarning
+from reconbench_core.parsers.types import PageImageHash, PageSplit, ParseWarning
 from reconbench_core.schema import (
     DocLine,
     DocType,
     Document,
     ExtractionMethod,
     FieldEvidence,
+    FieldOrigin,
     FieldSource,
     FieldValue,
+    FieldVerification,
     FileFormat,
     InvoiceHeader,
     UploadZone,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection, Engine, RowMapping
 
-from reconbench_app.ai import h1, vision
+from reconbench_app.ai import h1, shadow, vision
 from reconbench_app.ai.contracts import (
     FieldKind,
     H1Output,
@@ -65,6 +67,16 @@ from reconbench_app.audit import write_audit_event
 from reconbench_app.authorization import ActorContext, requires
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
+from reconbench_app.document_identity import (
+    content_fingerprint,
+    document_identity_collision_key,
+    document_natural_key,
+    identity_payload,
+    page_hashes_within_distance,
+    rescan_identity_payload,
+    verified_field_confidence,
+)
+from reconbench_app.extraction.engine import DEFAULT_ENGINE
 from reconbench_app.extraction.vision_pages import vision_pages_isolated
 from reconbench_app.pdf_sandbox import parse_pdf_isolated
 from reconbench_app.storage import ObjectStore
@@ -73,7 +85,7 @@ if TYPE_CHECKING:
     from reconbench_app.ai.enqueue import AiHookEnqueuer
 
 _LOGGER = logging.getLogger(__name__)
-PARSER_VERSION = "phase4-parser-4"
+PARSER_VERSION = "phase4-parser-7"  # 7: native Tally exports (WI-IMP1, D95)
 _MAX_DISPLAY_NAME = 255
 _READ_CHUNK_BYTES = 64 * 1024
 _CSV_MAPPING_FIELDS = frozenset(
@@ -155,9 +167,92 @@ INVOICE_LINE_COLUMNS: Mapping[str, str] = {
     "rate": "rate",
     "amount": "amount",
 }
+_COMMON_CORRECTION_HEADER_COLUMNS: Mapping[str, str] = {
+    "doc_no": "doc_no",
+    "doc_date": "doc_date",
+    "vendor_name": "vendor_name",
+    "vendor_gstin": "vendor_gstin",
+    "buyer_gstin": "buyer_gstin",
+    "currency": "currency",
+    "taxable_total": "taxable_total",
+    "cgst": "cgst_total",
+    "sgst": "sgst_total",
+    "igst": "igst_total",
+    "round_off": "round_off",
+    "grand_total": "grand_total",
+}
+_PO_CORRECTION_HEADER_COLUMNS: Mapping[str, str] = {
+    **_COMMON_CORRECTION_HEADER_COLUMNS,
+    "revision": "revision",
+    "status": "po_status",
+    "ship_to": "ship_to",
+    "payment_terms": "payment_terms_text",
+    "delivery_date": "delivery_date",
+}
+_GRN_CORRECTION_HEADER_COLUMNS: Mapping[str, str] = {
+    **_COMMON_CORRECTION_HEADER_COLUMNS,
+    "po_refs": "po_refs",
+    "challan_no": "challan_no",
+    "supplier_invoice_no": "supplier_invoice_no",
+}
+_CORRECTION_HEADER_COLUMNS_BY_TYPE: Mapping[str, Mapping[str, str]] = {
+    DocType.INVOICE.value: INVOICE_HEADER_COLUMNS,
+    DocType.PO.value: _PO_CORRECTION_HEADER_COLUMNS,
+    DocType.GRN.value: _GRN_CORRECTION_HEADER_COLUMNS,
+}
+_PO_CORRECTION_LINE_COLUMNS: Mapping[str, str] = {
+    "line_type": "line_type",
+    "description": "description",
+    "item_code": "item_code",
+    "hsn_sac": "hsn_sac",
+    "uom": "uom_as_read",
+    "quantity": "quantity",
+    "rate": "rate",
+    "discount": "discount",
+    "amount": "amount",
+    "tax_rate": "tax_rate",
+    "cgst_amount": "cgst_amount",
+    "sgst_amount": "sgst_amount",
+    "igst_amount": "igst_amount",
+    "po_ref": "po_ref",
+    "po_line_ref": "po_line_ref",
+}
+_GRN_CORRECTION_LINE_COLUMNS: Mapping[str, str] = {
+    "line_type": "line_type",
+    "description": "description",
+    "item_code": "item_code",
+    "hsn_sac": "hsn_sac",
+    "uom": "uom_as_read",
+    "quantity": "quantity",
+    "received_qty": "received_qty",
+    "rejected_qty": "rejected_qty",
+    "accepted_qty": "accepted_qty",
+    "rate": "rate",
+    "discount": "discount",
+    "amount": "amount",
+    "tax_rate": "tax_rate",
+    "cgst_amount": "cgst_amount",
+    "sgst_amount": "sgst_amount",
+    "igst_amount": "igst_amount",
+    "po_ref": "po_ref",
+    "po_line_ref": "po_line_ref",
+}
+_CORRECTION_LINE_COLUMNS_BY_TYPE: Mapping[str, Mapping[str, str]] = {
+    DocType.INVOICE.value: INVOICE_LINE_COLUMNS,
+    DocType.PO.value: _PO_CORRECTION_LINE_COLUMNS,
+    DocType.GRN.value: _GRN_CORRECTION_LINE_COLUMNS,
+}
 _MANUAL_SNIPPET = "Entered by reviewer; not quoted from the PDF source."
 _AI_SNIPPET_LIMIT = 500
 _CORRECTION_QA_CODE = "CORRECTION_QA_FAILED"
+
+
+def _correction_header_columns(doc_type: str) -> Mapping[str, str]:
+    return _CORRECTION_HEADER_COLUMNS_BY_TYPE.get(doc_type, {})
+
+
+def _correction_line_columns(doc_type: str) -> Mapping[str, str]:
+    return _CORRECTION_LINE_COLUMNS_BY_TYPE.get(doc_type, {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +289,35 @@ class IngestionLimits(BaseModel):
     @property
     def max_zip_uncompressed_bytes(self) -> int:
         return self.zip_max_uncompressed_gb * 1024**3
+
+
+def parser_hints_from_config(
+    body: Mapping[str, Any],
+    *,
+    zone_type: DocType | None,
+    file_format: FileFormat,
+    limits: IngestionLimits,
+    page_split: PageSplit = PageSplit.AUTO,
+    column_mapping: Mapping[str, str] | None = None,
+) -> ParserHints:
+    """Parser hints from a config body; upload and the accuracy bench both build them here."""
+
+    engine_body = body.get("engine", {})
+    synonyms = engine_body.get("synonyms", {}) if isinstance(engine_body, Mapping) else {}
+    uom = engine_body.get("uom", {}) if isinstance(engine_body, Mapping) else {}
+    policies = engine_body.get("charge_keywords", []) if isinstance(engine_body, Mapping) else []
+    return ParserHints(
+        doc_type=zone_type,
+        file_format=file_format,
+        synonyms=_parser_synonym_overrides(synonyms),
+        column_mapping=dict(column_mapping or {}),
+        uom_aliases=dict(uom.get("aliases", {})) if isinstance(uom, Mapping) else {},
+        charge_keywords=tuple(policies) if policies else ParserHints().charge_keywords,
+        max_bytes=limits.max_file_bytes,
+        max_pages=limits.max_pages,
+        page_split=page_split,
+        **(party_hints_from_config(engine_body) if isinstance(engine_body, Mapping) else {}),
+    )
 
 
 class IngestionFailure(RuntimeError):
@@ -318,6 +442,7 @@ class IngestionService:
         *,
         ocr_languages: tuple[str, ...] = ("eng",),
         einvoice_keys: tuple[Any, ...] = (),
+        extraction_engine: str = DEFAULT_ENGINE,
         ai_hooks: AiHookEnqueuer | None = None,
         ai_limits: Callable[[], LimitsState] | None = None,
     ) -> None:
@@ -326,6 +451,7 @@ class IngestionService:
         self.queue = queue
         self.ocr_languages = ocr_languages
         self.einvoice_keys = einvoice_keys
+        self.extraction_engine = extraction_engine
         self.ai_hooks = ai_hooks
         self.ai_limits = ai_limits or (lambda: LimitsState(AiLimits()))
 
@@ -1630,6 +1756,7 @@ class IngestionService:
                 content,
                 parser_hints,
                 languages=self.ocr_languages,
+                engine_name=self.extraction_engine,
                 einvoice_keys=self.einvoice_keys,
             )
         elif row["zone"] == UploadZone.OPENING_BALANCE.value:
@@ -1713,12 +1840,6 @@ class IngestionService:
 
     def _parser_hints(self, workspace_id: UUID, file_row: Mapping[str, Any]) -> ParserHints:
         body = self._active_config_body(workspace_id)
-        engine_body = body.get("engine", {})
-        synonyms = engine_body.get("synonyms", {}) if isinstance(engine_body, Mapping) else {}
-        uom = engine_body.get("uom", {}) if isinstance(engine_body, Mapping) else {}
-        policies = (
-            engine_body.get("charge_keywords", []) if isinstance(engine_body, Mapping) else []
-        )
         zone_type = {
             "po": DocType.PO,
             "grn": DocType.GRN,
@@ -1747,17 +1868,13 @@ class IngestionService:
                         for label, field in saved_mapping.items()
                         if isinstance(label, str) and isinstance(field, str)
                     }
-        return ParserHints(
-            doc_type=zone_type,
+        return parser_hints_from_config(
+            body,
+            zone_type=zone_type,
             file_format=FileFormat(file_row["format"]),
-            synonyms=_parser_synonym_overrides(synonyms),
-            column_mapping=column_mapping,
-            uom_aliases=dict(uom.get("aliases", {})) if isinstance(uom, Mapping) else {},
-            charge_keywords=tuple(policies) if policies else ParserHints().charge_keywords,
-            max_bytes=limits.max_file_bytes,
-            max_pages=limits.max_pages,
+            limits=limits,
             page_split=_page_split_mode(file_row),
-            **(party_hints_from_config(engine_body) if isinstance(engine_body, Mapping) else {}),
+            column_mapping=column_mapping,
         )
 
     def _active_config_body(self, workspace_id: UUID) -> dict[str, Any]:
@@ -1821,6 +1938,12 @@ class IngestionService:
             if not parse_failed:
                 hints = self._parser_hints(workspace_id, file_row)
                 for document in result.documents:
+                    own_pages = split_pages(document)
+                    document_page_hashes = tuple(
+                        page_hash
+                        for page_hash in result.page_image_hashes
+                        if not own_pages or page_hash.page in own_pages
+                    )
                     outcome, document_id, version_id = self._upsert_document(
                         connection,
                         workspace_id=workspace_id,
@@ -1829,6 +1952,7 @@ class IngestionService:
                         actor_id=cast(UUID | None, file_row["uploaded_by"]),
                         document=document,
                         file_sha=cast(str, file_row["sha256"]),
+                        page_hashes=document_page_hashes,
                         job_id=job_id,
                         parser_version=PARSER_VERSION,
                         layout_signature=result.layout_signature,
@@ -1847,10 +1971,9 @@ class IngestionService:
                     else:
                         documents_skipped += 1
                     if version_id is not None and outcome != "skipped" and result.page_texts:
-                        if result.file_format is FileFormat.PDF:
+                        if result.file_format is FileFormat.PDF and outcome != "alternative":
                             pdf_version_ids.append(version_id)
                         text_table = metadata.tables["document_text"]
-                        own_pages = split_pages(document)
                         for page_text in result.page_texts:
                             if own_pages and page_text.page not in own_pages:
                                 continue
@@ -2296,6 +2419,7 @@ class IngestionService:
         actor_id: UUID | None,
         document: Document,
         file_sha: str,
+        page_hashes: tuple[PageImageHash, ...] = (),
         job_id: int | None,
         parser_version: str,
         layout_signature: str,
@@ -2315,23 +2439,121 @@ class IngestionService:
         vendor_identity = _vendor_identity(gstin, vendor_name)
         content_value = document.model_dump(mode="json")
         content_hash = _canonical_hash(content_value)
-        natural_key = document_natural_key(document, file_sha)
-        existing = (
-            connection.execute(
-                sa.select(document_table)
+        structured = extraction_method in {
+            ExtractionMethod.XML_PROFILE,
+            ExtractionMethod.CSV_MAPPING,
+            ExtractionMethod.MANUAL,
+        }
+        rescan_identity = rescan_identity_payload(
+            document, file_sha, page_hashes=page_hashes, structured=structured
+        )
+        natural_key = document_natural_key(
+            document, file_sha, page_hashes=page_hashes, structured=structured
+        )
+        natural_identity = identity_payload(
+            document, file_sha, page_hashes=page_hashes, structured=structured
+        )
+        content_identity = content_fingerprint(document, structured=structured)
+        incoming_verified_confidence = verified_field_confidence(document, structured=structured)
+        identity_table = metadata.tables["document_identity"]
+        identity_query = (
+            sa.select(version_table.c.document_id)
+            .join(
+                identity_table,
+                identity_table.c.document_version_id == version_table.c.id,
+            )
+            .join(document_table, document_table.c.id == version_table.c.document_id)
+            .where(
+                identity_table.c.workspace_id == workspace_id,
+                version_table.c.workspace_id == workspace_id,
+                document_table.c.workspace_id == workspace_id,
+                document_table.c.doc_type == header.doc_type.value,
+            )
+        )
+        if rescan_identity["kind"] == "fingerprint":
+            exact_query = identity_query.where(
+                identity_table.c.content_fingerprint == content_identity,
+                identity_table.c.page_hashes
+                == [item.value for item in sorted(page_hashes, key=lambda item: item.page)],
+            )
+            candidate_ids = set(connection.scalars(exact_query.distinct()).all())
+            if not candidate_ids:
+                # Exact SHA + locator is stronger than a bounded perceptual
+                # match when earlier versions lack captured page hashes.
+                legacy_query = identity_query.where(
+                    sa.or_(
+                        identity_table.c.content_fingerprint.is_(None),
+                        identity_table.c.page_hashes == [],
+                    ),
+                    identity_table.c.source_sha256 == file_sha,
+                    identity_table.c.source_locator == document.source_locator,
+                )
+                candidate_ids = set(connection.scalars(legacy_query.distinct()).all())
+            if not candidate_ids:
+                fingerprint_rows = connection.execute(
+                    identity_query.with_only_columns(
+                        version_table.c.document_id,
+                        identity_table.c.page_hashes,
+                    ).where(identity_table.c.content_fingerprint == content_identity)
+                ).all()
+                incoming_hashes = [
+                    item.value for item in sorted(page_hashes, key=lambda item: item.page)
+                ]
+                candidate_ids = {
+                    cast(UUID, row.document_id)
+                    for row in fingerprint_rows
+                    if page_hashes_within_distance(tuple(row.page_hashes or ()), incoming_hashes)
+                }
+        else:
+            source_query = identity_query.where(
+                identity_table.c.source_sha256 == file_sha,
+                identity_table.c.source_locator == document.source_locator,
+            )
+            candidate_ids = set(connection.scalars(source_query.distinct()).all())
+        if not candidate_ids and natural_identity["kind"] == "verified":
+            verified_identity_query = sa.select(document_table.c.id).where(
+                document_table.c.workspace_id == workspace_id,
+                document_table.c.doc_type == header.doc_type.value,
+                document_table.c.natural_key == natural_key,
+            )
+            candidate_ids = set(connection.scalars(verified_identity_query.limit(2)).all())
+        existing = None
+        if len(candidate_ids) == 1:
+            existing = (
+                connection.execute(
+                    sa.select(document_table)
+                    .where(
+                        document_table.c.workspace_id == workspace_id,
+                        document_table.c.id == next(iter(candidate_ids)),
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if existing is None:
+            natural_key_owner = connection.scalar(
+                sa.select(document_table.c.id)
                 .where(
                     document_table.c.workspace_id == workspace_id,
                     document_table.c.natural_key == natural_key,
                 )
-                .with_for_update()
+                .limit(1)
             )
-            .mappings()
-            .one_or_none()
-        )
+            if natural_key_owner is not None:
+                natural_key = document_identity_collision_key(
+                    document,
+                    file_sha,
+                    page_hashes=page_hashes,
+                    structured=structured,
+                )
         created = existing is None
         document_id = cast(UUID, existing["id"]) if existing is not None else new_id()
         current_version_id = cast(UUID | None, existing["current_version_id"]) if existing else None
         current_hash = None
+        current_source_file_id: UUID | None = None
+        alternative_version = False
+        current_verified_confidence: Decimal | None = None
         if current_version_id is not None:
             current_snapshot = (
                 connection.execute(
@@ -2340,6 +2562,7 @@ class IngestionService:
                         version_table.c.extraction_method,
                         version_table.c.source_file_id,
                         version_table.c.parser_version,
+                        version_table.c.needs_verification,
                     ).where(
                         version_table.c.workspace_id == workspace_id,
                         version_table.c.id == current_version_id,
@@ -2348,7 +2571,28 @@ class IngestionService:
                 .mappings()
                 .one()
             )
+            document, verified_reference_conflict = _preserve_user_verified_references(
+                connection,
+                workspace_id=workspace_id,
+                version_id=current_version_id,
+                document=document,
+            )
+            if not verified_reference_conflict:
+                header = document.header
+                header_values = _header_values(header)
+                content_value = document.model_dump(mode="json")
+                content_hash = _canonical_hash(content_value)
+                incoming_verified_confidence = verified_field_confidence(
+                    document, structured=structured
+                )
             current_hash = cast(str, current_snapshot["content_hash"])
+            current_source_file_id = cast(UUID, current_snapshot["source_file_id"])
+            current_verified_confidence = _persisted_verified_field_confidence(
+                connection,
+                workspace_id=workspace_id,
+                version_id=current_version_id,
+                extraction_method=str(current_snapshot["extraction_method"]),
+            )
             if (
                 current_snapshot["extraction_method"] == ExtractionMethod.MANUAL.value
                 and current_snapshot["source_file_id"] == file_id
@@ -2367,6 +2611,13 @@ class IngestionService:
                     detail={"outcome": "skipped", "reason": "manual_review_version_preserved"},
                 )
                 return "skipped", document_id, current_version_id
+            alternative_version = verified_reference_conflict or (
+                current_verified_confidence is not None
+                and (
+                    incoming_verified_confidence is None
+                    or incoming_verified_confidence < current_verified_confidence
+                )
+            )
             if split_pages(document) and current_snapshot["extraction_method"] in {
                 ExtractionMethod.XML_PROFILE.value,
                 ExtractionMethod.CSV_MAPPING.value,
@@ -2387,7 +2638,7 @@ class IngestionService:
                     detail={"outcome": "skipped", "reason": "structured_version_preserved"},
                 )
                 return "skipped", document_id, current_version_id
-        if current_hash == content_hash:
+        if current_hash == content_hash and current_source_file_id == file_id:
             if existing is not None and existing["withdrawn_at"] is not None:
                 connection.execute(
                     sa.update(document_table)
@@ -2503,34 +2754,82 @@ class IngestionService:
             "created_by": actor_id,
         }
         connection.execute(sa.insert(version_table).values(**version_values))
+        identity_table = metadata.tables["document_identity"]
+        connection.execute(
+            sa.insert(identity_table).values(
+                workspace_id=workspace_id,
+                document_version_id=version_id,
+                source_sha256=file_sha,
+                source_locator=document.source_locator,
+                page_hashes=[
+                    item.value for item in sorted(page_hashes, key=lambda item: item.page)
+                ],
+                content_fingerprint=content_identity,
+            )
+        )
         self._insert_lines_and_evidence(
             connection,
             workspace_id=workspace_id,
             version_id=version_id,
             document=document,
+            extraction_method=extraction_method,
             uom_aliases=uom_aliases,
             charge_keywords=charge_keywords,
         )
-        connection.execute(
-            sa.update(document_table)
-            .where(
-                document_table.c.workspace_id == workspace_id, document_table.c.id == document_id
+        if not alternative_version:
+            identity_key_owner = None
+            if existing is not None and existing["natural_key"] != natural_key:
+                identity_key_owner = connection.scalar(
+                    sa.select(document_table.c.id)
+                    .where(
+                        document_table.c.workspace_id == workspace_id,
+                        document_table.c.natural_key == natural_key,
+                        document_table.c.id != document_id,
+                    )
+                    .limit(1)
+                )
+            connection.execute(
+                sa.update(document_table)
+                .where(
+                    document_table.c.workspace_id == workspace_id,
+                    document_table.c.id == document_id,
+                )
+                .values(
+                    current_version_id=version_id,
+                    natural_key=(
+                        natural_key if identity_key_owner is None else document_table.c.natural_key
+                    ),
+                    batch_id=sa.func.coalesce(document_table.c.batch_id, batch_id),
+                    vendor_identity=vendor_identity,
+                    doc_no=doc_no,
+                    canonical_doc_no=canonical_doc_no,
+                    doc_date=doc_date,
+                    grand_total=_plain(header_values.get("grand_total")),
+                    needs_verification=document.needs_verification,
+                    withdrawn_at=None,
+                    withdrawn_by=None,
+                    updated_at=sa.func.now(),
+                    version=document_table.c.version + 1,
+                )
             )
-            .values(
-                current_version_id=version_id,
-                batch_id=sa.func.coalesce(document_table.c.batch_id, batch_id),
-                vendor_identity=vendor_identity,
-                doc_no=doc_no,
-                canonical_doc_no=canonical_doc_no,
-                doc_date=doc_date,
-                grand_total=_plain(header_values.get("grand_total")),
-                needs_verification=document.needs_verification,
-                withdrawn_at=None,
-                withdrawn_by=None,
-                updated_at=sa.func.now(),
-                version=document_table.c.version + 1,
+        if alternative_version:
+            _event(
+                connection,
+                workspace_id=workspace_id,
+                file_id=file_id,
+                document_id=document_id,
+                document_version_id=version_id,
+                stage="upserted",
+                outcome="warn",
+                parser_version=parser_version,
+                job_id=job_id,
+                detail={
+                    "outcome": "alternative_reading",
+                    "reason": "verified_field_confidence_lower",
+                    "current_version_id": str(current_version_id),
+                },
             )
-        )
+            return "alternative", document_id, version_id
         if header.doc_type is DocType.PO:
             connection.execute(
                 sa.update(document_table)
@@ -2569,11 +2868,39 @@ class IngestionService:
         workspace_id: UUID,
         version_id: UUID,
         document: Document,
+        extraction_method: ExtractionMethod,
         uom_aliases: Mapping[str, str],
         charge_keywords: tuple[str, ...],
     ) -> None:
         line_table = metadata.tables["doc_line"]
         evidence_table = metadata.tables["field_evidence"]
+
+        def origin_for(value: FieldValue[Any]) -> FieldOrigin | None:
+            if value.origin is not None:
+                return value.origin
+            if value.source is FieldSource.MANUAL or extraction_method is ExtractionMethod.MANUAL:
+                return FieldOrigin.MANUAL
+            if extraction_method in {ExtractionMethod.XML_PROFILE, ExtractionMethod.CSV_MAPPING}:
+                return FieldOrigin.ERP_IMPORT
+            if extraction_method in {
+                ExtractionMethod.PDF_TEXT,
+                ExtractionMethod.PDF_OCR,
+                ExtractionMethod.AI_FALLBACK,
+                ExtractionMethod.AI_FIRST,
+            }:
+                return FieldOrigin.OCR
+            return None
+
+        def evidence_provenance(value: FieldValue[Any]) -> dict[str, Any]:
+            origin = origin_for(value)
+            return {
+                "confidence": value.confidence if origin is not FieldOrigin.MANUAL else None,
+                "origin": origin.value if origin is not None else None,
+                "verification": value.verification.value,
+                "verified_by": value.verified_by,
+                "verified_at": value.verified_at,
+            }
+
         for field_name in type(document.header).model_fields:
             value = getattr(document.header, field_name)
             if isinstance(value, FieldValue):
@@ -2584,7 +2911,7 @@ class IngestionService:
                         document_version_id=version_id,
                         field_name=field_name,
                         value_text=_field_text(value.value),
-                        confidence=value.confidence,
+                        **evidence_provenance(value),
                         source=value.source.value,
                         page=value.evidence.page,
                         bbox=_jsonable(value.evidence.bbox) if value.evidence.bbox else None,
@@ -2648,7 +2975,7 @@ class IngestionService:
                             doc_line_id=line_id,
                             field_name=field_name,
                             value_text=_field_text(value.value),
-                            confidence=value.confidence,
+                            **evidence_provenance(value),
                             source=value.source.value,
                             page=value.evidence.page,
                             bbox=_jsonable(value.evidence.bbox) if value.evidence.bbox else None,
@@ -3323,9 +3650,25 @@ class IngestionService:
                         return None
                     return FieldValue(
                         value=value,
-                        confidence=Decimal("1"),
+                        confidence=None,
                         source=FieldSource.MANUAL,
                         evidence=FieldEvidence(),
+                        origin=FieldOrigin.MANUAL,
+                        verification=FieldVerification.USER,
+                        verified_by=str(actor.actor_id),
+                        verified_at=datetime.now(UTC),
+                    )
+
+                def manual_header_value(field: str, value: Any) -> FieldValue[Any] | None:
+                    result = manual_value(value)
+                    if result is None or field not in {"po_refs", "grn_refs"}:
+                        return result
+                    return result.model_copy(
+                        update={
+                            "verification": FieldVerification.USER,
+                            "verified_by": str(actor.actor_id),
+                            "verified_at": datetime.now(UTC),
+                        }
                     )
 
                 header_values = {
@@ -3362,7 +3705,7 @@ class IngestionService:
                 ]
                 invoice_header = InvoiceHeader(
                     **{
-                        field: manual_value(value)
+                        field: manual_header_value(field, value)
                         for field, value in header_values.items()
                         if field not in {"doc_type", "extras"}
                     },
@@ -3492,12 +3835,12 @@ class IngestionService:
         reason: str | None,
         ai_suggestion_refs: Sequence[AiSuggestionRef] = (),
     ) -> dict[str, Any] | None:
-        """Append a human-reviewed invoice version and preserve correction evidence.
+        """Append a human-reviewed document version and preserve correction evidence.
 
-        Every save runs deterministic arithmetic QA (TR-PAR-5) on the new version
-        and records the result; a failure is flagged as a warning. Values taken
-        from H1 suggestions must still match a currently grounded suggestion; their
-        evidence keeps the quote, page and ``ai_call_id``.
+        Invoice saves run deterministic arithmetic QA (TR-PAR-5); a failure is
+        flagged as a warning. Values taken from grounded suggestions must still
+        match the current suggestion; their evidence keeps its quote, page and
+        ``ai_call_id``.
         """
 
         document_table = metadata.tables["document"]
@@ -3505,9 +3848,6 @@ class IngestionService:
         line_table = metadata.tables["doc_line"]
         evidence_table = metadata.tables["field_evidence"]
         document_text_table = metadata.tables["document_text"]
-        header_columns = INVOICE_HEADER_COLUMNS
-        line_columns = INVOICE_LINE_COLUMNS
-
         with self.engine.begin() as connection:
             current_document = (
                 connection.execute(
@@ -3526,11 +3866,45 @@ class IngestionService:
                 return None
             if int(current_document["version"]) != expected_version:
                 raise BatchVersionConflict("The document changed after it was loaded.")
-            if current_document["doc_type"] != DocType.INVOICE.value:
+            doc_type = str(current_document["doc_type"])
+            header_columns = _correction_header_columns(doc_type)
+            line_columns = _correction_line_columns(doc_type)
+            if not header_columns or not line_columns:
                 raise IngestionFailure(
                     "MANUAL_CORRECTION_UNSUPPORTED",
-                    "Manual field correction is currently enabled for invoices.",
+                    "Manual field correction is not enabled for this document type.",
                 )
+            linked_po_ids: set[UUID] = set()
+            if doc_type == DocType.GRN.value:
+                link_current = metadata.tables["link_current"]
+                link_table = metadata.tables["link"]
+                linked_po_ids = {
+                    cast(UUID, linked_po_id)
+                    for linked_po_id in connection.scalars(
+                        sa.select(link_current.c.to_document_id)
+                        .select_from(
+                            link_current.join(
+                                link_table,
+                                sa.and_(
+                                    link_current.c.workspace_id == link_table.c.workspace_id,
+                                    link_current.c.current_link_id == link_table.c.id,
+                                ),
+                            )
+                        )
+                        .where(
+                            link_current.c.workspace_id == actor.workspace_id,
+                            link_current.c.from_document_id == document_id,
+                            link_current.c.link_type == "grn_po",
+                            link_table.c.state.in_(("auto", "suggested", "confirmed")),
+                            sa.not_(
+                                sa.and_(
+                                    link_table.c.ai_suggested,
+                                    link_table.c.state == "suggested",
+                                )
+                            ),
+                        )
+                    ).all()
+                }
             previous_version_id = cast(UUID, current_document["current_version_id"])
             current_version = (
                 connection.execute(
@@ -3607,7 +3981,8 @@ class IngestionService:
                 column_name = header_columns.get(field_name)
                 if column_name is None:
                     raise IngestionFailure(
-                        "MANUAL_CORRECTION_FIELD_INVALID", "An invoice field is not editable."
+                        "MANUAL_CORRECTION_FIELD_INVALID",
+                        "A field is not editable for this document type.",
                     )
                 if field_name in {"po_refs", "grn_refs"}:
                     if raw_value is None:
@@ -3628,7 +4003,7 @@ class IngestionService:
                     value = raw_value.strip() or None
                     if value is not None and len(value) > 1_000:
                         raise IngestionFailure(
-                            "MANUAL_CORRECTION_VALUE_INVALID", "An invoice value is too long."
+                            "MANUAL_CORRECTION_VALUE_INVALID", "A document value is too long."
                         )
                     if field_name == "vendor_gstin" and value is not None:
                         value = value.upper().replace(" ", "")
@@ -3672,6 +4047,20 @@ class IngestionService:
                 new_version["canonical_grn_refs"] = [
                     canonicalize_document_number(ref) for ref in new_version["grn_refs"]
                 ]
+            if "challan_no" in normalized_header_patch:
+                new_version["canonical_challan_no"] = _canonical_optional(
+                    new_version.get("challan_no")
+                )
+            if "supplier_invoice_no" in normalized_header_patch:
+                new_version["canonical_supplier_invoice_no"] = _canonical_optional(
+                    new_version.get("supplier_invoice_no")
+                )
+            if "revision" in normalized_header_patch:
+                new_version["revision_rank"] = _revision_rank(new_version.get("revision"))
+            if "payment_terms" in normalized_header_patch:
+                new_version["payment_terms_days"] = _payment_days(
+                    new_version.get("payment_terms_text")
+                )
 
             old_lines_by_id = old_line_by_id
             requested_lines = None if lines_patch is None else list(lines_patch)
@@ -3687,6 +4076,12 @@ class IngestionService:
             changed_line_values: dict[tuple[UUID, str], Any] = {}
             line_no_by_owner: dict[UUID, int] = {}
             for supplied in requested_lines:
+                unknown_fields = set(supplied) - {"id", "line_no", *line_columns}
+                if unknown_fields:
+                    raise IngestionFailure(
+                        "MANUAL_CORRECTION_FIELD_INVALID",
+                        "A line field is not editable for this document type.",
+                    )
                 old_id = supplied.get("id")
                 old_row: dict[str, Any] | None = None
                 if old_id is not None:
@@ -3695,13 +4090,13 @@ class IngestionService:
                     if old_row is None or old_uuid in seen_old_ids:
                         raise IngestionFailure(
                             "MANUAL_CORRECTION_LINE_INVALID",
-                            "A line does not belong to this invoice or is duplicated.",
+                            "A line does not belong to this document or is duplicated.",
                         )
                     seen_old_ids.add(old_uuid)
                 line_no = int(supplied["line_no"])
                 if line_no < 1 or line_no in seen_line_numbers:
                     raise IngestionFailure(
-                        "MANUAL_CORRECTION_LINE_INVALID", "Invoice line numbers must be unique."
+                        "MANUAL_CORRECTION_LINE_INVALID", "Document line numbers must be unique."
                     )
                 seen_line_numbers.add(line_no)
                 row = dict(old_row or {})
@@ -3739,6 +4134,8 @@ class IngestionService:
                         row["uom"] = unit.canonical if unit and unit.is_known else None
                     else:
                         row[column_name] = value
+                    if field_name == "po_ref":
+                        row["canonical_po_ref"] = _canonical_optional(value)
                 description = row.get("description")
                 normalized = normalize_item_text(description) if description else None
                 row["description_norm"] = normalized.description if normalized else None
@@ -3776,8 +4173,13 @@ class IngestionService:
                 "verified": not needs_verification,
                 "reason": reason,
             }
-            qa = _correction_qa(new_version, new_lines)
-            extras["correction_qa"] = qa
+            qa = (
+                _correction_qa(new_version, new_lines)
+                if doc_type == DocType.INVOICE.value
+                else None
+            )
+            if qa is not None:
+                extras["correction_qa"] = qa
             new_version["extras"] = extras
             ai_evidence = self._ai_reference_evidence(
                 connection,
@@ -3790,10 +4192,17 @@ class IngestionService:
 
             def manual_evidence(key: tuple[str, int | None, str]) -> dict[str, Any]:
                 grounded = ai_evidence.get(key)
+                verified_values = {
+                    "source": "manual",
+                    "origin": FieldOrigin.MANUAL.value,
+                    "confidence": None,
+                    "verification": FieldVerification.USER.value,
+                    "verified_by": str(actor.actor_id),
+                    "verified_at": sa.func.now(),
+                }
                 if grounded is None:
                     return {
-                        "source": "manual",
-                        "confidence": Decimal("1"),
+                        **verified_values,
                         "page": None,
                         "bbox": None,
                         "snippet": _MANUAL_SNIPPET,
@@ -3801,8 +4210,7 @@ class IngestionService:
                     }
                 ai_call_id, suggestion = grounded
                 return {
-                    "source": "manual",
-                    "confidence": Decimal("1"),
+                    **verified_values,
                     "page": suggestion.page,
                     "bbox": list(suggestion.bbox) if suggestion.bbox is not None else None,
                     "snippet": suggestion.quote[:_AI_SNIPPET_LIMIT],
@@ -3866,6 +4274,12 @@ class IngestionService:
                             ),
                         )
                         manual_evidence_done.add(("line", old_line_id, field_name))
+                    elif verified and item["field_name"] == "po_ref":
+                        item.update(
+                            verification=FieldVerification.USER.value,
+                            verified_by=str(actor.actor_id),
+                            verified_at=sa.func.now(),
+                        )
                 else:
                     item["document_version_id"] = new_version_id
                     changed = item["field_name"] in changed_header_fields
@@ -3878,6 +4292,12 @@ class IngestionService:
                             **manual_evidence(("header", None, field_name)),
                         )
                         manual_evidence_done.add(("header", None, field_name))
+                    elif verified and field_name in {"po_refs", "grn_refs"}:
+                        item.update(
+                            verification=FieldVerification.USER.value,
+                            verified_by=str(actor.actor_id),
+                            verified_at=sa.func.now(),
+                        )
                 item["id"] = new_id()
                 item.pop("created_at", None)
                 connection.execute(sa.insert(evidence_table).values(**item))
@@ -3945,6 +4365,8 @@ class IngestionService:
                     doc_date=new_doc_date,
                     grand_total=new_version.get("grand_total"),
                     needs_verification=needs_verification,
+                    input_seq=document_table.c.input_seq
+                    + (1 if doc_type == DocType.PO.value and (any_correction or verified) else 0),
                     updated_at=sa.func.now(),
                     version=document_table.c.version + 1,
                 )
@@ -3978,9 +4400,10 @@ class IngestionService:
                         )
                     ],
                 },
-                reason=reason or "Invoice extraction reviewed by user.",
+                reason=reason or f"{doc_type.upper()} extraction reviewed by user.",
             )
-            if {"vendor_name", "vendor_gstin"} & changed_header_fields:
+            # Any changed correction can alter link inputs even when vendor identity stays put.
+            if any_correction:
                 source_file_id = current_version["source_file_id"]
                 if source_file_id is not None:
                     self.queue.enqueue(
@@ -3995,9 +4418,11 @@ class IngestionService:
                 document_id=document_id,
                 document_version_id=new_version_id,
                 stage="qa",
-                outcome="ok" if qa["passed"] else "warn",
+                outcome="warn" if qa is not None and not qa["passed"] else "ok",
                 parser_version=PARSER_VERSION,
-                warning_codes=() if qa["passed"] else (_CORRECTION_QA_CODE,),
+                warning_codes=(
+                    (_CORRECTION_QA_CODE,) if qa is not None and not qa["passed"] else ()
+                ),
                 detail={
                     "changed_header_fields": sorted(header_changes),
                     "changed_line_count": len(changed_line_fields),
@@ -4005,21 +4430,40 @@ class IngestionService:
                     "correction_qa": qa,
                 },
             )
-            self._record_correction_qa(
-                connection,
-                actor,
-                document_id=document_id,
-                version_id=new_version_id,
-                file_id=cast(UUID | None, current_version["source_file_id"]),
-                qa=qa,
-            )
-            self._mark_dirty_scope(
-                connection,
-                workspace_id=actor.workspace_id,
-                scope_kind="invoice",
-                scope_id=document_id,
-                reason="invoice extraction corrected or verified by user",
-            )
+            if qa is not None:
+                self._record_correction_qa(
+                    connection,
+                    actor,
+                    document_id=document_id,
+                    version_id=new_version_id,
+                    file_id=cast(UUID | None, current_version["source_file_id"]),
+                    qa=qa,
+                )
+            if doc_type == DocType.PO.value:
+                self._mark_dirty_scope(
+                    connection,
+                    workspace_id=actor.workspace_id,
+                    scope_kind="po",
+                    scope_id=document_id,
+                    reason="purchase order extraction corrected or verified by user",
+                )
+            elif doc_type == DocType.GRN.value:
+                for po_document_id in sorted(linked_po_ids, key=str):
+                    self._mark_dirty_scope(
+                        connection,
+                        workspace_id=actor.workspace_id,
+                        scope_kind="po",
+                        scope_id=po_document_id,
+                        reason="goods receipt extraction corrected or verified by user",
+                    )
+            else:
+                self._mark_dirty_scope(
+                    connection,
+                    workspace_id=actor.workspace_id,
+                    scope_kind="invoice",
+                    scope_id=document_id,
+                    reason="invoice extraction corrected or verified by user",
+                )
         return self.get_document(actor.workspace_id, document_id)
 
     def _record_correction_qa(
@@ -4076,7 +4520,7 @@ class IngestionService:
         H1 answers are re-grounded on the current page text; vision answers (AC-5)
         are re-checked against the pages that were read, the current buyer
         entities and the current values. PO and GRN documents get vision readings
-        only, shown read-only (corrections are invoice-only until AC-7).
+        only; their corrections use the same versioned manual-evidence path.
         """
 
         requests = metadata.tables["ai_request"]
@@ -4107,20 +4551,22 @@ class IngestionService:
         hooks = [vision.HOOK]
         if document["doc_type"] in h1.WIRED_DOC_TYPES:
             hooks.append(h1.HOOK)
+        of_document = (
+            requests.c.workspace_id == workspace_id,
+            requests.c.hook.in_(hooks),
+            requests.c.subject_type == h1.SUBJECT_TYPE,
+            requests.c.subject_id.in_(
+                sa.select(versions.c.id).where(
+                    versions.c.workspace_id == workspace_id,
+                    versions.c.document_id == document["id"],
+                )
+            ),
+        )
+        # A shadow reading (WI-BE6) is never shown; only H1 or the workspace's reader is.
         request = (
             connection.execute(
                 sa.select(requests)
-                .where(
-                    requests.c.workspace_id == workspace_id,
-                    requests.c.hook.in_(hooks),
-                    requests.c.subject_type == h1.SUBJECT_TYPE,
-                    requests.c.subject_id.in_(
-                        sa.select(versions.c.id).where(
-                            versions.c.workspace_id == workspace_id,
-                            versions.c.document_id == document["id"],
-                        )
-                    ),
-                )
+                .where(*of_document, requests.c.shadow.is_(False))
                 .order_by(requests.c.created_at.desc(), requests.c.attempt_no.desc())
                 .limit(1)
             )
@@ -4128,6 +4574,11 @@ class IngestionService:
             .first()
         )
         if request is None:
+            shadowed = connection.scalar(
+                sa.select(sa.exists().where(*of_document, requests.c.shadow.is_(True)))
+            )
+            if shadowed:
+                view["code"] = shadow.SHADOW_CODE
             return view, ()
         is_vision = request["hook"] == vision.HOOK
         view.update(
@@ -4349,7 +4800,10 @@ class IngestionService:
                 current = version_row.get(column)
             else:
                 row = lines_by_no.get(cast(int, item.line_no))
-                current = row.get(INVOICE_LINE_COLUMNS[item.field]) if row is not None else None
+                line_column = _correction_line_columns(str(document["doc_type"])).get(item.field)
+                current = (
+                    row.get(line_column) if row is not None and line_column is not None else None
+                )
             suggestions.append(
                 {
                     "scope": item.scope,
@@ -4426,6 +4880,8 @@ class IngestionService:
             )
         ai_call_id = cast(UUID, view["ai_call_id"])
         lines_by_no = {int(row["line_no"]): row for row in new_lines}
+        header_columns = _correction_header_columns(str(document["doc_type"]))
+        line_columns = _correction_line_columns(str(document["doc_type"]))
         evidence: dict[tuple[str, int | None, str], tuple[UUID, GroundedSuggestion]] = {}
         for ref in refs:
             key = (ref.scope, ref.line_no, ref.field)
@@ -4435,10 +4891,10 @@ class IngestionService:
                     "An AI suggestion reference is stale or repeated.",
                 )
             if ref.scope == "header":
-                column = INVOICE_HEADER_COLUMNS.get(ref.field)
+                column = header_columns.get(ref.field)
                 saved = new_version.get(column) if column else None
             else:
-                column = INVOICE_LINE_COLUMNS.get(ref.field)
+                column = line_columns.get(ref.field)
                 line = lines_by_no.get(ref.line_no or 0)
                 saved = line.get(column) if column and line is not None else None
             match = next(
@@ -4799,6 +5255,40 @@ def _header_values(header: Any) -> dict[str, Any]:
     return {name: getattr(header, name) for name in type(header).model_fields if name != "extras"}
 
 
+def _persisted_verified_field_confidence(
+    connection: Connection,
+    *,
+    workspace_id: UUID,
+    version_id: UUID,
+    extraction_method: str,
+) -> Decimal | None:
+    evidence = metadata.tables["field_evidence"]
+    structured = extraction_method in {"xml_profile", "csv_mapping", "manual"}
+    rows = connection.execute(
+        sa.select(
+            evidence.c.confidence,
+            evidence.c.source,
+            evidence.c.verification,
+        ).where(
+            evidence.c.workspace_id == workspace_id,
+            evidence.c.document_version_id == version_id,
+        )
+    ).all()
+    values = []
+    for row in rows:
+        if row.verification == FieldVerification.USER.value:
+            values.append(Decimal("1"))
+        elif (
+            row.verification == FieldVerification.SYSTEM_CHECK.value and row.confidence is not None
+        ) or (
+            row.source == FieldSource.RULE.value
+            and row.confidence is not None
+            and (structured or Decimal(str(row.confidence)) >= Decimal("0.98"))
+        ):
+            values.append(Decimal(str(row.confidence)))
+    return min(values) if values else None
+
+
 def _parser_synonym_overrides(raw: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
     """Translate the product's synonym groups into parser field aliases.
 
@@ -4922,6 +5412,144 @@ def _field_text(value: Any) -> str:
     return str(value)
 
 
+def _persisted_reference_values(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    return tuple(part for part in value.split(";") if part)
+
+
+def _same_reference_values(left: Sequence[str], right: Sequence[str]) -> bool:
+    return sorted(canonicalize_document_number(value) for value in left) == sorted(
+        canonicalize_document_number(value) for value in right
+    )
+
+
+def _preserve_user_verified_references(
+    connection: Connection,
+    *,
+    workspace_id: UUID,
+    version_id: UUID,
+    document: Document,
+) -> tuple[Document, bool]:
+    """Carry a human-verified PO/GRN reference forward only when it still agrees."""
+
+    evidence = metadata.tables["field_evidence"]
+    line_table = metadata.tables["doc_line"]
+    header_rows = connection.execute(
+        sa.select(
+            evidence.c.field_name,
+            evidence.c.value_text,
+            evidence.c.source,
+            evidence.c.origin,
+            evidence.c.confidence,
+            evidence.c.page,
+            evidence.c.bbox,
+            evidence.c.snippet,
+            evidence.c.verified_by,
+            evidence.c.verified_at,
+        )
+        .where(
+            evidence.c.workspace_id == workspace_id,
+            evidence.c.document_version_id == version_id,
+            evidence.c.field_name.in_(("po_refs", "grn_refs")),
+            evidence.c.verification == FieldVerification.USER.value,
+        )
+        .order_by(evidence.c.created_at, evidence.c.id)
+    ).mappings()
+    line_rows = connection.execute(
+        sa.select(
+            line_table.c.line_no,
+            evidence.c.value_text,
+            evidence.c.source,
+            evidence.c.origin,
+            evidence.c.confidence,
+            evidence.c.page,
+            evidence.c.bbox,
+            evidence.c.snippet,
+            evidence.c.verified_by,
+            evidence.c.verified_at,
+        )
+        .select_from(line_table.join(evidence, evidence.c.doc_line_id == line_table.c.id))
+        .where(
+            line_table.c.workspace_id == workspace_id,
+            line_table.c.document_version_id == version_id,
+            evidence.c.workspace_id == workspace_id,
+            evidence.c.field_name == "po_ref",
+            evidence.c.verification == FieldVerification.USER.value,
+        )
+        .order_by(line_table.c.line_no, evidence.c.created_at, evidence.c.id)
+    ).mappings()
+
+    header_updates: dict[str, Any] = {}
+
+    def preserve_field_value(
+        field: FieldValue[Any], row: RowMapping, value: Any
+    ) -> FieldValue[Any]:
+        source = FieldSource(str(row["source"]))
+        persisted_origin = row["origin"]
+        origin = (
+            FieldOrigin(str(persisted_origin))
+            if persisted_origin is not None
+            else (FieldOrigin.MANUAL if source is FieldSource.MANUAL else field.origin)
+        )
+        bbox_value = row["bbox"]
+        bbox = (
+            cast(
+                tuple[Decimal, Decimal, Decimal, Decimal],
+                tuple(Decimal(str(item)) for item in bbox_value),
+            )
+            if isinstance(bbox_value, (list, tuple)) and len(bbox_value) == 4
+            else None
+        )
+        return field.model_copy(
+            update={
+                "value": value,
+                "source": source,
+                "confidence": cast(Decimal | None, row["confidence"]),
+                "origin": origin,
+                "verification": FieldVerification.USER,
+                "verified_by": str(row["verified_by"]) if row["verified_by"] else None,
+                "verified_at": row["verified_at"],
+                "evidence": FieldEvidence(
+                    page=int(row["page"]) if row["page"] is not None else None,
+                    bbox=bbox,
+                    snippet=str(row["snippet"]) if row["snippet"] else None,
+                ),
+            }
+        )
+
+    for row in header_rows:
+        field_name = str(row["field_name"])
+        incoming = getattr(document.header, field_name, None)
+        old_values = _persisted_reference_values(cast(str | None, row["value_text"]))
+        incoming_values = (
+            tuple(str(item) for item in incoming.value) if incoming is not None else ()
+        )
+        if not _same_reference_values(old_values, incoming_values):
+            return document, True
+        if incoming is None:
+            return document, True
+        header_updates[field_name] = preserve_field_value(incoming, row, old_values)
+
+    line_updates: dict[int, DocLine] = {}
+    for row in line_rows:
+        line_no = int(row["line_no"])
+        line = next((item for item in document.lines if item.line_no == line_no), None)
+        old_values = _persisted_reference_values(cast(str | None, row["value_text"]))
+        incoming_values = (str(line.po_ref.value),) if line and line.po_ref is not None else ()
+        if not _same_reference_values(old_values, incoming_values):
+            return document, True
+        assert line is not None and line.po_ref is not None
+        line_updates[line_no] = line.model_copy(
+            update={"po_ref": preserve_field_value(line.po_ref, row, old_values[0])}
+        )
+    if not header_updates and not line_updates:
+        return document, False
+    header = document.header.model_copy(update=header_updates)
+    lines = tuple(line_updates.get(line.line_no, line) for line in document.lines)
+    return document.model_copy(update={"header": header, "lines": lines}), False
+
+
 def _reference_values(value: Any) -> list[str]:
     plain = _plain(value)
     if plain is None:
@@ -4938,29 +5566,6 @@ def _vendor_identity(gstin: str | None, name: str | None) -> str | None:
     if name:
         return normalize_vendor_name(name) or None
     return None
-
-
-def document_natural_key(document: Document, file_sha: str) -> str:
-    """Workspace identity of a parsed document: a re-upload with the same key is a new version."""
-
-    header_values = _header_values(document.header)
-    doc_no = _plain(header_values.get("doc_no"))
-    doc_date = _plain(header_values.get("doc_date"))
-    canonical_doc_no = canonicalize_document_number(doc_no) if doc_no else None
-    natural_payload: dict[str, Any] = {
-        "type": document.header.doc_type.value,
-        "vendor_identity": _vendor_identity(
-            _plain(header_values.get("vendor_gstin")), _plain(header_values.get("vendor_name"))
-        ),
-        "canonical_doc_no": canonical_doc_no,
-        "doc_date": doc_date.isoformat() if isinstance(doc_date, date) else None,
-    }
-    if not canonical_doc_no:
-        natural_payload["missing_number_fallback"] = {
-            "source_sha256": file_sha,
-            "locator": document.source_locator,
-        }
-    return document.natural_key or _canonical_hash(natural_payload)
 
 
 def _canonical_optional(value: Any) -> str | None:

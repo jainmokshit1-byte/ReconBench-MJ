@@ -14,7 +14,7 @@ import pdfplumber
 from pdfminer.pdfdocument import PDFPasswordIncorrect
 from pdfplumber.utils.exceptions import PdfminerException
 
-from reconbench_core.normalize import parse_date, parse_decimal
+from reconbench_core.normalize import parse_date, parse_decimal, validate_gstin
 from reconbench_core.parsers.common import (
     _HEADER_FIELDS_BY_TYPE,
     alias_to_field,
@@ -22,12 +22,17 @@ from reconbench_core.parsers.common import (
     combined_synonyms,
     normalize_label,
 )
-from reconbench_core.parsers.parties import guard_result
+from reconbench_core.parsers.parties import (
+    guard_result,
+    guard_unconfigured_parties,
+    withhold_vendor_name,
+)
 from reconbench_core.parsers.types import PageText, ParseResult, ParserHints, ParseWarning
 from reconbench_core.schema import (
     DocType,
     Document,
     FieldEvidence,
+    FieldOrigin,
     FieldSource,
     FieldValue,
     FileFormat,
@@ -1087,7 +1092,7 @@ def _attach_evidence(
         updates: dict[str, Any] = {}
         if evidence is not None:
             updates["evidence"] = evidence
-            if evidence.page in ocr_pages:
+            if evidence.page in ocr_pages and field.confidence is not None:
                 updates["confidence"] = max(
                     Decimal("0"), field.confidence - _OCR_CONFIDENCE_PENALTY
                 )
@@ -1126,6 +1131,7 @@ def _shell_document(doc_type: DocType, *, file_hash: str, page_count: int) -> Do
         line_extras=(),
         locator=f"pdf:sha256:{file_hash}:pages:{page_count}",
         source=FieldSource.RULE,
+        origin=FieldOrigin.OCR,
         base_confidence=_BASE_CONFIDENCE,
     )
     return document.model_copy(
@@ -1145,7 +1151,40 @@ def parse_pdf(
 ) -> ParseResult:
     """Extract a conservative canonical document from searchable PDF text."""
 
-    return guard_result(_parse_pdf(content, hints, ocr_pages=ocr_pages), hints)
+    return guard_unconfigured_parties(
+        guard_result(_parse_pdf(content, hints, ocr_pages=ocr_pages), hints), hints
+    )
+
+
+_SELLER_GSTIN_LABELS = frozenset({"SUPPLIER GSTIN", "VENDOR GSTIN"})
+_GSTIN_TEXT = re.compile(r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b")
+_ROLE_CAP = Decimal("0.60")
+
+
+def _vendor_role_unestablished(
+    hints: ParserHints,
+    vendor_gstin: str,
+    buyer_gstin: str | None,
+    label: str | None,
+    page_texts: Sequence[PageText],
+) -> bool:
+    """No configured buyer entities and no label that tells the vendor's GSTIN apart.
+
+    Same rule as the layout reader: one GSTIN under a generic label, or a generic
+    vendor GSTIN beside another GSTIN that no bill-to block claimed, may be the
+    buyer's own.
+    """
+
+    if hints.buyer_entities or label in _SELLER_GSTIN_LABELS:
+        return False
+    wanted = re.sub(r"[^A-Z0-9]", "", vendor_gstin.upper())
+    others = {
+        found
+        for page in page_texts
+        for found in _GSTIN_TEXT.findall(page.content.upper())
+        if found != wanted and validate_gstin(found).is_valid
+    }
+    return not others or buyer_gstin is None
 
 
 def _parse_pdf(
@@ -1179,6 +1218,7 @@ def _parse_pdf(
     header_raw: dict[str, str] = {}
     header_evidence: dict[str, FieldEvidence] = {}
     header_priorities: dict[str, int] = {}
+    header_labels: dict[str, str] = {}
     header_alternatives: dict[str, list[str]] = {}
     table_header_names: set[str] = set()
     header_names: set[str] = set()
@@ -1228,6 +1268,7 @@ def _parse_pdf(
                         header_raw[field] = snippet
                         header_evidence[field] = _evidence(page_number, snippet, value_words)
                         header_priorities[field] = priority
+                        header_labels[field] = label
                     elif snippet != header_raw[field]:
                         alternatives = header_alternatives.setdefault(field, [])
                         if snippet not in alternatives:
@@ -1251,6 +1292,7 @@ def _parse_pdf(
                                 bbox=_find_word_bbox(words, snippet),
                             )
                             header_priorities[field] = priority
+                            header_labels[field] = label
                         elif snippet != header_raw[field]:
                             alternatives = header_alternatives.setdefault(field, [])
                             if snippet not in alternatives:
@@ -1406,6 +1448,7 @@ def _parse_pdf(
         header_alternatives=header_alternatives,
         locator="pdf",
         source=FieldSource.RULE,
+        origin=FieldOrigin.OCR,
         base_confidence=_BASE_CONFIDENCE,
         same_file_dates=(header_raw["doc_date"],) if header_raw.get("doc_date") else (),
         uom_aliases=hints.uom_aliases,
@@ -1413,7 +1456,19 @@ def _parse_pdf(
     )
     document = _attach_evidence(document, header_evidence, line_evidence_with_bbox, ocr_pages)
     warnings.extend(build_warnings)
-    if inferred_vendor_name and document.header.vendor_name is not None:
+    vendor_gstin_field = document.header.vendor_gstin
+    vendor_role_open = vendor_gstin_field is not None and _vendor_role_unestablished(
+        hints,
+        str(vendor_gstin_field.value),
+        str(document.header.buyer_gstin.value) if document.header.buyer_gstin else None,
+        header_labels.get("vendor_gstin"),
+        page_texts,
+    )
+    if inferred_vendor_name and document.header.vendor_name is not None and vendor_role_open:
+        # The unlabelled heading is the seller's only if its GSTIN is (scan fix WI-3).
+        document, withheld = withhold_vendor_name(document, locator="pdf")
+        warnings.append(withheld)
+    elif inferred_vendor_name and document.header.vendor_name is not None:
         inferred_vendor_name_field = document.header.vendor_name.model_copy(
             update={"confidence": Decimal("0.65")}
         )
@@ -1497,6 +1552,19 @@ def _parse_pdf(
         )
         document = document.model_copy(
             update={
+                "needs_verification": True,
+                "reason_codes": tuple(
+                    dict.fromkeys((*document.reason_codes, ReasonCode.LOW_CONFIDENCE_DATA))
+                ),
+            }
+        )
+    if vendor_gstin_field is not None and vendor_role_open:
+        capped = vendor_gstin_field.model_copy(
+            update={"confidence": min(vendor_gstin_field.confidence or _ROLE_CAP, _ROLE_CAP)}
+        )
+        document = document.model_copy(
+            update={
+                "header": document.header.model_copy(update={"vendor_gstin": capped}),
                 "needs_verification": True,
                 "reason_codes": tuple(
                     dict.fromkeys((*document.reason_codes, ReasonCode.LOW_CONFIDENCE_DATA))

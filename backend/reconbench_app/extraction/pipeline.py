@@ -22,7 +22,7 @@ from reconbench_core.extraction.extract import (
 from reconbench_core.extraction.layout import DocumentLayout, PageSource, full_rows
 from reconbench_core.extraction.pages import PageGroup, classify_page, group_pages, is_plain_split
 from reconbench_core.extraction.values import has_lookalike
-from reconbench_core.parsers.parties import guard_result
+from reconbench_core.parsers.parties import guard_result, guard_unconfigured_parties
 from reconbench_core.parsers.types import (
     PageSplit,
     PageText,
@@ -237,7 +237,7 @@ def layout_parse(
         layout_signature=_signature(first),
         page_texts=_page_texts(layout),
     )
-    return guard_result(result, hints)
+    return guard_unconfigured_parties(guard_result(result, hints), hints)
 
 
 def has_content(result: ParseResult) -> bool:

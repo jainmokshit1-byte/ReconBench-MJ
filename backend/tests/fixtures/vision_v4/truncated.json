@@ -1,0 +1,61 @@
+{
+  "doc_kind": "invoice",
+  "pages": [
+    {
+      "page": 1,
+      "kind": "invoice",
+      "title": "TAX INVOICE"
+    }
+  ],
+  "fields": [
+    {
+      "name": "doc_no",
+      "text": "SYN-INV-0001",
+      "label": "Invoice No.",
+      "page": 1,
+      "box_2d": [
+        80,
+        620,
+        100,
+        820
+      ]
+    },
+    {
+      "name": "doc_date",
+      "text": "01-04-2026",
+      "label": "Dated",
+      "page": 1,
+      "box_2d": [
+        105,
+        620,
+        125,
+        760
+      ]
+    },
+    {
+      "name": "supplier_name",
+      "text": "Synthetic Supplier Pvt Ltd",
+      "page": 1,
+      "box_2d": [
+        60,
+        40,
+        85,
+        420
+      ]
+    },
+    {
+      "name": "supplier_gstin",
+      "text": "29AAACS9999K1Z9",
+      "label": "GSTIN",
+      "page": 1,
+      "box_2d": [
+        90,
+        40,
+        110,
+        330
+      ]
+    },
+    {
+      "name": "taxable_total",
+      "text": "1,000.00",
+      "label": "Ta

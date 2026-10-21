@@ -84,6 +84,9 @@ class LoginSession:
     csrf_token: str
     absolute_expires_at: datetime
     max_age_seconds: int
+    # The persisted role; ``role`` is the P0 effective role. Only the capabilities in
+    # ``STORED_ROLE_CAPABILITIES`` (``ai.manage``, O-18) are checked against it.
+    stored_role: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +97,7 @@ class AuthContext:
     display_name: str
     role: str
     csrf_token: str
+    stored_role: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +353,7 @@ class AuthService:
                 csrf_token=csrf_token,
                 absolute_expires_at=absolute_expires_at,
                 max_age_seconds=policy.session_absolute_hours * 60 * 60,
+                stored_role=str(user["role"]),
             )
 
     @requires("data.view")
@@ -470,6 +475,7 @@ class AuthService:
             display_name=row["display_name"],
             role=resolve_effective_role(str(row["role"])),
             csrf_token=csrf_token,
+            stored_role=str(row["role"]),
         )
 
     @staticmethod

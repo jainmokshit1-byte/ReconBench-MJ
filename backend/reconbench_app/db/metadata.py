@@ -16,6 +16,9 @@ from sqlalchemy.dialects import postgresql
 from reconbench_app.db.numeric_types import D_AMOUNT, D_QTY, D_SCORE, D_TAXRATE
 
 metadata = sa.MetaData()
+_AI_PROVIDER = postgresql.ENUM(
+    "claude", "openai", "gemini", "vllm", name="ai_provider", create_type=False
+)
 _tables: dict[str, sa.Table] = {}
 
 _tables["vendor_merge_suggestion"] = sa.Table(
@@ -203,6 +206,7 @@ _tables["batch"] = sa.Table(
         "updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
     ),
     sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
+    sa.Column("provider_override", _AI_PROVIDER),
     sa.PrimaryKeyConstraint("id", name="batch_pkey"),
     sa.ForeignKeyConstraint(["created_by"], ["app_user.id"], name="batch_created_by_fkey"),
     sa.ForeignKeyConstraint(["workspace_id"], ["workspace.id"], name="batch_workspace_id_fkey"),
@@ -314,12 +318,16 @@ _tables["field_evidence"] = sa.Table(
     sa.Column("doc_line_id", postgresql.UUID(as_uuid=True)),
     sa.Column("field_name", sa.Text(), nullable=False),
     sa.Column("value_text", sa.Text()),
-    sa.Column("confidence", D_SCORE, nullable=False),
+    sa.Column("confidence", D_SCORE),
     sa.Column(
         "source",
         postgresql.ENUM("rule", "ai", "manual", name="field_source", create_type=False),
         nullable=False,
     ),
+    sa.Column("origin", sa.Text()),
+    sa.Column("verification", sa.Text(), server_default=sa.text("'none'"), nullable=False),
+    sa.Column("verified_by", sa.Text()),
+    sa.Column("verified_at", sa.TIMESTAMP(timezone=True)),
     sa.Column("page", sa.Integer()),
     sa.Column("bbox", postgresql.JSONB()),
     sa.Column("snippet", sa.Text()),
@@ -345,6 +353,182 @@ _tables["field_evidence"] = sa.Table(
     sa.CheckConstraint(
         "(document_version_id IS NOT NULL) <> (doc_line_id IS NOT NULL)",
         name="field_evidence_owner_ck",
+    ),
+    sa.CheckConstraint(
+        "origin IS NULL OR origin IN ('ocr', 'manual', 'erp_import')",
+        name="field_evidence_origin_ck",
+    ),
+    sa.CheckConstraint(
+        "verification IN ('none', 'user', 'system_check')",
+        name="field_evidence_verification_ck",
+    ),
+)
+
+_tables["consensus_run"] = sa.Table(
+    "consensus_run",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("document_version_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("ai_request_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("ai_call_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("consensus_version", sa.Text(), nullable=False),
+    sa.Column("status", sa.Text(), server_default=sa.text("'queued'"), nullable=False),
+    sa.Column("summary", postgresql.JSONB()),
+    sa.Column("error_code", sa.Text()),
+    sa.Column("result_version_id", postgresql.UUID(as_uuid=True)),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.Column("finished_at", sa.TIMESTAMP(timezone=True)),
+    sa.PrimaryKeyConstraint("id", name="consensus_run_pkey"),
+    sa.UniqueConstraint(
+        "workspace_id", "ai_request_id", name="consensus_run_workspace_request_key"
+    ),
+    sa.ForeignKeyConstraint(
+        ["document_version_id"],
+        ["document_version.id"],
+        name="consensus_run_document_version_id_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["result_version_id"],
+        ["document_version.id"],
+        name="consensus_run_result_version_id_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["ai_request_id"], ["ai_request.id"], name="consensus_run_ai_request_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["ai_call_id"], ["ai_call_log.id"], name="consensus_run_ai_call_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="consensus_run_workspace_id_fkey"
+    ),
+    sa.CheckConstraint(
+        "status = ANY (ARRAY['queued'::text, 'succeeded'::text, 'stale'::text, 'failed'::text])",
+        name="consensus_run_status_ck",
+    ),
+    sa.CheckConstraint(
+        "(status = 'queued'::text) = (finished_at IS NULL)", name="consensus_run_finished_ck"
+    ),
+    sa.CheckConstraint(
+        "(status = 'succeeded'::text) = (summary IS NOT NULL)", name="consensus_run_summary_ck"
+    ),
+    sa.CheckConstraint(
+        "(status = 'failed'::text) = (error_code IS NOT NULL)", name="consensus_run_error_ck"
+    ),
+)
+
+_tables["reader_comparison"] = sa.Table(
+    "reader_comparison",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("document_version_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("ai_request_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("provider", _AI_PROVIDER, nullable=False),
+    sa.Column("model", sa.Text(), nullable=False),
+    sa.Column("prompt_version", sa.Text(), nullable=False),
+    sa.Column("schema_version", sa.Text(), nullable=False),
+    sa.Column("reader_params_digest", sa.Text(), nullable=False),
+    sa.Column("counts", postgresql.JSONB(), nullable=False),
+    sa.Column("labels", postgresql.JSONB(), nullable=False),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.PrimaryKeyConstraint("id", name="reader_comparison_pkey"),
+    sa.UniqueConstraint("workspace_id", "ai_request_id", name="reader_comparison_request_key"),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="reader_comparison_workspace_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["document_version_id"],
+        ["document_version.id"],
+        name="reader_comparison_document_version_id_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["ai_request_id"], ["ai_request.id"], name="reader_comparison_ai_request_id_fkey"
+    ),
+    sa.CheckConstraint(
+        "length(model) >= 1 AND length(model) <= 200 "
+        "AND length(prompt_version) >= 1 AND length(prompt_version) <= 64 "
+        "AND length(schema_version) >= 1 AND length(schema_version) <= 64",
+        name="reader_comparison_text_len_ck",
+    ),
+    sa.CheckConstraint(
+        "reader_params_digest ~ '^[0-9a-f]{64}$'::text", name="reader_comparison_digest_ck"
+    ),
+    sa.CheckConstraint("jsonb_typeof(counts) = 'object'::text", name="reader_comparison_counts_ck"),
+    sa.CheckConstraint("jsonb_typeof(labels) = 'array'::text", name="reader_comparison_labels_ck"),
+)
+_tables["consensus_decision"] = sa.Table(
+    "consensus_decision",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("consensus_run_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("document_version_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("field_key", sa.Text(), nullable=False),
+    sa.Column("scope", sa.Text(), nullable=False),
+    sa.Column("line_no", sa.Integer()),
+    sa.Column("field_name", sa.Text(), nullable=False),
+    sa.Column("field_type", sa.Text()),
+    sa.Column("trust_level", sa.Text(), nullable=False),
+    sa.Column("decision_rule", sa.Text(), nullable=False),
+    sa.Column("reason", sa.Text(), nullable=False),
+    sa.Column("readings", postgresql.JSONB(), nullable=False),
+    sa.Column(
+        "supporting",
+        postgresql.ARRAY(sa.Text()),
+        server_default=sa.text("'{}'::text[]"),
+        nullable=False,
+    ),
+    sa.Column("crop", postgresql.JSONB()),
+    sa.Column(
+        "failed_validators",
+        postgresql.ARRAY(sa.Text()),
+        server_default=sa.text("'{}'::text[]"),
+        nullable=False,
+    ),
+    sa.Column("auto_verified", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+    sa.Column("reopened", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.PrimaryKeyConstraint("id", name="consensus_decision_pkey"),
+    sa.UniqueConstraint(
+        "workspace_id", "consensus_run_id", "field_key", name="consensus_decision_run_field_key"
+    ),
+    sa.ForeignKeyConstraint(
+        ["consensus_run_id"], ["consensus_run.id"], name="consensus_decision_consensus_run_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["document_version_id"],
+        ["document_version.id"],
+        name="consensus_decision_document_version_id_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="consensus_decision_workspace_id_fkey"
+    ),
+    sa.CheckConstraint(
+        "(scope = 'header'::text AND line_no IS NULL) OR (scope = 'line'::text AND line_no >= 1)",
+        name="consensus_decision_scope_ck",
+    ),
+    sa.CheckConstraint(
+        "trust_level = ANY (ARRAY['l0'::text, 'l1'::text, 'l2'::text, "
+        "'l3'::text, 'rejected'::text])",
+        name="consensus_decision_trust_level_ck",
+    ),
+    sa.CheckConstraint(
+        "decision_rule = ANY (ARRAY['existing'::text, 'd42'::text, 'single'::text, "
+        "'conflict'::text, 'reopen'::text, 'excluded'::text, 'vision_only'::text])",
+        name="consensus_decision_rule_ck",
+    ),
+    sa.CheckConstraint(
+        "field_type IS NULL OR field_type = ANY (ARRAY['doc_no'::text, 'doc_date'::text, "
+        "'gstin'::text, 'amount'::text, 'reference'::text, 'line_amount'::text, "
+        "'line_quantity'::text, 'line_rate'::text])",
+        name="consensus_decision_field_type_ck",
     ),
 )
 
@@ -592,7 +776,7 @@ _tables["ai_call_log"] = sa.Table(
     ),
     sa.Column(
         "provider",
-        postgresql.ENUM("claude", "openai", "gemini", name="ai_provider", create_type=False),
+        _AI_PROVIDER,
         nullable=False,
     ),
     sa.Column("model", sa.Text(), nullable=False),
@@ -735,7 +919,7 @@ _tables["ai_setting"] = sa.Table(
     ),
     sa.Column(
         "provider",
-        postgresql.ENUM("claude", "openai", "gemini", name="ai_provider", create_type=False),
+        _AI_PROVIDER,
     ),
     sa.Column("model", sa.Text()),
     sa.Column("budget_cap_usd", sa.Numeric(precision=12, scale=4)),
@@ -770,6 +954,31 @@ _tables["ai_setting"] = sa.Table(
         postgresql.DOMAIN("d_hash", sa.Text(collation="default"), create_type=False),
     ),
     sa.Column("vision_enabled", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+    sa.Column(
+        "auto_verify_field_types",
+        postgresql.ARRAY(sa.Text()),
+        server_default=sa.text("'{}'::text[]"),
+        nullable=False,
+    ),
+    sa.Column(
+        "reader_strategy",
+        postgresql.ENUM("off", "shadow", "single", name="ai_reader_strategy", create_type=False),
+        server_default=sa.text("'off'::ai_reader_strategy"),
+        nullable=False,
+    ),
+    sa.Column("primary_reader", _AI_PROVIDER),
+    sa.Column("extraction_provider", _AI_PROVIDER),
+    sa.Column("assist_provider", _AI_PROVIDER),
+    sa.Column("shadow_provider", _AI_PROVIDER),
+    sa.Column(
+        "allow_provider_fallback", sa.Boolean(), server_default=sa.text("false"), nullable=False
+    ),
+    sa.Column(
+        "apply_mode",
+        postgresql.ENUM("suggest", "merge", name="ai_apply_mode", create_type=False),
+        server_default=sa.text("'suggest'::ai_apply_mode"),
+        nullable=False,
+    ),
     sa.PrimaryKeyConstraint("id", name="ai_setting_pkey"),
     sa.UniqueConstraint("workspace_id", name="ai_setting_workspace_id_key"),
     sa.ForeignKeyConstraint(["consent_by"], ["app_user.id"], name="ai_setting_consent_by_fkey"),
@@ -794,6 +1003,229 @@ _tables["ai_setting"] = sa.Table(
         "mode = 'rules_only'::ai_mode OR consent_given AND provider IS NOT NULL AND model IS NOT NULL",  # noqa: E501
         name="ai_setting_mode_ck",
     ),
+    sa.CheckConstraint(
+        "auto_verify_field_types <@ ARRAY['doc_date'::text, 'doc_no'::text, 'gstin'::text, "
+        "'line_amount'::text, 'reference'::text] AND cardinality(auto_verify_field_types) <= 5",
+        name="ai_setting_auto_verify_field_types_ck",
+    ),
+    sa.CheckConstraint(
+        "(reader_strategy = 'off'::ai_reader_strategy) = (primary_reader IS NULL)",
+        name="ai_setting_reader_strategy_ck",
+    ),
+)
+
+_tables["ai_provider_config"] = sa.Table(
+    "ai_provider_config",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("provider", _AI_PROVIDER, nullable=False),
+    sa.Column("enabled", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+    sa.Column("model", sa.Text()),
+    sa.Column("base_url", sa.Text()),
+    sa.Column("key_secret_id", postgresql.UUID(as_uuid=True)),
+    sa.Column(
+        "limits",
+        postgresql.JSONB(astext_type=sa.Text()),
+        server_default=sa.text("'{}'::jsonb"),
+        nullable=False,
+    ),
+    sa.Column("last_test_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("last_test_ok", sa.Boolean()),
+    sa.Column("last_health_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("last_health_ok", sa.Boolean()),
+    sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
+    sa.Column("updated_by", postgresql.UUID(as_uuid=True)),
+    sa.Column(
+        "updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.Column("connected_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("last_error_code", sa.Text()),
+    sa.Column("last_error_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("key_rotated_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("consent_fingerprint", sa.Text()),
+    sa.Column("consent_accepted_by", postgresql.UUID(as_uuid=True)),
+    sa.Column("consent_accepted_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("monthly_cost_cap_inr", D_AMOUNT),
+    sa.Column("cap_warn_pct", sa.SmallInteger(), server_default=sa.text("80"), nullable=False),
+    sa.Column("doc_cost_flag_inr", D_AMOUNT),
+    sa.Column(
+        "auto_verify_field_types",
+        postgresql.ARRAY(sa.Text()),
+        server_default=sa.text("'{}'::text[]"),
+        nullable=False,
+    ),
+    sa.Column(
+        "apply_mode",
+        postgresql.ENUM("suggest", "merge", name="ai_apply_mode", create_type=False),
+        server_default=sa.text("'suggest'::ai_apply_mode"),
+        nullable=False,
+    ),
+    sa.Column("breaker_state", sa.Text(), server_default=sa.text("'closed'::text"), nullable=False),
+    sa.Column("breaker_changed_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("key_tier", sa.Text(), server_default=sa.text("'free'::text"), nullable=False),
+    sa.Column("pending_key_secret_id", postgresql.UUID(as_uuid=True)),
+    sa.PrimaryKeyConstraint("id", name="ai_provider_config_pkey"),
+    sa.UniqueConstraint(
+        "workspace_id", "provider", name="ai_provider_config_workspace_provider_key"
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="ai_provider_config_workspace_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["key_secret_id"], ["secret.id"], name="ai_provider_config_key_secret_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["updated_by"], ["app_user.id"], name="ai_provider_config_updated_by_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["consent_accepted_by"], ["app_user.id"], name="ai_provider_config_consent_accepted_by_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["pending_key_secret_id"],
+        ["secret.id"],
+        name="ai_provider_config_pending_key_secret_id_fkey",
+    ),
+    sa.CheckConstraint(
+        "provider = 'vllm'::ai_provider OR base_url IS NULL", name="ai_provider_config_base_url_ck"
+    ),
+    sa.CheckConstraint(
+        "model IS NULL OR length(model) >= 1 AND length(model) <= 128",
+        name="ai_provider_config_model_ck",
+    ),
+    sa.CheckConstraint(
+        "base_url IS NULL OR length(base_url) >= 1 AND length(base_url) <= 512",
+        name="ai_provider_config_base_url_len_ck",
+    ),
+    sa.CheckConstraint(
+        "jsonb_typeof(limits) = 'object'::text", name="ai_provider_config_limits_ck"
+    ),
+    sa.CheckConstraint("version >= 1", name="ai_provider_config_version_ck"),
+    sa.CheckConstraint(
+        "last_error_code IS NULL OR length(last_error_code) >= 1 AND length(last_error_code) <= 64",
+        name="ai_provider_config_error_code_ck",
+    ),
+    sa.CheckConstraint(
+        "(consent_fingerprint IS NULL) = (consent_accepted_at IS NULL) "
+        "AND (consent_accepted_at IS NULL) = (consent_accepted_by IS NULL)",
+        name="ai_provider_config_consent_ck",
+    ),
+    sa.CheckConstraint(
+        "consent_fingerprint IS NULL OR length(consent_fingerprint) >= 1 "
+        "AND length(consent_fingerprint) <= 128",
+        name="ai_provider_config_consent_len_ck",
+    ),
+    sa.CheckConstraint(
+        "monthly_cost_cap_inr IS NULL OR monthly_cost_cap_inr >= 0::numeric",
+        name="ai_provider_config_cap_ck",
+    ),
+    sa.CheckConstraint(
+        "cap_warn_pct >= 1 AND cap_warn_pct <= 100", name="ai_provider_config_cap_warn_ck"
+    ),
+    sa.CheckConstraint(
+        "doc_cost_flag_inr IS NULL OR doc_cost_flag_inr >= 0::numeric",
+        name="ai_provider_config_doc_flag_ck",
+    ),
+    sa.CheckConstraint(
+        "auto_verify_field_types <@ ARRAY['doc_date'::text, 'doc_no'::text, 'gstin'::text, "
+        "'line_amount'::text, 'reference'::text] AND cardinality(auto_verify_field_types) <= 5",
+        name="ai_provider_config_auto_verify_ck",
+    ),
+    sa.CheckConstraint(
+        "breaker_state = ANY (ARRAY['closed'::text, 'open'::text])",
+        name="ai_provider_config_breaker_ck",
+    ),
+    sa.CheckConstraint(
+        "key_tier = ANY (ARRAY['free'::text, 'paid'::text])", name="ai_provider_config_key_tier_ck"
+    ),
+    sa.CheckConstraint(
+        "provider = 'gemini'::ai_provider OR key_tier = 'free'::text",
+        name="ai_provider_config_key_tier_provider_ck",
+    ),
+    sa.CheckConstraint(
+        "pending_key_secret_id IS NULL OR pending_key_secret_id IS DISTINCT FROM key_secret_id",
+        name="ai_provider_config_pending_key_ck",
+    ),
+)
+
+_tables["ai_endpoint_allow"] = sa.Table(
+    "ai_endpoint_allow",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("url", sa.Text(), nullable=False),
+    sa.Column("action", sa.Text(), nullable=False),
+    sa.Column("added_by", postgresql.UUID(as_uuid=True)),
+    sa.Column(
+        "added_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.PrimaryKeyConstraint("id", name="ai_endpoint_allow_pkey"),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="ai_endpoint_allow_workspace_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(["added_by"], ["app_user.id"], name="ai_endpoint_allow_added_by_fkey"),
+    sa.CheckConstraint("length(url) >= 1 AND length(url) <= 512", name="ai_endpoint_allow_url_ck"),
+    sa.CheckConstraint(
+        "action = ANY (ARRAY['add'::text, 'remove'::text])", name="ai_endpoint_allow_action_ck"
+    ),
+)
+sa.Index(
+    "ai_endpoint_allow_url_ix",
+    _tables["ai_endpoint_allow"].c["workspace_id"],
+    _tables["ai_endpoint_allow"].c["url"],
+    _tables["ai_endpoint_allow"].c["added_at"],
+)
+
+_tables["provider_measurement"] = sa.Table(
+    "provider_measurement",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("provider", _AI_PROVIDER, nullable=False),
+    sa.Column("field_type", sa.Text(), nullable=False),
+    sa.Column("split", sa.Text(), nullable=False),
+    sa.Column("n", sa.Integer(), nullable=False),
+    sa.Column("correct", sa.Integer(), nullable=False),
+    sa.Column("wrong", sa.Integer(), nullable=False),
+    sa.Column("lower_bound", D_SCORE),
+    sa.Column("report_hash", sa.Text(), nullable=False),
+    sa.Column("epoch", sa.Text()),
+    sa.Column("measured_on", sa.Date(), nullable=False),
+    sa.Column("imported_by", postgresql.UUID(as_uuid=True)),
+    sa.Column(
+        "imported_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.PrimaryKeyConstraint("id", name="provider_measurement_pkey"),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="provider_measurement_workspace_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["imported_by"], ["app_user.id"], name="provider_measurement_imported_by_fkey"
+    ),
+    sa.CheckConstraint(
+        "length(field_type) >= 1 AND length(field_type) <= 64", name="provider_measurement_field_ck"
+    ),
+    sa.CheckConstraint(
+        "split = ANY (ARRAY['dev'::text, 'heldout'::text])", name="provider_measurement_split_ck"
+    ),
+    sa.CheckConstraint(
+        "n >= 0 AND correct >= 0 AND wrong >= 0 AND (correct + wrong) <= n",
+        name="provider_measurement_counts_ck",
+    ),
+    sa.CheckConstraint(
+        "report_hash ~ '^[0-9a-f]{12,64}$'::text", name="provider_measurement_hash_ck"
+    ),
+    sa.CheckConstraint(
+        "epoch IS NULL OR length(epoch) >= 1 AND length(epoch) <= 128",
+        name="provider_measurement_epoch_ck",
+    ),
+)
+sa.Index(
+    "provider_measurement_lookup_ix",
+    _tables["provider_measurement"].c["workspace_id"],
+    _tables["provider_measurement"].c["provider"],
+    _tables["provider_measurement"].c["field_type"],
+    _tables["provider_measurement"].c["measured_on"].desc(),
 )
 
 _tables["dirty_scope"] = sa.Table(
@@ -1342,7 +1774,7 @@ _tables["recon_run"] = sa.Table(
     ),
     sa.Column(
         "ai_provider",
-        postgresql.ENUM("claude", "openai", "gemini", name="ai_provider", create_type=False),
+        _AI_PROVIDER,
     ),
     sa.Column("ai_model", sa.Text()),
     sa.Column("ai_prompt_versions", postgresql.JSONB()),
@@ -1560,6 +1992,42 @@ _tables["document_version"] = sa.Table(
     sa.ForeignKeyConstraint(
         ["workspace_id"], ["workspace.id"], name="document_version_workspace_id_fkey"
     ),
+)
+
+_tables["document_identity"] = sa.Table(
+    "document_identity",
+    metadata,
+    sa.Column("document_version_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column(
+        "source_sha256",
+        postgresql.DOMAIN("d_hash", sa.Text(collation="default"), create_type=False),
+        nullable=False,
+    ),
+    sa.Column("source_locator", sa.Text()),
+    sa.Column(
+        "page_hashes",
+        postgresql.ARRAY(sa.Text()),
+        server_default=sa.text("'{}'::text[]"),
+        nullable=False,
+    ),
+    sa.Column(
+        "content_fingerprint",
+        postgresql.DOMAIN("d_hash", sa.Text(collation="default"), create_type=False),
+    ),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.PrimaryKeyConstraint("document_version_id", name="document_identity_pkey"),
+    sa.ForeignKeyConstraint(
+        ["document_version_id"],
+        ["document_version.id"],
+        name="document_identity_document_version_id_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="document_identity_workspace_id_fkey"
+    ),
+    sa.CheckConstraint("cardinality(page_hashes) <= 100", name="document_identity_page_hashes_ck"),
 )
 
 _tables["config_version"] = sa.Table(
@@ -2153,9 +2621,24 @@ _tables["ai_cache"] = sa.Table(
         "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
     ),
     sa.Column("last_hit_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column(
+        "provider",
+        _AI_PROVIDER,
+    ),
+    sa.Column("schema_version", sa.Text()),
+    sa.Column("reader_params", postgresql.JSONB()),
     sa.PrimaryKeyConstraint("id", name="ai_cache_pkey"),
     sa.UniqueConstraint("workspace_id", "cache_key", name="ai_cache_workspace_id_cache_key_key"),
     sa.ForeignKeyConstraint(["workspace_id"], ["workspace.id"], name="ai_cache_workspace_id_fkey"),
+    sa.CheckConstraint(
+        "(schema_version IS NULL) OR ((length(schema_version) >= 1) "
+        "AND (length(schema_version) <= 64))",
+        name="ai_cache_schema_version_ck",
+    ),
+    sa.CheckConstraint(
+        "(reader_params IS NULL) OR (jsonb_typeof(reader_params) = 'object'::text)",
+        name="ai_cache_reader_params_ck",
+    ),
 )
 
 _tables["source_file"] = sa.Table(
@@ -2358,6 +2841,42 @@ sa.Index(
     unique=False,
     postgresql_where=sa.text("(document_version_id IS NOT NULL)"),
 )
+sa.Index(
+    "field_evidence_verification_ix",
+    _tables["field_evidence"].c["workspace_id"],
+    _tables["field_evidence"].c["document_version_id"],
+    _tables["field_evidence"].c["field_name"],
+    _tables["field_evidence"].c["created_at"],
+    _tables["field_evidence"].c["id"],
+    unique=False,
+    postgresql_where=sa.text("(verification <> 'none')"),
+)
+sa.Index(
+    "field_evidence_line_verification_ix",
+    _tables["field_evidence"].c["workspace_id"],
+    _tables["field_evidence"].c["doc_line_id"],
+    _tables["field_evidence"].c["field_name"],
+    _tables["field_evidence"].c["created_at"],
+    _tables["field_evidence"].c["id"],
+    unique=False,
+    postgresql_where=sa.text("(verification <> 'none')"),
+)
+sa.Index(
+    "consensus_run_version_ix",
+    _tables["consensus_run"].c["workspace_id"],
+    _tables["consensus_run"].c["document_version_id"],
+    _tables["consensus_run"].c["created_at"].desc(),
+)
+sa.Index(
+    "reader_comparison_created_ix",
+    _tables["reader_comparison"].c["workspace_id"],
+    _tables["reader_comparison"].c["created_at"],
+)
+sa.Index(
+    "consensus_decision_run_ix",
+    _tables["consensus_decision"].c["workspace_id"],
+    _tables["consensus_decision"].c["consensus_run_id"],
+)
 
 sa.Index("link_current_from_ix", _tables["link_current"].c["from_document_id"], unique=False)
 sa.Index("link_current_to_ix", _tables["link_current"].c["to_document_id"], unique=False)
@@ -2553,6 +3072,20 @@ sa.Index(
 )
 
 sa.Index("document_version_file_ix", _tables["document_version"].c["source_file_id"], unique=False)
+sa.Index(
+    "document_identity_fingerprint_ix",
+    _tables["document_identity"].c["workspace_id"],
+    _tables["document_identity"].c["content_fingerprint"],
+    unique=False,
+    postgresql_where=sa.text("(content_fingerprint IS NOT NULL)"),
+)
+sa.Index(
+    "document_identity_source_ix",
+    _tables["document_identity"].c["workspace_id"],
+    _tables["document_identity"].c["source_sha256"],
+    _tables["document_identity"].c["source_locator"],
+    unique=False,
+)
 sa.Index(
     "document_version_governing_ix",
     _tables["document_version"].c["document_id"],
@@ -2764,7 +3297,7 @@ _tables["ai_request"] = sa.Table(
     sa.Column("consent_fingerprint", _D_HASH),
     sa.Column(
         "provider",
-        postgresql.ENUM("claude", "openai", "gemini", name="ai_provider", create_type=False),
+        _AI_PROVIDER,
         nullable=False,
     ),
     sa.Column("model", sa.Text(), nullable=False),
@@ -2803,6 +3336,10 @@ _tables["ai_request"] = sa.Table(
     sa.Column("finished_at", sa.TIMESTAMP(timezone=True)),
     sa.Column("acknowledged_by", postgresql.UUID(as_uuid=True)),
     sa.Column("acknowledged_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column(
+        "reader_params", postgresql.JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False
+    ),
+    sa.Column("shadow", sa.Boolean(), server_default=sa.text("false"), nullable=False),
     sa.PrimaryKeyConstraint("id", name="ai_request_pkey"),
     sa.UniqueConstraint(
         "workspace_id",
@@ -2899,6 +3436,12 @@ _tables["ai_request"] = sa.Table(
         "AND (tokens_output IS NULL OR tokens_output >= 0) "
         "AND (tokens_thought IS NULL OR tokens_thought >= 0)",
         name="ai_request_tokens_ck",
+    ),
+    sa.CheckConstraint(
+        "jsonb_typeof(reader_params) = 'object'::text", name="ai_request_reader_params_ck"
+    ),
+    sa.CheckConstraint(
+        "(NOT shadow) OR (hook = 'h6_vision'::ai_hook)", name="ai_request_shadow_ck"
     ),
     sa.CheckConstraint(
         "(NOT usage_known) OR (tokens_input IS NOT NULL AND tokens_output IS NOT NULL)",

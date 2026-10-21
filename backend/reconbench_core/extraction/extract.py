@@ -58,12 +58,18 @@ from reconbench_core.extraction.verify import (
     solve_line,
 )
 from reconbench_core.parsers.common import build_document
-from reconbench_core.parsers.parties import buyer_gstins, is_buyer_name, name_problem
+from reconbench_core.parsers.parties import (
+    buyer_gstins,
+    is_buyer_name,
+    name_problem,
+    withhold_vendor_name,
+)
 from reconbench_core.parsers.types import DEFAULT_GST_RATES, BuyerEntityHint, ParseWarning
 from reconbench_core.schema import (
     DocType,
     Document,
     FieldEvidence,
+    FieldOrigin,
     FieldSource,
     LineType,
     ReasonCode,
@@ -444,6 +450,12 @@ def _gstins(
     never the vendor. Otherwise the buyer's GSTIN is usually printed in both the
     bill-to and ship-to blocks, so a GSTIN that appears twice on one page is the
     buyer; labels decide the rest.
+
+    Without ``own`` (the workspace has not configured its GSTINs) a checksum alone
+    never confirms a vendor whose role no label establishes: one unlabelled GSTIN,
+    or an unlabelled vendor beside another unlabelled GSTIN, may be the buyer's
+    own, so it is capped below the review floor. A labelled buyer GSTIN beside it
+    establishes the vendor's role by elimination.
     """
 
     occurrences: list[tuple[str, bool, Candidate, str]] = []
@@ -514,7 +526,20 @@ def _gstins(
             for word in row.words
         )
         repeated = sum(1 for v, *_r in occurrences if v == vendor[0]) >= 2
-        if unrepaired or pan_seen or repeated:
+
+        def role_of(value: str) -> str:
+            roles = {role for v, _r, _c, role in occurrences if v == value}
+            return next((role for role in ("seller", "buyer") if role in roles), "unknown")
+
+        vendor_role = role_of(vendor[0])
+        unlabelled_other = any(
+            value != vendor[0] and role_of(value) == "unknown" for value in values
+        )
+        if not own and vendor_role == "unknown" and (len(values) == 1 or unlabelled_other):
+            check = FieldCheck(
+                Status.UNVERIFIED, "party role not established", cap=DERIVED_CONFIDENCE
+            )
+        elif unrepaired or pan_seen or repeated:
             check = FieldCheck(Status.CONFIRMED, "GSTIN checksum valid")
         else:
             check = FieldCheck(Status.UNVERIFIED, "GSTIN repaired from OCR")
@@ -869,7 +894,16 @@ def extract_document(
                 message="A GSTIN is printed but could not be read with a valid checksum.",
             )
         )
-    name = _signatory_name(ctx, buyer_entities) or _supplier_block_name(ctx, buyer_entities)
+    # A PO or GRN is issued by the buyer, so its "for <Company>" line is the buyer's own
+    # name. Without configured entities nothing rejects it: only a name under a supplier
+    # label is used, and an issuer line alone leaves the vendor name for review.
+    issuer_is_buyer = doc_type in {DocType.PO, DocType.GRN} and not buyer_entities
+    if issuer_is_buyer:
+        name = _supplier_block_name(ctx, buyer_entities)
+        withhold_name = name is None and _signatory_name(ctx, buyer_entities) is not None
+    else:
+        name = _signatory_name(ctx, buyer_entities) or _supplier_block_name(ctx, buyer_entities)
+        withhold_name = False
     if name:
         header_raw["vendor_name"] = name
         checks["vendor_name"] = FieldCheck(Status.UNVERIFIED)
@@ -1006,12 +1040,16 @@ def extract_document(
         line_extras=line_extras,
         locator="layout",
         source=FieldSource.RULE,
+        origin=FieldOrigin.OCR,
         base_confidence=OCR_CONFIDENCE if source == PageSource.OCR else TEXT_LAYER_CONFIDENCE,
         uom_aliases=uom_aliases,
         charge_keywords=charge_keywords,
     )
     warnings.extend(built_warnings)
     document = _apply_checks(document, checks, evidence, line_checks, source)
+    if withhold_name:
+        document, withheld = withhold_vendor_name(document, locator="layout")
+        warnings.append(withheld)
     return Extraction(document, tuple(warnings), checks, line_checks, kinds)
 
 

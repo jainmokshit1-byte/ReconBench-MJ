@@ -9,25 +9,29 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
 from reconbench_core.extraction.vision import (
     ANNOTATION_KINDS,
     ANNOTATION_LOOKS,
+    ANNOTATION_LOOKS_V5,
     DOC_KINDS,
     FIELD_KINDS,
     LINE_CELLS,
     PAGE_KINDS,
+    UNREADABLE_NAMES,
 )
 
 HookName = Literal["h1_extract", "h2_item", "h3_rerank", "h4_vendor", "h6_vision"]
 DocTypeName = Literal["invoice", "po", "grn"]
 FieldKind = Literal["text", "ref", "date", "money", "number", "gstin", "currency"]
+SchemaDialect = Literal["gemini", "openai_json_schema"]
 
 SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
     {
@@ -35,7 +39,7 @@ SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
         "h2_item": "h2.schema.v2",
         "h3_rerank": "h3.schema.v1",
         "h4_vendor": "h4.schema.v1",
-        "h6_vision": "vision.schema.v3",
+        "h6_vision": "vision.schema.v4",
         "provider_test": "provider_test.schema.v1",
     }
 )
@@ -255,14 +259,35 @@ class VisionAnnotationItem(_Strict):
     box_2d: list[int] = _BOX
 
 
+class VisionUnreadableItem(_Strict):
+    """A value printed on the page that the model could not read with certainty (no value)."""
+
+    name: str = Field(min_length=1, max_length=40)
+    page: int = Field(ge=1, le=10_000)
+    box_2d: list[int] = _BOX
+
+
 class VisionOutput(_Strict):
-    """A page-image reading (``vision.schema.v3``): every value as printed, with its box."""
+    """A page-image reading (``vision.schema.v4``): every value as printed, with its box.
+
+    v4 adds ``unreadable``. It is optional here (the provider schemas require it) so
+    answers recorded under v3 still parse; the strict local parse is the authority
+    for every provider dialect.
+    """
 
     doc_kind: str = Field(min_length=1, max_length=40)
     pages: list[VisionPageInfo] = Field(max_length=50)
     fields: list[VisionFieldItem] = Field(max_length=400)
     lines: list[VisionLineItem] = Field(max_length=500)
     annotations: list[VisionAnnotationItem] = Field(max_length=60)
+    unreadable: list[VisionUnreadableItem] = Field(default_factory=list, max_length=200)
+    _schema_dropped: dict[str, int] = PrivateAttr(default_factory=dict)
+
+    @property
+    def schema_dropped(self) -> Mapping[str, int]:
+        """Items :func:`parse_output` left out for breaking a schema rule (D73), by reason."""
+
+        return MappingProxyType(self._schema_dropped)
 
 
 OUTPUT_MODELS: Mapping[str, type[_Strict]] = MappingProxyType(
@@ -353,8 +378,8 @@ H4_RESPONSE_SCHEMA: Mapping[str, Any] = MappingProxyType(
 )
 
 
-def vision_response_schema() -> dict[str, Any]:
-    """Provider schema for ``h6_vision``: flat lists, no ``maxItems``/``$ref``/``anyOf`` (D31)."""
+def vision_response_schema_v3() -> dict[str, Any]:
+    """The ``vision.schema.v3`` Gemini schema, kept byte-identical for the v1 cache key."""
 
     box = {"type": "array", "items": {"type": "integer"}}
     # The model writes keys in schema order: the scored cells come first (D40).
@@ -412,6 +437,94 @@ def vision_response_schema() -> dict[str, Any]:
     )
 
 
+def vision_response_schema(dialect: SchemaDialect = "gemini") -> dict[str, Any]:
+    """Provider schema for ``h6_vision`` (``vision.schema.v4``) in one provider dialect.
+
+    ``gemini``: flat lists, no ``maxItems``/``$ref``/``anyOf`` (D31), optional keys
+    left out of ``required``. ``openai_json_schema`` (vLLM structured output): the
+    same properties with ``additionalProperties: false`` and every key required;
+    a key that is optional in ``gemini`` becomes nullable through ``anyOf``.
+    Both are derived from one definition and must list exactly the fields of
+    :class:`VisionOutput` (unit test).
+    """
+
+    schema = vision_response_schema_v3()
+    box = {"type": "array", "items": {"type": "integer"}}
+    schema["properties"]["unreadable"] = {
+        "type": "array",
+        "items": _object(
+            {
+                "name": _string(enum=sorted(UNREADABLE_NAMES)),
+                "page": {"type": "integer"},
+                "box_2d": box,
+            },
+            ["name", "page", "box_2d"],
+        ),
+    }
+    schema["required"].append("unreadable")
+    if dialect == "gemini":
+        return schema
+    return _openai_dialect(schema, VisionOutput)
+
+
+VISION_SCHEMA_V5 = "vision.schema.v5"
+"""``h6_vision`` schema of the WI-Q2 prompt variants: v4 plus ``service_po_number``."""
+
+
+def vision_response_schema_v5(dialect: SchemaDialect = "gemini") -> dict[str, Any]:
+    """``vision.schema.v5`` (WI-Q2): v4 with ``service_po_number`` as an annotation type.
+
+    Only the Q2 prompt variants use it; every v4 request (and its cache key) is unchanged.
+    """
+
+    schema = vision_response_schema("gemini")
+    annotation = schema["properties"]["annotations"]["items"]["properties"]
+    annotation["looks_like"] = _string(enum=list(ANNOTATION_LOOKS_V5))
+    if dialect == "gemini":
+        return schema
+    return _openai_dialect(schema, VisionOutput)
+
+
+def _string_limits(model: type[BaseModel], name: str) -> dict[str, int]:
+    """``minLength``/``maxLength`` of one string field, read from its pydantic limits."""
+
+    limits: dict[str, int] = {}
+    for meta in model.model_fields[name].metadata:
+        if (low := getattr(meta, "min_length", None)) is not None:
+            limits["minLength"] = low
+        if (high := getattr(meta, "max_length", None)) is not None:
+            limits["maxLength"] = high
+    return limits
+
+
+def _openai_dialect(schema: dict[str, Any], model: type[BaseModel]) -> dict[str, Any]:
+    """The ``openai_json_schema`` form of a vision object schema (D73).
+
+    Every free-text string carries the length limits of ``model`` so vLLM's
+    structured output cannot write an empty or over-long value the local parse
+    would drop (D71). Enum strings are bounded by their enum already.
+    """
+
+    required = set(schema["required"])
+    properties: dict[str, Any] = {}
+    for name, child in schema["properties"].items():
+        converted = child
+        if child.get("type") == "array" and child["items"].get("type") == "object":
+            item_model = _ITEM_MODELS[name]
+            converted = {**child, "items": _openai_dialect(child["items"], item_model)}
+        elif child.get("type") == "string" and "enum" not in child:
+            converted = {**child, **_string_limits(model, name)}
+        properties[name] = (
+            converted if name in required else {"anyOf": [converted, {"type": "null"}]}
+        )
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -435,10 +548,74 @@ def parse_output(kind: str, output_text: str) -> _Strict:
         raise InvalidOutput("invalid_output", "output is not a single JSON object") from exc
     if not isinstance(raw, dict):
         raise InvalidOutput("invalid_output", "output is not a JSON object")
+    dropped: Counter[str] = Counter()
+    if model is VisionOutput:
+        raw = _vision_items(raw, dropped)
     try:
-        return model.model_validate(raw)
+        parsed = model.model_validate(raw)
     except ValidationError as exc:
         raise InvalidOutput("invalid_output", "output violates the schema") from exc
+    if isinstance(parsed, VisionOutput) and dropped:
+        parsed._schema_dropped = dict(dropped)
+    return parsed
+
+
+def error_patterns(error: ValidationError, prefix: tuple[str, ...] = ()) -> list[str]:
+    """Pydantic errors as ``location: type`` patterns, list positions as ``*``, no values."""
+
+    return [
+        ".".join("*" if isinstance(part, int) else str(part) for part in (*prefix, *item["loc"]))
+        + f": {item['type']}"
+        for item in error.errors(include_input=False, include_url=False)
+    ]
+
+
+_VISION_ITEMS: Mapping[str, type[_Strict]] = MappingProxyType(
+    {
+        "fields": VisionFieldItem,
+        "lines": VisionLineItem,
+        "annotations": VisionAnnotationItem,
+        "unreadable": VisionUnreadableItem,
+    }
+)
+_ITEM_MODELS: Mapping[str, type[_Strict]] = MappingProxyType(
+    {"pages": VisionPageInfo, **_VISION_ITEMS}
+)
+_EMPTY_TEXT = "fields.*.text: string_too_short"
+
+
+def _vision_items(raw: dict[str, Any], dropped: Counter[str]) -> dict[str, Any]:
+    """The answer with each field, line, annotation or unreadable item that breaks its
+    schema rule left out and counted (``schema:<location>: <type>``, D73).
+
+    One bad item no longer loses the whole answer (D71: 3 of 18 invoices). A dropped
+    item is never repaired, truncated or turned into a value; a field whose only
+    problem is an empty ``text`` becomes an ``unreadable`` entry for that name. The
+    top level (keys, list types, list caps, ``doc_kind``, ``pages``) is still checked
+    whole by :class:`VisionOutput`.
+    """
+
+    cleaned = dict(raw)
+    moved: list[dict[str, Any]] = []
+    for name, model in _VISION_ITEMS.items():
+        items = raw.get(name)
+        if not isinstance(items, list):
+            continue
+        kept: list[Any] = []
+        for item in items:
+            try:
+                model.model_validate(item)
+            except ValidationError as exc:
+                patterns = error_patterns(exc, (name, "*"))
+                dropped[f"schema:{patterns[0]}"] += 1
+                if patterns == [_EMPTY_TEXT]:
+                    moved.append({key: item[key] for key in ("name", "page", "box_2d")})
+                continue
+            kept.append(item)
+        cleaned[name] = kept
+    if moved and isinstance(cleaned.get("unreadable", []), list):
+        cleaned["unreadable"] = [*cleaned.get("unreadable", []), *moved]
+    return cleaned
 
 
 def h1_field_kind(doc_type: DocTypeName, scope: str, field: str) -> FieldKind | None:
@@ -493,6 +670,7 @@ __all__ = [
     "SCHEMA_VERSIONS",
     "DocTypeName",
     "FieldKind",
+    "SchemaDialect",
     "H1Output",
     "H1Suggestion",
     "H2Opinion",
@@ -507,9 +685,13 @@ __all__ = [
     "VisionLineItem",
     "VisionOutput",
     "VisionPageInfo",
+    "VisionUnreadableItem",
     "h1_field_kind",
     "h1_response_schema",
     "parse_output",
     "typed_value",
+    "VISION_SCHEMA_V5",
     "vision_response_schema",
+    "vision_response_schema_v5",
+    "vision_response_schema_v3",
 ]

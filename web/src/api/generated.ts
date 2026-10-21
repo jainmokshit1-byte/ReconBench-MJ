@@ -33,7 +33,9 @@ export interface paths {
          * @description Consent text, per-hook data list and fingerprint for settings not yet saved.
          *
          *     ``vision=true`` previews the consent with page images on (the vision reader
-         *     replaces PDF text suggestions).
+         *     replaces PDF text suggestions). ``reader_strategy``/``primary_reader`` choose
+         *     the one vision provider; for the company server pass its model and base URL
+         *     (checked against the deployment allowlist).
          */
         get: operations["get_ai_consent_preview_api_v1_ai_consent_preview_get"];
         put?: never;
@@ -56,6 +58,92 @@ export interface paths {
         post?: never;
         /** Delete Ai Key */
         delete: operations["delete_ai_key_api_v1_ai_key_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/providers/{provider}/connect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Connect Ai Provider
+         * @description Save the credentials, record the accepted notice and queue the connection test.
+         *
+         *     The card is Not connected until the AI worker's test passes (poll
+         *     ``GET /ai/requests/{id}`` and ``GET /ai/settings``). The key is write-only.
+         */
+        post: operations["connect_ai_provider_api_v1_ai_providers__provider__connect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/providers/{provider}/connect-notice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Provider Connect Notice
+         * @description The notice an admin accepts when connecting this provider, with its fingerprint.
+         *
+         *     For Gemini the notice depends on the declared key tier; a free-tier key's notice states
+         *     the data use explicitly. Nothing is written.
+         */
+        get: operations["get_provider_connect_notice_api_v1_ai_providers__provider__connect_notice_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/providers/{provider}/disconnect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disconnect Ai Provider
+         * @description Delete the card's keys; a request still in flight is discarded, never applied.
+         */
+        post: operations["disconnect_ai_provider_api_v1_ai_providers__provider__disconnect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/providers/{provider}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate Ai Provider Key
+         * @description Test a new key first; the old key stays active until the test passes.
+         */
+        post: operations["rotate_ai_provider_key_api_v1_ai_providers__provider__rotate_post"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -112,6 +200,27 @@ export interface paths {
         get: operations["get_ai_settings_api_v1_ai_settings_get"];
         /** Put Ai Settings */
         put: operations["put_ai_settings_api_v1_ai_settings_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/shadow-report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Ai Shadow Report
+         * @description Shadow reader aggregates: agreement labels per provider and field, latency and
+         *     failure codes. Never a value or a document.
+         */
+        get: operations["get_ai_shadow_report_api_v1_ai_shadow_report_get"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -484,7 +593,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Correct Invoice Document */
+        /** Correct Document */
         put: operations["correct_invoice_document_api_v1_documents__document_id__correction_put"];
         post?: never;
         delete?: never;
@@ -1107,8 +1216,12 @@ export interface components {
         AiSettingsUpdate: {
             /** Api Key */
             api_key?: string | null;
+            /** Apply Mode */
+            apply_mode?: ("suggest" | "merge") | null;
             /** Auto Accept Ai Links */
             auto_accept_ai_links?: boolean | null;
+            /** Auto Verify Field Types */
+            auto_verify_field_types?: ("doc_date" | "doc_no" | "gstin" | "line_amount" | "reference")[] | null;
             /** Budget Cap Usd */
             budget_cap_usd?: number | string | null;
             consent?: components["schemas"]["ConsentAcceptance"] | null;
@@ -1118,8 +1231,14 @@ export interface components {
             mode?: ("rules_only" | "ai_assisted" | "ai_first") | null;
             /** Model */
             model?: string | null;
+            /** Primary Reader */
+            primary_reader?: ("gemini" | "vllm") | null;
             /** Provider */
             provider?: "gemini" | null;
+            /** Providers */
+            providers?: components["schemas"]["ProviderConfigUpdate"][] | null;
+            /** Reader Strategy */
+            reader_strategy?: ("off" | "shadow" | "single") | null;
             /** Redaction Enabled */
             redaction_enabled?: boolean | null;
             /** Vision */
@@ -1467,8 +1586,38 @@ export interface components {
             /** Seq */
             seq: number;
         };
+        /**
+         * ConnectBody
+         * @description Credentials and declarations for one provider card; the key is write-only.
+         */
+        ConnectBody: {
+            /** Api Key */
+            api_key?: string | null;
+            /** Base Url */
+            base_url?: string | null;
+            consent: components["schemas"]["ConsentToNotice"];
+            /** Key Storage */
+            key_storage?: ("session" | "saved") | null;
+            /** Model */
+            model?: string | null;
+            /** Tier */
+            tier?: ("free" | "paid") | null;
+        };
         /** ConsentAcceptance */
         ConsentAcceptance: {
+            /**
+             * Accept
+             * @constant
+             */
+            accept: true;
+            /** Fingerprint */
+            fingerprint: string;
+        };
+        /**
+         * ConsentToNotice
+         * @description The admin accepts the notice shown for this provider card.
+         */
+        ConsentToNotice: {
             /**
              * Accept
              * @constant
@@ -1499,6 +1648,114 @@ export interface components {
              */
             run_date?: string;
             scope?: components["schemas"]["RunScope"];
+        };
+        /**
+         * DocumentCorrectionBody
+         * @description Typed superset for the existing invoice, PO and GRN correction route.
+         */
+        DocumentCorrectionBody: {
+            /** Ai Suggestion Refs */
+            ai_suggestion_refs?: components["schemas"]["AiSuggestionRefBody"][];
+            /** Buyer Gstin */
+            buyer_gstin?: string | null;
+            /** Cgst */
+            cgst?: number | string | null;
+            /** Challan No */
+            challan_no?: string | null;
+            /** Currency */
+            currency?: string | null;
+            /** Delivery Date */
+            delivery_date?: string | null;
+            /** Doc Date */
+            doc_date?: string | null;
+            /** Doc No */
+            doc_no?: string | null;
+            /** E Way Bill No */
+            e_way_bill_no?: string | null;
+            /** Grand Total */
+            grand_total?: number | string | null;
+            /** Grn Refs */
+            grn_refs?: string[] | null;
+            /** Igst */
+            igst?: number | string | null;
+            /** Irn */
+            irn?: string | null;
+            /** Lines */
+            lines?: components["schemas"]["DocumentLineCorrection"][] | null;
+            /** Payment Terms */
+            payment_terms?: string | null;
+            /** Place Of Supply */
+            place_of_supply?: string | null;
+            /** Po Refs */
+            po_refs?: string[] | null;
+            /** Reason */
+            reason?: string | null;
+            /** Revision */
+            revision?: string | null;
+            /** Round Off */
+            round_off?: number | string | null;
+            /** Sgst */
+            sgst?: number | string | null;
+            /** Ship To */
+            ship_to?: string | null;
+            /** Status */
+            status?: ("open" | "closed" | "cancelled") | null;
+            /** Supplier Invoice No */
+            supplier_invoice_no?: string | null;
+            /** Taxable Total */
+            taxable_total?: number | string | null;
+            /** Vendor Gstin */
+            vendor_gstin?: string | null;
+            /** Vendor Name */
+            vendor_name?: string | null;
+            /**
+             * Verified
+             * @default false
+             */
+            verified: boolean;
+        };
+        /** DocumentLineCorrection */
+        DocumentLineCorrection: {
+            /** Accepted Qty */
+            accepted_qty?: number | string | null;
+            /** Amount */
+            amount?: number | string | null;
+            /** Cgst Amount */
+            cgst_amount?: number | string | null;
+            /** Description */
+            description?: string | null;
+            /** Discount */
+            discount?: number | string | null;
+            /** Hsn Sac */
+            hsn_sac?: string | null;
+            /** Id */
+            id?: string | null;
+            /** Igst Amount */
+            igst_amount?: number | string | null;
+            /** Item Code */
+            item_code?: string | null;
+            /** Line No */
+            line_no: number;
+            /** Line Type */
+            line_type?: ("goods" | "charge") | null;
+            /** Po Line Ref */
+            po_line_ref?: string | null;
+            /** Po Ref */
+            po_ref?: string | null;
+            /** Quantity */
+            quantity?: number | string | null;
+            /** Rate */
+            rate?: number | string | null;
+            /** Received Qty */
+            received_qty?: number | string | null;
+            /** Rejected Qty */
+            rejected_qty?: number | string | null;
+            /** Sgst Amount */
+            sgst_amount?: number | string | null;
+            /** Tax Rate */
+            tax_rate?: number | string | null;
+            /** Uom */
+            uom?: string | null;
         };
         /** DuplicatePolicyBody */
         DuplicatePolicyBody: {
@@ -1563,6 +1820,8 @@ export interface components {
             challan_no?: string | null;
             /** Currency */
             currency?: string | null;
+            /** Delivery Date */
+            delivery_date?: string | null;
             /** Doc Date */
             doc_date?: string | null;
             /** Doc No */
@@ -1579,16 +1838,24 @@ export interface components {
             irn?: string | null;
             /** Lines */
             lines?: components["schemas"]["InvoiceLineCorrection"][] | null;
+            /** Payment Terms */
+            payment_terms?: string | null;
             /** Place Of Supply */
             place_of_supply?: string | null;
             /** Po Refs */
             po_refs?: string[] | null;
             /** Reason */
             reason?: string | null;
+            /** Revision */
+            revision?: string | null;
             /** Round Off */
             round_off?: number | string | null;
             /** Sgst */
             sgst?: number | string | null;
+            /** Ship To */
+            ship_to?: string | null;
+            /** Status */
+            status?: ("open" | "closed" | "cancelled") | null;
             /** Taxable Total */
             taxable_total?: number | string | null;
             /** Vendor Gstin */
@@ -1958,6 +2225,54 @@ export interface components {
             location: (string | number)[];
         };
         /**
+         * ProviderConfigUpdate
+         * @description One provider card; Gemini and the vLLM server are configured separately.
+         */
+        ProviderConfigUpdate: {
+            /** Api Key */
+            api_key?: string | null;
+            /** Base Url */
+            base_url?: string | null;
+            /** Enabled */
+            enabled?: boolean | null;
+            /** Key Storage */
+            key_storage?: ("session" | "saved") | null;
+            /** Limits */
+            limits?: {
+                [key: string]: number;
+            } | null;
+            /** Model */
+            model?: string | null;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "gemini" | "vllm";
+            /**
+             * Remove Key
+             * @default false
+             */
+            remove_key: boolean;
+        };
+        /**
+         * ProviderTestBody
+         * @description Which provider to test; the default is today's Gemini text test.
+         */
+        ProviderTestBody: {
+            /**
+             * Kind
+             * @default text
+             * @enum {string}
+             */
+            kind: "text" | "image";
+            /**
+             * Provider
+             * @default gemini
+             * @enum {string}
+             */
+            provider: "gemini" | "vllm";
+        };
+        /**
          * ReasonCode
          * @enum {string}
          */
@@ -2016,6 +2331,16 @@ export interface components {
             min_canonical_len: number;
             /** Window Runs */
             window_runs: number;
+        };
+        /** RotateBody */
+        RotateBody: {
+            /**
+             * Api Key
+             * Format: password
+             */
+            api_key: string;
+            /** Key Storage */
+            key_storage?: ("session" | "saved") | null;
         };
         /** RunScope */
         RunScope: {
@@ -2293,6 +2618,12 @@ export interface operations {
                 mode: "ai_assisted" | "ai_first";
                 model: string;
                 vision?: boolean;
+                auto_verify_field_types?: ("doc_date" | "doc_no" | "gstin" | "line_amount" | "reference")[] | null;
+                reader_strategy?: ("off" | "shadow" | "single") | null;
+                primary_reader?: ("gemini" | "vllm") | null;
+                vllm_model?: string | null;
+                vllm_base_url?: string | null;
+                apply_mode?: "suggest" | "merge";
             };
             header?: never;
             path?: never;
@@ -2336,6 +2667,142 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+        };
+    };
+    connect_ai_provider_api_v1_ai_providers__provider__connect_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: "gemini" | "vllm";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_provider_connect_notice_api_v1_ai_providers__provider__connect_notice_get: {
+        parameters: {
+            query?: {
+                tier?: ("free" | "paid") | null;
+                model?: string | null;
+                base_url?: string | null;
+            };
+            header?: never;
+            path: {
+                provider: "gemini" | "vllm";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    disconnect_ai_provider_api_v1_ai_providers__provider__disconnect_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: "gemini" | "vllm";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rotate_ai_provider_key_api_v1_ai_providers__provider__rotate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: "gemini" | "vllm";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RotateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -2455,6 +2922,37 @@ export interface operations {
             };
         };
     };
+    get_ai_shadow_report_api_v1_ai_shadow_report_get: {
+        parameters: {
+            query?: {
+                since?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     test_ai_guardrails_api_v1_ai_test_post: {
         parameters: {
             query?: never;
@@ -2482,7 +2980,11 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ProviderTestBody"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             202: {
@@ -2493,11 +2995,22 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     get_ai_usage_api_v1_ai_usage_get: {
         parameters: {
-            query?: never;
+            query?: {
+                provider?: ("gemini" | "vllm") | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2511,6 +3024,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -3292,7 +3814,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["InvoiceCorrectionBody"];
+                "application/json": components["schemas"]["DocumentCorrectionBody"];
             };
         };
         responses: {

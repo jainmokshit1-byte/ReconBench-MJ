@@ -7,7 +7,7 @@ runner treats every kind identically for gating, budgets and the ledger.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
@@ -16,6 +16,7 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
+from reconbench_app.ai import connection_state
 from reconbench_app.ai.contracts import ProviderTestOutput
 from reconbench_app.ai.fixtures import PROVIDER_TEST
 from reconbench_app.ai.limits import AiLimits
@@ -35,6 +36,11 @@ class Prepared:
     document_version_id: UUID | None = None
     document_hash: str | None = None
     context: Mapping[str, Any] = field(default_factory=dict)
+    # A reader that reads one page per call (WI-BE2): one payload per provider call,
+    # and how their answers become one answer. ``payload`` stays the whole request
+    # (digest, cache key, input limits); empty ``parts`` sends ``payload`` once.
+    parts: tuple[PromptPayload, ...] = ()
+    merge_outputs: Callable[[Sequence[str]], str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,33 +113,55 @@ class ProviderTestHandler:
         now: datetime,
     ) -> str:
         del prepared, validated, call_log_id
-        settings = metadata.tables["ai_setting"]
-        updated = connection.execute(
-            sa.update(settings)
-            .where(
-                settings.c.workspace_id == request["workspace_id"],
-                settings.c.version == request["settings_version"],
-            )
-            .values(last_test_at=now, last_test_ok=True)
-        ).rowcount
+        updated = _record_test(connection, request, now, ok=True)
         return "applied" if updated else "discarded_stale"
 
 
-def record_test_failure(connection: Connection, request: Any, now: datetime) -> None:
+def _record_test(
+    connection: Connection,
+    request: Any,
+    now: datetime,
+    *,
+    ok: bool,
+    error_code: str | None = None,
+) -> int:
+    """Store a test result for the settings version it ran under.
+
+    A plain test keeps its legacy result for Gemini on ``ai_setting``. Every provider's
+    card takes the result through ``connection_state`` (Connected / Error, health, and the
+    test-then-swap of a key rotation), so a stale result changes nothing.
+    """
+
+    legacy = 0
+    if request["provider"] != "vllm" and connection_state.request_kind(request) == "test":
+        settings = metadata.tables["ai_setting"]
+        legacy = int(
+            connection.execute(
+                sa.update(settings)
+                .where(
+                    settings.c.workspace_id == request["workspace_id"],
+                    settings.c.version == request["settings_version"],
+                )
+                .values(last_test_at=now, last_test_ok=ok)
+            ).rowcount
+        )
+    card = connection_state.record_result(connection, request, now, ok=ok, error_code=error_code)
+    return legacy or card
+
+
+def record_test_failure(
+    connection: Connection, request: Any, now: datetime, error_code: str | None = None
+) -> None:
     if request["call_kind"] != "provider_test":
         return
-    settings = metadata.tables["ai_setting"]
-    connection.execute(
-        sa.update(settings)
-        .where(
-            settings.c.workspace_id == request["workspace_id"],
-            settings.c.version == request["settings_version"],
-        )
-        .values(last_test_at=now, last_test_ok=False)
-    )
+    _record_test(connection, request, now, ok=False, error_code=error_code)
 
 
-def default_handlers(*, vision_reader: str | None = None) -> dict[str, Handler]:
+def default_handlers(
+    *,
+    vision_reader: str | None = None,
+    consensus_enqueue: Any | None = None,
+) -> dict[str, Handler]:
     # Hook modules import ``Prepared`` and ``Skip`` from here.
     from reconbench_app.ai.worker.hooks.h1 import ExtractionSuggestionHandler
     from reconbench_app.ai.worker.hooks.h2 import ItemOpinionHandler
@@ -147,7 +175,9 @@ def default_handlers(*, vision_reader: str | None = None) -> dict[str, Handler]:
         ItemOpinionHandler(),
         PoRerankHandler(),
         VendorOpinionHandler(),
-        VisionReadHandler(vision_reader) if vision_reader else VisionReadHandler(),
+        VisionReadHandler(vision_reader, consensus_enqueue=consensus_enqueue)
+        if vision_reader
+        else VisionReadHandler(consensus_enqueue=consensus_enqueue),
     ]
     return {handler.kind: handler for handler in handlers}
 

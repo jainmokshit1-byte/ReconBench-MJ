@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 # "responded": the provider answered (the call finished, possibly billed).
 # "not_sent": provably never reached the provider. "may_have_been_sent": unknown.
 Delivery = Literal["responded", "not_sent", "may_have_been_sent"]
+ThinkingLevel = Literal["minimal", "low", "medium", "high"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,15 +38,25 @@ class ProviderRequest:
     response_schema: Mapping[str, Any]
     max_output_tokens: int
     timeout_ms: int
-    thinking_level: Literal["low"] = "low"
+    # ``None`` leaves thinking to the provider's own default.
+    thinking_level: ThinkingLevel | None = "low"
     # Page images (h6_vision); text-only hooks send none and keep their exact shape.
     images: tuple[ProviderImage, ...] = ()
+    # Provider-specific settings (sampling, chat-template kwargs); a provider ignores
+    # keys it does not know. Gemini reads none today.
+    options: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderResult:
     output_text: str
     usage: ProviderUsage | None
+    latency_ms: int | None = None
+    finish_reason: str | None = None
+    model_reported: str | None = None
+    """The model id the provider says answered (may differ from the requested alias)."""
+    reasoning_present: bool = False
+    """The answer carried a separate reasoning/thinking part."""
 
 
 class ProviderFailure(RuntimeError):
@@ -58,11 +69,14 @@ class ProviderFailure(RuntimeError):
         delivery: Delivery,
         cooldown_seconds: int | None = None,
         usage: ProviderUsage | None = None,
+        detail: str | None = None,
     ) -> None:
         self.code = code
         self.delivery = delivery
         self.cooldown_seconds = cooldown_seconds
         self.usage = usage
+        # A short sanitized diagnostic (no key, digit runs masked); never shown to users.
+        self.detail = detail
         super().__init__(f"provider call failed: {code} ({delivery})")
 
 
@@ -80,4 +94,5 @@ __all__ = [
     "ProviderRequest",
     "ProviderResult",
     "ProviderUsage",
+    "ThinkingLevel",
 ]

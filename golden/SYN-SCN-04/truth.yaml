@@ -1,0 +1,49 @@
+# Synthetic golden case mirroring fixtures/SCN-04: a second invoice exceeds the
+# cumulative PO cap (ordered 100, billed 90 + 15, accepted 60 + 45).
+# All values are made up; no real document was used.
+synthetic: true
+source_fixture: fixtures/SCN-04
+expected_status: Exception
+expected_link: SYN-PO-1004
+expected_reason_codes: [QTY_OVER_PO, QTY_OVER_GRN]
+run_date: "2026-03-02"
+invoice_key: invoice-b
+documents:
+  - key: po
+    doc_type: po
+    xml: >-
+      <PurchaseOrder><OrderNo>SYN-PO-1004</OrderNo><OrderDate>20260105</OrderDate>
+      <Status>open</Status><Supplier>Synthetic Supplies</Supplier><TaxableTotal>50000</TaxableTotal>
+      <Line><Description>Synthetic widget B</Description><Qty>100</Qty><Rate>500</Rate>
+      <Amount>50000</Amount></Line></PurchaseOrder>
+  - key: grn-1
+    doc_type: grn
+    xml: >-
+      <GRN><GRNNo>SYN-GRN-1004A</GRNNo><GRNDate>20260110</GRNDate><Supplier>Synthetic Supplies</Supplier>
+      <PORef>SYN-PO-1004</PORef><Line><Description>Synthetic widget B</Description>
+      <AcceptedQty>60</AcceptedQty><ReceivedQty>60</ReceivedQty><RejectedQty>0</RejectedQty></Line></GRN>
+  - key: grn-2
+    doc_type: grn
+    xml: >-
+      <GRN><GRNNo>SYN-GRN-1004B</GRNNo><GRNDate>20260210</GRNDate><Supplier>Synthetic Supplies</Supplier>
+      <PORef>SYN-PO-1004</PORef><Line><Description>Synthetic widget B</Description>
+      <AcceptedQty>45</AcceptedQty><ReceivedQty>45</ReceivedQty><RejectedQty>0</RejectedQty></Line></GRN>
+  - key: invoice-a
+    doc_type: invoice
+    xml: >-
+      <Invoice><InvoiceNo>SYN-INV-1004A</InvoiceNo><InvoiceDate>20260201</InvoiceDate>
+      <Supplier>Synthetic Supplies</Supplier><TaxableTotal>45000</TaxableTotal><IGST>8100</IGST>
+      <InvoiceTotal>53100</InvoiceTotal><Line><Description>Synthetic widget B</Description>
+      <Qty>90</Qty><Rate>500</Rate><Amount>45000</Amount></Line></Invoice>
+  - key: invoice-b
+    doc_type: invoice
+    xml: >-
+      <Invoice><InvoiceNo>SYN-INV-1004B</InvoiceNo><InvoiceDate>20260301</InvoiceDate>
+      <Supplier>Synthetic Supplies</Supplier><TaxableTotal>7500</TaxableTotal><IGST>1350</IGST>
+      <InvoiceTotal>8850</InvoiceTotal><Line><Description>Synthetic widget B</Description>
+      <Qty>15</Qty><Rate>500</Rate><Amount>7500</Amount></Line></Invoice>
+links:
+  - {from: grn-1, to: po}
+  - {from: grn-2, to: po}
+  - {from: invoice-a, to: po}
+  - {from: invoice-b, to: po}

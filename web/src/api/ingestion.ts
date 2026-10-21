@@ -310,7 +310,7 @@ export async function createManualInvoice(
   return value;
 }
 
-export async function correctInvoiceDocument(
+export async function correctDocument(
   documentId: string,
   version: number,
   correction: Record<string, unknown>,
@@ -325,9 +325,12 @@ export async function correctInvoiceDocument(
     body: JSON.stringify(correction),
   });
   const value: unknown = await json(response);
-  if (!isRecord(value)) throw new Error("The server returned invalid corrected invoice details.");
+  if (!isRecord(value)) throw new Error("The server returned invalid corrected document details.");
   return value;
 }
+
+/** Backwards-compatible name retained for invoice-only call sites. */
+export const correctInvoiceDocument = correctDocument;
 
 export async function getBatchSummary(batchId: string): Promise<Record<string, unknown>> {
   const value: unknown = await json(await request(`/batches/${encodeURIComponent(batchId)}/summary`, null));

@@ -33,7 +33,7 @@ from reconbench_app.ai.contracts import (
 from reconbench_app.ai.fixtures import PROVIDER_TEST, SYNTHETIC_FIXTURE_DIGESTS, plain_schema
 from reconbench_app.ai.gate import payload_digest
 from reconbench_app.ai.limits import AiLimits, estimate_reservation
-from reconbench_app.ai.prompts import PROMPT_VERSIONS, vision_prompt
+from reconbench_app.ai.prompts import PROMPT_VERSIONS, prompt_version, vision_prompt
 from reconbench_app.ai.provider import ProviderImage, ProviderRequest
 from reconbench_app.ai.redaction import WordBox, image_mask_regions
 from reconbench_app.ai.vision import (
@@ -160,8 +160,9 @@ def test_vision_schema_avoids_keywords_gemini_rejects() -> None:
     keys = {key for node in _walk(schema) for key in node}
     assert not keys & {"maxItems", "minItems", "$ref", "$defs", "anyOf", "oneOf"}
     assert json.loads(json.dumps(schema)) == schema
-    assert SCHEMA_VERSIONS["h6_vision"] == "vision.schema.v3"
-    assert PROMPT_VERSIONS["h6_vision"] == "vision.prompt.v3"
+    assert SCHEMA_VERSIONS["h6_vision"] == "vision.schema.v4"
+    assert prompt_version("h6_vision") == "vision.prompt.v4.gemini"
+    assert "h6_vision" not in PROMPT_VERSIONS  # one version per reader (WI-BE4)
     line = schema["properties"]["lines"]["items"]
     assert line["required"] == ["page", "box_2d", "description", "quantity", "amount"]
     names = list(line["properties"])
@@ -176,9 +177,12 @@ def test_recorded_answer_parses_strictly_and_extra_keys_are_rejected() -> None:
     tampered = {**answer, "status": "approved"}
     with pytest.raises(InvalidOutput):
         parse_output("h6_vision", json.dumps(tampered))
-    answer["fields"][0]["box_2d"] = list(range(17))  # far beyond a box: still rejected
-    with pytest.raises(InvalidOutput):
-        parse_output("h6_vision", json.dumps(answer))
+    # Far beyond a box: that field is dropped and counted, never used (D73).
+    answer["fields"][0]["box_2d"] = list(range(17))
+    parsed = parse_output("h6_vision", json.dumps(answer))
+    assert isinstance(parsed, VisionOutput)
+    assert parsed.schema_dropped == {"schema:fields.*.box_2d: too_long": 1}
+    assert len(parsed.fields) == len(recorded_response()["fields"]) - 1
 
 
 def test_a_malformed_box_drops_only_its_item(invoice_pdf: bytes) -> None:
@@ -192,16 +196,21 @@ def test_a_malformed_box_drops_only_its_item(invoice_pdf: bytes) -> None:
     assert len(validation.document.lines) == 1
 
 
-def test_a_line_row_without_a_description_key_rejects_the_answer() -> None:
+def _lines_dropped(answer: dict[str, Any]) -> tuple[int, dict[str, int]]:
+    parsed = parse_output("h6_vision", json.dumps(answer))
+    assert isinstance(parsed, VisionOutput)
+    return len(parsed.lines), dict(parsed.schema_dropped)
+
+
+def test_a_line_row_without_a_description_key_is_dropped_on_its_own() -> None:
     answer = recorded_response()
+    rows = len(answer["lines"])
     del answer["lines"][0]["description"]
-    with pytest.raises(InvalidOutput):
-        parse_output("h6_vision", json.dumps(answer))
+    assert _lines_dropped(answer) == (rows - 1, {"schema:lines.*.description: missing": 1})
     answer["lines"][0]["description"] = ""  # printed row without a description: allowed
-    assert isinstance(parse_output("h6_vision", json.dumps(answer)), VisionOutput)
+    assert _lines_dropped(answer) == (rows, {})
     del answer["lines"][0]["amount"]  # amount is a required key since v3
-    with pytest.raises(InvalidOutput):
-        parse_output("h6_vision", json.dumps(answer))
+    assert _lines_dropped(answer) == (rows - 1, {"schema:lines.*.amount: missing": 1})
     answer["lines"][0]["amount"] = ""
     answer["lines"][0]["uom"] = "x" * 120  # a long unit no longer rejects the answer
     assert isinstance(parse_output("h6_vision", json.dumps(answer)), VisionOutput)
@@ -271,7 +280,11 @@ def test_vision_schema_v2_needs_fresh_consent_only_with_vision_on(
         consent, "SCHEMA_VERSIONS", {**SCHEMA_VERSIONS, "h6_vision": "vision.schema.v1"}
     )
     monkeypatch.setattr(
-        consent, "PROMPT_VERSIONS", {**PROMPT_VERSIONS, "h6_vision": "vision.prompt.v1"}
+        consent,
+        "prompt_version",
+        lambda hook, *, reader: (
+            "vision.prompt.v1" if hook == "h6_vision" else PROMPT_VERSIONS[hook]
+        ),
     )
     after = {
         vision: consent_fingerprint(provider="gemini", model=MODEL, mode="ai_first", vision=vision)

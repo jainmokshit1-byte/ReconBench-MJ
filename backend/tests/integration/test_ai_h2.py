@@ -174,6 +174,22 @@ def _document(
             needs_verification=False,
         )
     )
+    if refs:
+        connection.execute(
+            sa.insert(metadata.tables["field_evidence"]).values(
+                id=new_id(),
+                workspace_id=world.workspace_id,
+                document_version_id=version_id,
+                field_name="po_refs",
+                value_text=json.dumps(refs),
+                confidence=None,
+                source="manual",
+                origin="manual",
+                verification="user",
+                verified_by=str(world.user_id),
+                verified_at=datetime.now(UTC),
+            )
+        )
     for line_no, description in enumerate(descriptions, start=1):
         connection.execute(
             sa.insert(metadata.tables["doc_line"]).values(
@@ -399,7 +415,7 @@ def _runner(engine: Engine, keyring: Keyring, provider: ScriptedProvider) -> AiR
         gate=DeploymentGate.from_values("enabled", APPROVAL),
         limits=lambda: LimitsState(AiLimits()),
         prices=lambda: None,
-        provider=provider,
+        providers={provider.name: provider},
         handlers=default_handlers(),
     )
 

@@ -20,11 +20,20 @@ from reconbench_app.ai import h1, h2, h3, h4, ledger, vision
 from reconbench_app.ai.contracts import SCHEMA_VERSIONS
 from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.limits import AiLimits, LimitsState
-from reconbench_app.ai.prompts import PROMPT_VERSIONS
+from reconbench_app.ai.prompts import prompt_version
 from reconbench_app.ai.redaction import IMAGE_MASK_VERSION, REDACTION_VERSION
-from reconbench_app.ai.runtime_checks import SettingsSnapshot, load_key, load_settings
+from reconbench_app.ai.runtime_checks import (
+    SettingsSnapshot,
+    load_provider_key,
+    load_settings,
+)
 from reconbench_app.db.ids import new_id
-from reconbench_app.extraction.vision import DEFAULT_VISION_READER, vision_reader
+from reconbench_app.extraction.vision import (
+    DEFAULT_VISION_READER,
+    VisionReaderInfo,
+    reader_for_provider,
+    vision_reader,
+)
 
 if TYPE_CHECKING:
     from reconbench_app.mapping_service import MappingSnapshot
@@ -52,15 +61,29 @@ class AiHookEnqueuer:
         self.queue = queue
         self.limits = limits
         self.clock = clock
+        self.vision_reader_name = vision_reader_name
         self.vision_reader = vision_reader(vision_reader_name)
+
+    def _reader(self, settings: SettingsSnapshot) -> VisionReaderInfo | None:
+        """The reader of the workspace's one vision provider (Gemini or the vLLM server)."""
+
+        return reader_for_provider(self.vision_reader_name, settings.vision_provider)
+
+    def _prompt_version(self, hook: str, settings: SettingsSnapshot) -> str:
+        reader = self._reader(settings) if hook == vision.HOOK else None
+        if reader is not None:
+            return prompt_version(hook, reader=reader.name)
+        return prompt_version(hook)
+
+    def _reader_params(self, hook: str, settings: SettingsSnapshot) -> dict[str, object]:
+        reader = self._reader(settings) if hook == vision.HOOK else None
+        return {} if reader is None else vision.reader_params(reader)
 
     def ready(
         self, connection: Connection, workspace_id: UUID, hook: str
     ) -> tuple[SettingsSnapshot, AiLimits] | None:
         """Settings and limits when ``hook`` may run for business data now, else ``None``."""
 
-        if self.gate.mode != "enabled":
-            return None
         limits = self.limits().limits
         if limits is None:
             return None
@@ -70,14 +93,32 @@ class AiHookEnqueuer:
             or settings.provider is None
             or settings.model is None
             or not settings.consent_current
-            or not any(name.split(":", 1)[0] == hook for name in settings.hooks)
         ):
             return None
-        if hook == vision.HOOK and (
-            self.vision_reader is None or self.vision_reader.provider != settings.provider
+        # A shadow reader reads the documents H1 is consented for (H1 keeps running, D65).
+        wanted = h1.HOOK if hook == vision.HOOK and settings.strategy == "shadow" else hook
+        if not any(name.split(":", 1)[0] == wanted for name in settings.hooks):
+            return None
+        provider, model = settings.target(hook)
+        if provider is None or model is None:
+            return None
+        if hook == vision.HOOK:
+            reader = self._reader(settings)
+            if (
+                settings.strategy not in {"single", "shadow"}
+                or reader is None
+                or reader.provider != provider
+            ):
+                return None
+        # Business data may leave only when the gate of the provider it goes to allows it.
+        gate_mode = self.gate.vllm_mode if provider == "vllm" else self.gate.mode
+        if gate_mode != "enabled":
+            return None
+        if provider == "vllm" and not self.gate.endpoint_allowed(
+            settings.vllm.base_url if settings.vllm else None
         ):
             return None
-        if isinstance(load_key(connection, settings, self.clock()), str):
+        if isinstance(load_provider_key(connection, settings, provider, self.clock()), str):
             return None
         return settings, limits
 
@@ -94,7 +135,8 @@ class AiHookEnqueuer:
         run_id: UUID | None = None,
         requested_by: UUID | None = None,
     ) -> UUID | None:
-        assert settings.provider is not None and settings.model is not None
+        provider, model = settings.target(hook)
+        assert provider is not None and model is not None
         request_id = ledger.create_request(
             connection,
             ledger.NewRequest(
@@ -108,13 +150,15 @@ class AiHookEnqueuer:
                 operation_key=operation_key,
                 settings_version=settings.version,
                 consent_fingerprint=settings.consent_fingerprint,
-                provider=settings.provider,
-                model=settings.model,
-                prompt_version=PROMPT_VERSIONS[hook],
+                provider=provider,
+                model=model,
+                prompt_version=self._prompt_version(hook, settings),
                 schema_version=SCHEMA_VERSIONS[hook],
                 redaction_version=IMAGE_MASK_VERSION if hook == vision.HOOK else REDACTION_VERSION,
                 run_id=run_id,
                 requested_by=requested_by,
+                reader_params=self._reader_params(hook, settings),
+                shadow=hook == vision.HOOK and settings.strategy == "shadow",
             ),
         )
         if request_id is None:
@@ -240,7 +284,8 @@ class AiHookEnqueuer:
                 subject_version=subject_version,
                 operation_key=f"{vision.HOOK}:{version_id}",
             )
-        assert settings.provider is not None and settings.model is not None
+        provider, model = settings.vision_target
+        assert provider is not None and model is not None
         request_id = ledger.create_request(
             connection,
             ledger.NewRequest(
@@ -254,11 +299,13 @@ class AiHookEnqueuer:
                 operation_key=f"{vision.HOOK}:{version_id}",
                 settings_version=settings.version,
                 consent_fingerprint=settings.consent_fingerprint,
-                provider=settings.provider,
-                model=settings.model,
-                prompt_version=PROMPT_VERSIONS[vision.HOOK],
+                provider=provider,
+                model=model,
+                prompt_version=self._prompt_version(vision.HOOK, settings),
                 schema_version=SCHEMA_VERSIONS[vision.HOOK],
                 redaction_version=IMAGE_MASK_VERSION,
+                reader_params=self._reader_params(vision.HOOK, settings),
+                shadow=settings.strategy == "shadow",
             ),
         )
         if request_id is not None:

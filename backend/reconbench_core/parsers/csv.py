@@ -21,7 +21,7 @@ from reconbench_core.parsers.common import (
 )
 from reconbench_core.parsers.parties import guard_result
 from reconbench_core.parsers.types import ParseResult, ParserHints, ParseWarning
-from reconbench_core.schema import DocType, Document, FieldSource, FileFormat
+from reconbench_core.schema import DocType, Document, FieldOrigin, FieldSource, FileFormat
 
 _HEADER_FIELDS = {
     "doc_no",
@@ -391,6 +391,7 @@ def _parse_csv(content: bytes, hints: ParserHints) -> ParseResult:
                 line_alternatives=line_alternatives,
                 locator=locator,
                 source=FieldSource.RULE,
+                origin=FieldOrigin.ERP_IMPORT,
                 base_confidence=Decimal("0.90"),
                 same_file_dates=all_dates,
                 uom_aliases=hints.uom_aliases,

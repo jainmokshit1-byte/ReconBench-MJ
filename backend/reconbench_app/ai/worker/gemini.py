@@ -62,6 +62,15 @@ def _input(request: ProviderRequest) -> Any:
     return parts
 
 
+def _generation_config(request: ProviderRequest) -> dict[str, Any]:
+    """``request.options`` is not read: Gemini traffic stays as recorded (WI-BE1 golden)."""
+
+    config: dict[str, Any] = {"max_output_tokens": request.max_output_tokens}
+    if request.thinking_level is not None:
+        config["thinking_level"] = request.thinking_level
+    return config
+
+
 class GeminiProvider:
     name = "gemini"
 
@@ -82,10 +91,7 @@ class GeminiProvider:
                         "mime_type": "application/json",
                         "schema": dict(request.response_schema),
                     },
-                    generation_config={
-                        "max_output_tokens": request.max_output_tokens,
-                        "thinking_level": request.thinking_level,
-                    },
+                    generation_config=_generation_config(request),
                     store=False,
                 )
             except ProviderAttemptFinished as exc:
@@ -112,7 +118,12 @@ class GeminiProvider:
         output_text = getattr(interaction, "output_text", None)
         if not isinstance(output_text, str) or not output_text.strip():
             raise ProviderFailure("invalid_output", delivery="responded", usage=usage)
-        return ProviderResult(output_text=output_text, usage=usage)
+        model = getattr(interaction, "model", None)
+        return ProviderResult(
+            output_text=output_text,
+            usage=usage,
+            model_reported=model if isinstance(model, str) else None,
+        )
 
 
 __all__ = ["GeminiProvider"]

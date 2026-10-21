@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -92,6 +92,22 @@ class FieldSource(StrEnum):
     RULE = "rule"
     AI = "ai"
     MANUAL = "manual"
+
+
+class FieldOrigin(StrEnum):
+    """How a field value entered the document model, independent of verification."""
+
+    OCR = "ocr"
+    MANUAL = "manual"
+    ERP_IMPORT = "erp_import"
+
+
+class FieldVerification(StrEnum):
+    """Whether a person or a complete deterministic system check verified a value."""
+
+    NONE = "none"
+    USER = "user"
+    SYSTEM_CHECK = "system_check"
 
 
 class ExtractionMethod(StrEnum):
@@ -408,9 +424,13 @@ class FieldValue[ValueT](FrozenModel):
     """A canonical value together with confidence, provenance, and source evidence."""
 
     value: ValueT
-    confidence: Probability
+    confidence: Probability | None = None
     source: FieldSource
     evidence: FieldEvidence
+    origin: FieldOrigin | None = None
+    verification: FieldVerification = FieldVerification.NONE
+    verified_by: str | None = None
+    verified_at: datetime | None = None
 
 
 class DocumentHeader(FrozenModel):
@@ -511,11 +531,12 @@ class Document(FrozenModel):
         for field in (self.header.doc_no, self.header.doc_date, self.header.grand_total):
             if field is None:
                 return Decimal("0")
-            confidences.append(field.confidence)
+            if field.confidence is not None:
+                confidences.append(field.confidence)
         vendor_confidences = [
             field.confidence
             for field in (self.header.vendor_name, self.header.vendor_gstin)
-            if field is not None
+            if field is not None and field.confidence is not None
         ]
         if not vendor_confidences:
             return Decimal("0")
@@ -527,12 +548,12 @@ class Document(FrozenModel):
                 line.quantity,
                 line.rate if line.rate is not None else line.amount,
             )
-            if field is not None
+            if field is not None and field.confidence is not None
         ]
         if not line_confidences:
             return Decimal("0")
         confidences.extend(line_confidences)
-        return min(confidences)
+        return min(confidences) if confidences else Decimal("0")
 
 
 class ManifestDocument(FrozenModel):

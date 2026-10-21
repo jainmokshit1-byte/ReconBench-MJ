@@ -13,7 +13,13 @@ from typing import Any
 from reconbench_core.extraction.pages import PageType, text_page_types
 from reconbench_core.extraction.qr import apply_einvoice, parse_einvoice_qr
 from reconbench_core.parsers.pdf import parse_pdf
-from reconbench_core.parsers.types import PageSplit, ParseResult, ParserHints, ParseWarning
+from reconbench_core.parsers.types import (
+    PageImageHash,
+    PageSplit,
+    ParseResult,
+    ParserHints,
+    ParseWarning,
+)
 from reconbench_core.schema import DocType, FileFormat
 
 PDF_CPU_SECONDS = 8
@@ -32,6 +38,8 @@ PDF_LAYOUT_MAX_PAGES = 20
 # Rendering and decoding the first pages for an e-invoice QR (about 0.5 s a page).
 PDF_QR_CPU_SECONDS = 30
 PDF_QR_WALL_SECONDS = 45
+PDF_IDENTITY_CPU_SECONDS = 60
+PDF_IDENTITY_WALL_SECONDS = 90
 _MAX_OCR_OUTPUT_BYTES = 100 * 1024 * 1024
 
 
@@ -170,6 +178,43 @@ def _child_main(
         connection.close()
 
 
+def _page_image_hashes_child_main(
+    connection: Any,
+    start_event: Any,
+    content: bytes,
+    pages: tuple[int, ...],
+    cpu_seconds: int,
+    memory_bytes: int,
+) -> None:
+    """Render page pixels in the sandbox; send perceptual hashes, never images."""
+
+    try:
+        if not start_event.wait(timeout=10):
+            connection.send({"child_error": True})
+            return
+        _set_posix_limits(cpu_seconds, memory_bytes)
+        import pypdfium2  # type: ignore[import-untyped]
+        from reconbench_core.parsers.types import PageImageHash
+
+        from reconbench_app.document_identity import difference_hash
+
+        document = pypdfium2.PdfDocument(content)
+        try:
+            hashes = []
+            for number in pages:
+                if not 1 <= number <= len(document):
+                    raise ValueError("page out of range")
+                image = document[number - 1].render(scale=1.0).to_pil()
+                hashes.append(PageImageHash(page=number, value=difference_hash(image)))
+        finally:
+            document.close()
+        connection.send({"page_image_hashes": [item.model_dump(mode="json") for item in hashes]})
+    except BaseException:
+        connection.send({"child_error": True})
+    finally:
+        connection.close()
+
+
 def _result_payload(result: ParseResult) -> dict[str, Any]:
     return {
         "success": result.success,
@@ -182,7 +227,31 @@ def _result_payload(result: ParseResult) -> dict[str, Any]:
         "layout_signature": result.layout_signature,
         "reason_code": result.reason_code,
         "page_texts": [page.model_dump(mode="json") for page in result.page_texts],
+        "page_image_hashes": [
+            page_hash.model_dump(mode="json") for page_hash in result.page_image_hashes
+        ],
     }
+
+
+def _page_hashes_from_payload(payload: dict[str, Any]) -> tuple[PageImageHash, ...]:
+    return tuple(PageImageHash.model_validate(item) for item in payload["page_image_hashes"])
+
+
+def page_image_hashes_isolated(
+    content: bytes, pages: tuple[int, ...], *, memory_bytes: int = PDF_MEMORY_BYTES
+) -> tuple[PageImageHash, ...] | None:
+    """Return stable 64-bit page hashes from the bounded PDF renderer."""
+
+    result: tuple[PageImageHash, ...] | None = _run_child(
+        _page_image_hashes_child_main,
+        (content, pages, PDF_IDENTITY_CPU_SECONDS, memory_bytes),
+        name="reconbench-pdf-identity-hashes",
+        cpu_seconds=PDF_IDENTITY_CPU_SECONDS,
+        memory_bytes=memory_bytes,
+        wall_seconds=PDF_IDENTITY_WALL_SECONDS,
+        convert=_page_hashes_from_payload,
+    )
+    return result
 
 
 def _page_ranges(pages: tuple[int, ...]) -> str:
@@ -622,17 +691,25 @@ def parse_pdf_isolated(
         memory_bytes=memory_bytes,
         wall_seconds=wall_seconds,
     )
-    if not result.success or hints.doc_type is not DocType.INVOICE:
-        return result
-    texts = _run_qr_isolated(content, memory_bytes=memory_bytes)
-    if not texts:
-        return result
-    codes = [
-        code
-        for page, text in texts
-        if (code := parse_einvoice_qr(text, page=page, public_keys=einvoice_keys)) is not None
-    ]
-    return apply_einvoice(result, codes, hints)
+    if result.success and hints.doc_type is DocType.INVOICE:
+        texts = _run_qr_isolated(content, memory_bytes=memory_bytes)
+        if texts:
+            codes = [
+                code
+                for page, text in texts
+                if (code := parse_einvoice_qr(text, page=page, public_keys=einvoice_keys))
+                is not None
+            ]
+            result = apply_einvoice(result, codes, hints)
+    if result.success and result.page_texts:
+        page_hashes = page_image_hashes_isolated(
+            content,
+            tuple(page.page for page in result.page_texts),
+            memory_bytes=memory_bytes,
+        )
+        if page_hashes is not None and len(page_hashes) == len(result.page_texts):
+            result = result.model_copy(update={"page_image_hashes": page_hashes})
+    return result
 
 
 def _extract_isolated(
@@ -788,5 +865,8 @@ __all__ = [
     "PDF_WALL_SECONDS",
     "PDF_OCR_CPU_SECONDS",
     "PDF_OCR_WALL_SECONDS",
+    "PDF_IDENTITY_CPU_SECONDS",
+    "PDF_IDENTITY_WALL_SECONDS",
+    "page_image_hashes_isolated",
     "parse_pdf_isolated",
 ]

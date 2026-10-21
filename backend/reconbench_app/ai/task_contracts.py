@@ -16,6 +16,8 @@ from procrastinate import App
 AI_QUEUE = "ai"
 RUN_AI_REQUEST = "reconbench.ai.run_request"
 AI_TASK_NAMES = (RUN_AI_REQUEST,)
+CONSENSUS_QUEUE = "parse"
+RUN_CONSENSUS = "reconbench.process_consensus"
 
 
 class AiTaskNotExecutableHere(RuntimeError):
@@ -42,11 +44,25 @@ def register_ai_task_declarations(app: App) -> dict[str, Any]:
     return {RUN_AI_REQUEST: run_request}
 
 
+def register_consensus_task_declaration(app: App) -> Any:
+    """Declare the parse-queue follow-up in the AI worker for atomic deferral."""
+
+    @app.task(name=RUN_CONSENSUS, queue=CONSENSUS_QUEUE)
+    def process_consensus(workspace_id: str, consensus_run_id: str) -> None:
+        del workspace_id, consensus_run_id
+        raise AiTaskNotExecutableHere(RUN_CONSENSUS)
+
+    return process_consensus
+
+
 __all__ = [
     "AI_QUEUE",
     "AI_TASK_NAMES",
+    "CONSENSUS_QUEUE",
     "RUN_AI_REQUEST",
+    "RUN_CONSENSUS",
     "AiTaskNotExecutableHere",
     "register_ai_task_declarations",
+    "register_consensus_task_declaration",
     "run_request_kwargs",
 ]

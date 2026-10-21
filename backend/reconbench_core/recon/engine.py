@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import re
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
 from uuid import UUID
-
-from rapidfuzz.distance import Levenshtein
 
 from reconbench_core.align import AlignmentResult, align_lines
 from reconbench_core.extraction.pages import split_unconfirmed
@@ -62,6 +60,9 @@ _ZERO = Decimal("0")
 _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
 _ACTIVE_LINK_STATES = {LinkState.AUTO, LinkState.CONFIRMED, LinkState.SUGGESTED}
+_DUPLICATE_NUMBER_LOOKALIKE_FOLD = str.maketrans(
+    {"O": "0", "I": "1", "L": "1", "|": "1", "S": "5", "B": "8", "Z": "2"}
+)
 
 
 @dataclass
@@ -137,6 +138,18 @@ def _taxable(document: Document) -> Decimal | None:
 
 def _grand_total(document: Document) -> Decimal | None:
     return _decimal(_value(document.header.grand_total))
+
+
+def _duplicate_number_key(value: str) -> str:
+    folded = value.upper().translate(_DUPLICATE_NUMBER_LOOKALIKE_FOLD)
+    return canonicalize_document_number(folded)
+
+
+def _line_amounts_fingerprint(document: Document) -> tuple[Decimal, ...] | None:
+    amounts = [_line_amount(line) for line in document.lines]
+    if not amounts or any(amount is None for amount in amounts):
+        return None
+    return tuple(sorted(amount for amount in amounts if amount is not None))
 
 
 def _unique_codes(codes: list[ReasonCode]) -> tuple[ReasonCode, ...]:
@@ -317,31 +330,39 @@ def _duplicate_map(
             else:
                 seen_irn[irn.strip().upper()] = invoice.document_id
 
-    candidate_history: dict[tuple[UUID, Decimal], deque[tuple[date, str, UUID]]] = defaultdict(
-        deque
-    )
+    candidate_history: deque[tuple[date, Decimal, str, tuple[Decimal, ...] | None, UUID]] = deque()
     for invoice in ordered:
-        invoice_date = _doc_date(invoice.document)
-        invoice_total = _taxable(invoice.document)
-        invoice_no = canonicalize_document_number(_doc_no(invoice.document))
-        vendor_id = invoice.vendor_id
-        if vendor_id is None or invoice_date is None or invoice_total is None or not invoice_no:
+        if not isinstance(invoice.document.header, InvoiceHeader):
             continue
-        history = candidate_history[(vendor_id, invoice_total)]
+        invoice_date = _doc_date(invoice.document)
+        invoice_total = _grand_total(invoice.document)
+        if invoice_date is None or invoice_total is None:
+            continue
+
         cutoff = invoice_date - timedelta(days=config.duplicate_suspect_days)
-        while history and history[0][0] < cutoff:
-            history.popleft()
+        while candidate_history and candidate_history[0][0] < cutoff:
+            candidate_history.popleft()
+
+        invoice_no = _duplicate_number_key(_doc_no(invoice.document))
+        line_amounts = _line_amounts_fingerprint(invoice.document)
         if invoice.document_id not in exact:
-            for _prior_date, prior_no, prior_id in history:
-                if (
-                    Levenshtein.distance(invoice_no, prior_no)
-                    <= config.duplicate_suspect_edit_distance
-                ):
+            for _prior_date, prior_total, prior_no, prior_amounts, prior_id in candidate_history:
+                if abs(invoice_total - prior_total) > Decimal("1"):
+                    continue
+                same_number = bool(invoice_no and prior_no and invoice_no == prior_no)
+                same_amounts = (
+                    line_amounts is not None
+                    and prior_amounts is not None
+                    and line_amounts == prior_amounts
+                )
+                if same_number or same_amounts:
                     suspected[invoice.document_id] = prior_id
                     break
         # Exact duplicates remain eligible as prior candidates, matching the
         # original ordered-prefix rule for later invoices.
-        history.append((invoice_date, invoice_no, invoice.document_id))
+        candidate_history.append(
+            (invoice_date, invoice_total, invoice_no, line_amounts, invoice.document_id)
+        )
     return exact, suspected
 
 
@@ -1749,7 +1770,7 @@ def evaluate(
             if invoice_date is not None:
                 pending_days = max(0, (run_date - invoice_date).days)
                 aged = pending_days >= config.pending_ageing_days
-                if aged and status is CaseStatus.PENDING:
+                if aged and status is not CaseStatus.EXCEPTION:
                     status = CaseStatus.EXCEPTION
         invoice_finance = finance[invoice.document_id]
         variance = (
@@ -1765,6 +1786,7 @@ def evaluate(
         all_checks = tuple(
             (*header_checks, *(check for line in line_results for check in line.checks))
         )
+        blocked = status in {CaseStatus.DUPLICATE, CaseStatus.UNLINKED}
         result_by_invoice.append(
             CaseResult(
                 engine_version=engine_version,
@@ -1781,11 +1803,11 @@ def evaluate(
                 variance=variance,
                 variance_pct=variance_pct,
                 payable_taxable=invoice_finance.payable,
-                at_risk=invoice_finance.at_risk,
-                at_risk_gst=invoice_finance.at_risk_gst,
-                blocked_value=(invoice_taxable or _ZERO)
-                if status in {CaseStatus.DUPLICATE, CaseStatus.UNLINKED}
-                else _ZERO,
+                # A blocked invoice (duplicate or unlinked) carries its value as blocked,
+                # never as at risk (schema check recon_case_atrisk_ck; D95).
+                at_risk=_ZERO if blocked else invoice_finance.at_risk,
+                at_risk_gst=_ZERO if blocked else invoice_finance.at_risk_gst,
+                blocked_value=(invoice_taxable or _ZERO) if blocked else _ZERO,
                 po_nos=tuple(sorted({_doc_no(documents[item].document) for item in po_ids})),
                 grn_nos=tuple(sorted({_doc_no(documents[item].document) for item in grn_ids})),
                 payment_due_date=invoice_finance.payment_due_date,

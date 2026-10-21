@@ -26,7 +26,7 @@ from reconbench_core.extraction.values import find_dates, gstins_in
 from reconbench_core.normalize.gstin import validate_gstin
 from reconbench_core.normalize.text import normalize_vendor_name
 from reconbench_core.parsers.types import BuyerEntityHint, ParseResult, ParserHints, ParseWarning
-from reconbench_core.schema import Document, DocumentHeader, FieldValue, ReasonCode
+from reconbench_core.schema import Document, DocumentHeader, FieldValue, ReasonCode, WarnLevel
 
 # Words that make up party labels, never a party's name on their own.
 _LABEL_WORDS = frozenset(
@@ -290,6 +290,88 @@ def guard_document(document: Document, hints: ParserHints) -> tuple[Document, li
     )
 
 
+def withhold_vendor_name(document: Document, *, locator: str) -> tuple[Document, ParseWarning]:
+    """Leave out a vendor name the reader cannot attribute to the seller; list it for review.
+
+    Scan fix WI-3: without configured buyer entities nothing tells the buyer's own
+    name apart (a PO or GRN's issuer line, a heading beside a GSTIN of unknown role).
+    Even a low-confidence name would name a vendor created from the document's GSTIN,
+    so the name stays empty: that vendor is name-pending until a person names it.
+    """
+
+    header = document.header
+    listed = list(header.extras.get("review_fields", []))
+    extras = {
+        **header.extras,
+        "review_fields": listed + ([] if "vendor_name" in listed else ["vendor_name"]),
+    }
+    withheld = document.model_copy(
+        update={
+            "header": header.model_copy(update={"vendor_name": None, "extras": extras}),
+            "needs_verification": True,
+            "reason_codes": tuple(
+                dict.fromkeys((*document.reason_codes, ReasonCode.LOW_CONFIDENCE_DATA))
+            ),
+        }
+    )
+    warning = ParseWarning(
+        code="VENDOR_NAME_ROLE_UNESTABLISHED",
+        message=(
+            "The company name read may be your own: your GSTINs are not set in Settings. "
+            "The supplier name was left for review."
+        ),
+        level=WarnLevel.WARNING,
+        locator=locator,
+    )
+    return withheld, warning
+
+
+def guard_unconfigured_parties(result: ParseResult, hints: ParserHints) -> ParseResult:
+    """Without configured buyer entities no PDF reading can tell buyer from vendor.
+
+    Every document with a vendor GSTIN lists it for review, and the result says why
+    (only when some document read one). Uploads are not blocked.
+    """
+
+    if hints.buyer_entities or not any(
+        document.header.vendor_gstin is not None for document in result.documents
+    ):
+        return result
+    documents: list[Document] = []
+    for document in result.documents:
+        header = document.header
+        if header.vendor_gstin is None:
+            documents.append(document)
+            continue
+        listed = list(header.extras.get("review_fields", []))
+        extras = {
+            **header.extras,
+            "review_fields": listed + ([] if "vendor_gstin" in listed else ["vendor_gstin"]),
+        }
+        documents.append(
+            document.model_copy(
+                update={
+                    "header": header.model_copy(update={"extras": extras}),
+                    "needs_verification": True,
+                    "reason_codes": tuple(
+                        dict.fromkeys((*document.reason_codes, ReasonCode.LOW_CONFIDENCE_DATA))
+                    ),
+                }
+            )
+        )
+    warning = ParseWarning(
+        code="BUYER_ENTITIES_NOT_CONFIGURED",
+        message=(
+            "Your company's own GSTINs are not set in Settings, so the supplier GSTIN "
+            "cannot be told apart from yours; it needs review."
+        ),
+        level=WarnLevel.WARNING,
+    )
+    return result.model_copy(
+        update={"documents": tuple(documents), "warnings": (*result.warnings, warning)}
+    )
+
+
 def party_hints_from_config(engine: Mapping[str, Any]) -> dict[str, Any]:
     """``buyer_entities`` and ``gst_rates`` for :class:`ParserHints` from config ``engine``."""
 
@@ -331,8 +413,10 @@ __all__ = [
     "gst_problems",
     "guard_document",
     "guard_result",
+    "guard_unconfigured_parties",
     "is_buyer_gstin",
     "is_buyer_name",
     "name_problem",
     "party_hints_from_config",
+    "withhold_vendor_name",
 ]

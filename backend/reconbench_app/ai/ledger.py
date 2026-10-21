@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
@@ -29,8 +30,12 @@ from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 
 REQUESTS = metadata.tables["ai_request"]
+LOGS = metadata.tables["ai_call_log"]
 LIVE_STATES = ("queued", "reserved", "sending")
 RATE_LIMIT_CODES = ("rate_limited", "QUOTA_EXHAUSTED")
+# A self-hosted provider that answered 429 or 503 is left alone for its kind's
+# ``backoff_seconds`` (WI-BE2), across workspaces: the server is shared.
+PROVIDER_BACKOFF_CODES = ("rate_limited", "PROVIDER_UNAVAILABLE")
 LEASE_MARGIN = timedelta(seconds=30)
 
 SKIP_QUEUE_TIMEOUT = "QUEUE_TIMEOUT"
@@ -96,6 +101,11 @@ class NewRequest:
     redaction_version: str
     run_id: UUID | None = None
     requested_by: UUID | None = None
+    # Reader and image parameters (vision only, WI-BE5); text hooks send none.
+    reader_params: Mapping[str, Any] = field(default_factory=dict)
+    # A vision request of the workspace's one reader in ``shadow`` (WI-BE6): its answer
+    # goes to ``reader_comparison`` only, never to consensus or a suggestion.
+    shadow: bool = False
 
     @property
     def key(self) -> str:
@@ -161,6 +171,8 @@ def create_request(connection: Connection, request: NewRequest) -> UUID | None:
                 "prompt_version": request.prompt_version,
                 "schema_version": request.schema_version,
                 "redaction_version": request.redaction_version,
+                "reader_params": dict(request.reader_params),
+                "shadow": request.shadow,
                 "request_key": key,
                 "attempt_no": attempt_no,
             }
@@ -179,9 +191,15 @@ class ReserveOutcome:
 
 
 def _usage_since(
-    connection: Connection, workspace_id: UUID, since: datetime | None, operation_key: str | None
+    connection: Connection,
+    workspace_id: UUID,
+    since: datetime | None,
+    operation_key: str | None,
+    provider: str | None = None,
 ) -> tuple[int, int]:
     conditions = [REQUESTS.c.workspace_id == workspace_id]
+    if provider is not None:
+        conditions.append(REQUESTS.c.provider == provider)
     if since is not None:
         conditions.append(REQUESTS.c.reserved_at >= since)
     if operation_key is not None:
@@ -203,10 +221,15 @@ def reserve(
     limits: AiLimits,
     now: datetime,
     timeout_seconds: int | None = None,
+    max_concurrency: int | None = None,
+    backoff_seconds: int | None = None,
 ) -> ReserveOutcome:
     """Reserve budget for a queued request; no lock is held once this returns.
 
     ``timeout_seconds`` is the call timeout of the request's kind (the lease covers it).
+    ``max_concurrency`` caps in-flight requests to the request's provider across all
+    workspaces (a shared self-hosted server); ``backoff_seconds`` defers a request
+    while that provider's last 429/503 answer is that recent.
     """
 
     with engine.begin() as connection:
@@ -252,6 +275,37 @@ def reserve(
         )
         if in_flight >= limits.in_flight:
             return ReserveOutcome("deferred", "IN_FLIGHT_LIMIT", 5)
+        provider = row["provider"]
+        if backoff_seconds is not None:
+            backoff_from = connection.scalar(
+                sa.select(sa.func.max(REQUESTS.c.finished_at)).where(
+                    REQUESTS.c.provider == provider,
+                    REQUESTS.c.error_code.in_(PROVIDER_BACKOFF_CODES),
+                )
+            )
+            if backoff_from is not None:
+                remaining = backoff_from + timedelta(seconds=backoff_seconds) - now
+                if remaining > timedelta(0):
+                    return ReserveOutcome(
+                        "deferred", "PROVIDER_BACKOFF", int(remaining.total_seconds()) + 1
+                    )
+        if max_concurrency is not None:
+            # Serialises reservations per provider; taken after the workspace lock.
+            connection.execute(
+                sa.text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"ai_provider_in_flight:{provider}"},
+            )
+            provider_in_flight = int(
+                connection.scalar(
+                    sa.select(sa.func.count()).where(
+                        REQUESTS.c.provider == provider,
+                        REQUESTS.c.request_state.in_(("reserved", "sending")),
+                    )
+                )
+                or 0
+            )
+            if provider_in_flight >= max_concurrency:
+                return ReserveOutcome("deferred", "PROVIDER_IN_FLIGHT_LIMIT", 10)
         minute_calls, _ = _usage_since(connection, workspace_id, now - timedelta(minutes=1), None)
         if minute_calls >= limits.per_minute_calls:
             return ReserveOutcome("deferred", "MINUTE_LIMIT", 15)
@@ -531,16 +585,72 @@ def sweep_expired_secrets(engine: Engine, *, now: datetime) -> int:
             ),
             {"now": now, "ids": expired},
         )
+        clear_provider_config_keys(connection, expired, now=now)
         connection.execute(sa.text("DELETE FROM secret WHERE id = ANY(:ids)"), {"ids": expired})
     return len(expired)
 
 
-def usage_summary(connection: Connection, workspace_id: UUID, now: datetime) -> dict[str, Any]:
+def clear_provider_config_keys(
+    connection: Connection, secret_ids: list[Any], *, now: datetime
+) -> None:
+    """Detach expiring keys from provider cards; the workspace's settings version moves on.
+
+    A card that loses its live key goes back to Not connected; a rotation candidate that
+    expires is simply dropped (the live key and the card's state stay).
+    """
+
+    connection.execute(
+        sa.text(
+            "UPDATE ai_provider_config SET pending_key_secret_id = NULL, version = version + 1, "
+            "updated_at = :now WHERE pending_key_secret_id = ANY(:ids)"
+        ),
+        {"now": now, "ids": secret_ids},
+    )
+    workspaces = list(
+        connection.scalars(
+            sa.text(
+                "UPDATE ai_provider_config SET key_secret_id = NULL, version = version + 1, "
+                "last_test_at = NULL, last_test_ok = NULL, connected_at = NULL, "
+                "last_error_code = NULL, last_error_at = NULL, updated_at = :now "
+                "WHERE key_secret_id = ANY(:ids) RETURNING workspace_id"
+            ),
+            {"now": now, "ids": secret_ids},
+        )
+    )
+    if workspaces:
+        connection.execute(
+            sa.text(
+                "UPDATE ai_setting SET version = version + 1, updated_at = :now "
+                "WHERE workspace_id = ANY(:workspaces)"
+            ),
+            {"now": now, "workspaces": workspaces},
+        )
+
+
+def usage_summary(
+    connection: Connection, workspace_id: UUID, now: datetime, *, provider: str | None = None
+) -> dict[str, Any]:
+    """Calls and tokens today and this month; ``provider`` narrows every figure to it."""
+
     day_start = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    day_calls, day_tokens = _usage_since(connection, workspace_id, day_start, None)
+    scope = [REQUESTS.c.workspace_id == workspace_id]
+    if provider is not None:
+        scope.append(REQUESTS.c.provider == provider)
+    day_calls, day_tokens = _usage_since(connection, workspace_id, day_start, None, provider)
+    latency = connection.execute(
+        sa.select(
+            sa.func.percentile_cont(0.5).within_group(LOGS.c.latency_ms),
+            sa.func.percentile_cont(0.95).within_group(LOGS.c.latency_ms),
+        ).where(
+            LOGS.c.workspace_id == workspace_id,
+            LOGS.c.created_at >= day_start,
+            LOGS.c.latency_ms.is_not(None),
+            *([LOGS.c.provider == provider] if provider is not None else []),
+        )
+    ).one()
     estimated = connection.scalar(
         sa.select(sa.func.count()).where(
-            REQUESTS.c.workspace_id == workspace_id,
+            *scope,
             REQUESTS.c.reserved_at >= day_start,
             sa.text("NOT usage_known AND request_state NOT IN ('queued','skipped','released')"),
         )
@@ -548,7 +658,7 @@ def usage_summary(connection: Connection, workspace_id: UUID, now: datetime) -> 
     uncertain = connection.execute(
         sa.select(REQUESTS.c.id, REQUESTS.c.call_kind, REQUESTS.c.hook, REQUESTS.c.finished_at)
         .where(
-            REQUESTS.c.workspace_id == workspace_id,
+            *scope,
             REQUESTS.c.request_state == "uncertain",
             REQUESTS.c.acknowledged_at.is_(None),
         )
@@ -559,13 +669,13 @@ def usage_summary(connection: Connection, workspace_id: UUID, now: datetime) -> 
         sa.select(
             sa.func.sum(sa.func.coalesce(REQUESTS.c.actual_usd, REQUESTS.c.reserved_usd))
         ).where(
-            REQUESTS.c.workspace_id == workspace_id,
+            *scope,
             REQUESTS.c.reserved_at >= day_start,
             sa.text("request_state NOT IN ('queued','skipped','released')"),
         )
     )
     month_start = _month_start(now)
-    month_calls, month_tokens = _usage_since(connection, workspace_id, month_start, None)
+    month_calls, month_tokens = _usage_since(connection, workspace_id, month_start, None, provider)
     return {
         "day_start": day_start,
         "calls_today": day_calls,
@@ -576,6 +686,8 @@ def usage_summary(connection: Connection, workspace_id: UUID, now: datetime) -> 
         "calls_with_estimated_usage": int(estimated or 0),
         "usd_today": usd,
         "uncertain_requests": [dict(row) for row in uncertain],
+        "latency_ms_p50_today": None if latency[0] is None else int(latency[0]),
+        "latency_ms_p95_today": None if latency[1] is None else int(latency[1]),
     }
 
 
@@ -591,6 +703,7 @@ __all__ = [
     "SweepCounts",
     "Usage",
     "acknowledge",
+    "clear_provider_config_keys",
     "create_request",
     "finish",
     "mark_sending",

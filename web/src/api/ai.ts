@@ -196,6 +196,12 @@ export interface AiStatus {
   at: string | null;
 }
 
+export type AiAutoVerifyFieldType = "doc_date" | "doc_no" | "gstin" | "line_amount" | "reference";
+export interface AiAutoVerifyFieldOption {
+  type: AiAutoVerifyFieldType;
+  label: string;
+}
+
 /** `GET /ai/settings`; the key is never part of it, only a four-character hint. */
 export interface AiSettingsView {
   version: number;
@@ -211,6 +217,7 @@ export interface AiSettingsView {
   key_storage_available: boolean;
   /** Page images for the vision reader: chosen per workspace, available per server. */
   vision: { enabled: boolean; available: boolean };
+  auto_verify: { field_types: AiAutoVerifyFieldType[]; available_field_types: AiAutoVerifyFieldOption[] };
   status: AiStatus;
 }
 
@@ -219,6 +226,7 @@ export interface AiConsentPreview {
   mode_label: string;
   model: string;
   vision: boolean;
+  auto_verify_field_types: AiAutoVerifyFieldType[];
   text: string;
   fingerprint: string;
   hooks: AiHookDisclosure[];
@@ -261,6 +269,7 @@ export interface AiSettingsUpdate {
   consent?: { accept: true; fingerprint: string };
   withdraw_consent?: boolean;
   vision?: boolean;
+  auto_verify_field_types?: AiAutoVerifyFieldType[];
 }
 
 export class AiApiError extends Error {
@@ -298,6 +307,7 @@ function parseHooks(value: unknown): AiHookDisclosure[] {
 }
 
 const aiModes: readonly AiMode[] = ["rules_only", "ai_assisted", "ai_first"];
+const autoVerifyTypes: readonly AiAutoVerifyFieldType[] = ["doc_date", "doc_no", "gstin", "line_amount", "reference"];
 
 function parseSettings(value: unknown): AiSettingsView {
   if (!isObject(value) || typeof value["version"] !== "number" || !aiModes.includes(value["mode"] as AiMode)
@@ -309,7 +319,16 @@ function parseSettings(value: unknown): AiSettingsView {
   const status = value["status"];
   const budget = isObject(value["budget"]) ? value["budget"] : {};
   const vision = isObject(value["vision"]) ? value["vision"] : {};
+  const autoVerify = isObject(value["auto_verify"]) ? value["auto_verify"] : {};
   const storage = key["storage"];
+  const autoVerifyFieldTypes = Array.isArray(autoVerify["field_types"])
+    ? autoVerify["field_types"].filter((item): item is AiAutoVerifyFieldType => typeof item === "string" && autoVerifyTypes.includes(item as AiAutoVerifyFieldType))
+    : [];
+  const availableFieldTypes = Array.isArray(autoVerify["available_field_types"])
+    ? autoVerify["available_field_types"].flatMap((item) => isObject(item) && typeof item["type"] === "string" && autoVerifyTypes.includes(item["type"] as AiAutoVerifyFieldType)
+      ? [{ type: item["type"] as AiAutoVerifyFieldType, label: text(item["label"]) ?? item["type"] as AiAutoVerifyFieldType }]
+      : [])
+    : [];
   return {
     version: value["version"],
     mode: value["mode"] as AiMode,
@@ -338,6 +357,7 @@ function parseSettings(value: unknown): AiSettingsView {
     },
     key_storage_available: value["key_storage_available"] === true,
     vision: { enabled: vision["enabled"] === true, available: vision["available"] === true },
+    auto_verify: { field_types: autoVerifyFieldTypes, available_field_types: availableFieldTypes },
     status: { code: text(status["code"]) ?? "UNKNOWN", label: text(status["label"]) ?? "", at: text(status["at"]) },
   };
 }
@@ -363,9 +383,15 @@ export async function removeAiKey(etag: string, csrf: string): Promise<{ view: A
   return settingsResult(await aiSend("/ai/key", { method: "DELETE", headers: { "If-Match": etag } }, csrf));
 }
 
-export async function getAiConsentPreview(mode: Exclude<AiMode, "rules_only">, model: string, vision = false): Promise<AiConsentPreview> {
+export async function getAiConsentPreview(
+  mode: Exclude<AiMode, "rules_only">,
+  model: string,
+  vision = false,
+  autoVerifyFieldTypes: readonly AiAutoVerifyFieldType[] = [],
+): Promise<AiConsentPreview> {
   const query = new URLSearchParams({ mode, model });
   if (vision) query.set("vision", "true");
+  for (const fieldType of autoVerifyFieldTypes) query.append("auto_verify_field_types", fieldType);
   const value: unknown = await (await aiSend(`/ai/consent-preview?${query.toString()}`)).json();
   if (!isObject(value) || typeof value["fingerprint"] !== "string" || typeof value["text"] !== "string") {
     throw new Error("The server returned an invalid consent preview.");
@@ -375,6 +401,7 @@ export async function getAiConsentPreview(mode: Exclude<AiMode, "rules_only">, m
     mode_label: text(value["mode_label"]) ?? mode,
     model,
     vision: value["vision"] === true,
+    auto_verify_field_types: autoVerifyFieldTypes.filter((item) => autoVerifyTypes.includes(item)),
     text: value["text"],
     fingerprint: value["fingerprint"],
     hooks: parseHooks(value["hooks"]),

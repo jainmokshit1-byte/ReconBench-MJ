@@ -53,6 +53,12 @@ def test_po_canonicalization_is_idempotent(segments: list[str], separator: str) 
     assert canonicalize_po_number(once) == once
 
 
+def test_po_canonicalization_zero_segments_is_idempotent() -> None:
+    once = canonicalize_po_number("0/0")
+    assert once == "0"
+    assert canonicalize_po_number(once) == once
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

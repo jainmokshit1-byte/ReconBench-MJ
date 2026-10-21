@@ -91,6 +91,10 @@ services:
       RB_AI_SEAL_PUBLIC_KEY_FILE: /run/ai-keys/ai_seal_public.json
       RB_AI_EXTERNAL_CALLS: ${RB_AI_EXTERNAL_CALLS:-disabled}
       RB_AI_EXTERNAL_CALLS_APPROVAL_REF: ${RB_AI_EXTERNAL_CALLS_APPROVAL_REF:-}
+      # Company vLLM server: its own gate and the allowlist ceiling the API checks
+      # a workspace's server URL against on save (the API never calls it).
+      RB_AI_VLLM_CALLS: ${RB_AI_VLLM_CALLS:-disabled}
+      RB_AI_VLLM_ENDPOINTS: ${RB_AI_VLLM_ENDPOINTS:-}
       RB_VISION_READER: ${RB_VISION_READER:-vision_gemini}
       RB_PUBLIC_BASE_URL: ${RB_PUBLIC_BASE_URL:-http://localhost:5173}
       RB_PDF_OCR_LANGUAGES: ${RB_PDF_OCR_LANGUAGES:-eng}
@@ -140,6 +144,8 @@ services:
       # worker must see the same deployment gate as the API and AI worker.
       RB_AI_EXTERNAL_CALLS: ${RB_AI_EXTERNAL_CALLS:-disabled}
       RB_AI_EXTERNAL_CALLS_APPROVAL_REF: ${RB_AI_EXTERNAL_CALLS_APPROVAL_REF:-}
+      RB_AI_VLLM_CALLS: ${RB_AI_VLLM_CALLS:-disabled}
+      RB_AI_VLLM_ENDPOINTS: ${RB_AI_VLLM_ENDPOINTS:-}
       RB_VISION_READER: ${RB_VISION_READER:-vision_gemini}
       RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
       RB_OTEL_EXPORTER_OTLP_ENDPOINT: ${RB_OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -164,6 +170,11 @@ services:
       RB_AI_KEYRING_FILE: /run/ai-keys/ai_keyring.json
       RB_AI_EXTERNAL_CALLS: ${RB_AI_EXTERNAL_CALLS:-disabled}
       RB_AI_EXTERNAL_CALLS_APPROVAL_REF: ${RB_AI_EXTERNAL_CALLS_APPROVAL_REF:-}
+      # The company vLLM server is registered only when the base URL is set, the
+      # gate is not disabled and the URL is on the allowlist (else startup fails).
+      RB_AI_VLLM_CALLS: ${RB_AI_VLLM_CALLS:-disabled}
+      RB_AI_VLLM_ENDPOINTS: ${RB_AI_VLLM_ENDPOINTS:-}
+      RB_AI_VLLM_BASE_URL: ${RB_AI_VLLM_BASE_URL:-}
       RB_VISION_READER: ${RB_VISION_READER:-vision_gemini}
       RB_LOG_LEVEL: ${RB_LOG_LEVEL:-INFO}
     volumes:

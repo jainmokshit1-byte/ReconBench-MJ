@@ -30,6 +30,17 @@ default) scores recorded page-image readings; ``--vision provider
 --allow-provider`` (owner only, network on, ``BENCH_GEMINI_KEY``) records missing
 ones first. Vision values are suggestions, so ``report_hash`` covers only the
 main pipeline and the vision block has its own ``vision_hash``.
+
+Evaluation harness (LLM plan WI-EV1): each run reads with exactly one vision
+provider, ``--vision-provider gemini`` (default) or ``vllm`` (``make
+accuracy-bench-vllm``; ``--vision-base-url`` must be on ``RB_AI_VLLM_ENDPOINTS``
+and no Gemini client is built), with ``--vision-model``, ``--vision-thinking``,
+``--vision-sampling``, ``--vision-prompt-variant``, ``--vision-strategy full`` and
+``--repeat N``. The
+counts-only ``vision_eval`` block (own ``vision_eval_hash``) is written when one
+of these flags, ``--agreement-policy llm_x_ocr`` or ``--vision-eval`` is given;
+without them the report and every hash are as before. Arms are compared by
+reading their reports side by side; their answers are never combined.
 """
 
 from __future__ import annotations
@@ -59,9 +70,19 @@ sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(ROOT))
 
 from reconbench_app.db.seed_data import DEFAULT_CONFIG  # noqa: E402
+from reconbench_app.document_identity import (  # noqa: E402
+    document_identity_collision_key,
+    document_rescan_key,
+    identity_payload,
+    page_hashes_within_distance,
+    rescan_identity_payload,
+    verified_field_confidence,
+)
+from reconbench_app.extraction.einvoice_keys import einvoice_keys  # noqa: E402
 from reconbench_app.ingestion import (  # noqa: E402
-    _parser_synonym_overrides,
+    IngestionLimits,
     document_natural_key,
+    parser_hints_from_config,
 )
 from reconbench_app.mapping_service import mapping_config_from_body  # noqa: E402
 from reconbench_app.pdf_sandbox import _result_payload, parse_pdf_isolated  # noqa: E402
@@ -93,7 +114,7 @@ from reconbench_core.parsers.parties import (  # noqa: E402
     buyer_gstins,
     party_hints_from_config,
 )
-from reconbench_core.parsers.types import BuyerEntityHint, ParseResult  # noqa: E402
+from reconbench_core.parsers.types import BuyerEntityHint, PageImageHash, ParseResult  # noqa: E402
 from reconbench_core.recon import (  # noqa: E402
     ReconciliationDocument,
     ReconciliationLink,
@@ -111,10 +132,11 @@ from reconbench_core.schema import (  # noqa: E402
     FileFormat,
     LinkLevel,
     LinkState,
+    ReasonCode,
 )
 from reconbench_core.version import ENGINE_VERSION  # noqa: E402
 
-from scripts import accuracy_vision  # noqa: E402
+from scripts import accuracy_consensus, accuracy_vision, accuracy_vision_eval  # noqa: E402
 
 TRUTH_FORMAT = "reconbench-accuracy-truth/v2"
 _NAMESPACE = UUID("6f1c2a52-6d0b-5a55-9a43-7a0d3c2f4b10")
@@ -164,6 +186,7 @@ _CODE_PATHS = (
     "backend/reconbench_core/schema",
     "backend/reconbench_app/extraction",
     "backend/reconbench_app/pdf_sandbox.py",
+    "backend/reconbench_app/document_identity.py",
 )
 
 
@@ -302,21 +325,13 @@ def _format_for(path: Path) -> FileFormat:
 
 
 def parser_hints(zone: DocType, file_format: FileFormat, body: Mapping[str, Any]) -> ParserHints:
-    """Hints as the app builds them from the active config (``IngestionService._parser_hints``)."""
+    """Hints exactly as upload builds them from the active config (WI-1 parity)."""
 
-    engine = body.get("engine", {})
-    synonyms = engine.get("synonyms", {})
-    uom = engine.get("uom", {})
-    charge_keywords = engine.get("charge_keywords", [])
-    return ParserHints(
-        doc_type=zone,
+    return parser_hints_from_config(
+        body,
+        zone_type=zone,
         file_format=file_format,
-        synonyms=_parser_synonym_overrides(synonyms),
-        uom_aliases=dict(uom.get("aliases", {})),
-        charge_keywords=tuple(charge_keywords)
-        if charge_keywords
-        else ParserHints().charge_keywords,
-        **party_hints_from_config(engine),
+        limits=IngestionLimits.model_validate(body["app"]["limits"]),
     )
 
 
@@ -336,7 +351,9 @@ def _package_version(name: str) -> str:
         return "none"
 
 
-def reader_fingerprint(languages: tuple[str, ...], engine_name: str) -> dict[str, str]:
+def reader_fingerprint(
+    languages: tuple[str, ...], engine_name: str, einvoice_key_bytes: bytes | None = None
+) -> dict[str, str]:
     """Everything that can change a reader's output for the same file bytes and hints."""
 
     digest = hashlib.sha256()
@@ -344,8 +361,9 @@ def reader_fingerprint(languages: tuple[str, ...], engine_name: str) -> dict[str
         target = ROOT / relative
         paths = sorted(target.rglob("*.py")) if target.is_dir() else [target]
         for path in paths:
-            if path.name.startswith("vision"):
-                continue  # the vision reader (AC-5) never changes a rules reading
+            if path.name.startswith(("vision", "consensus")):
+                # Vision (AC-5) and consensus (AC-6) never change a rules reading.
+                continue
             digest.update(path.relative_to(ROOT).as_posix().encode("utf-8"))
             digest.update(path.read_bytes())
     return {
@@ -356,7 +374,11 @@ def reader_fingerprint(languages: tuple[str, ...], engine_name: str) -> dict[str
         "qr_decoder": _package_version("zxing-cpp"),
         "languages": "+".join(languages),
         "engine": engine_name,
+        "einvoice_keys": _sha256(einvoice_key_bytes) if einvoice_key_bytes else "none",
     }
+
+
+_TIMEOUT = "PDF_PROCESS_TIMEOUT"
 
 
 @dataclass
@@ -378,6 +400,7 @@ def read_file(
     refresh: bool,
     languages: tuple[str, ...],
     engine_name: str,
+    einvoice_public_keys: tuple[Any, ...] = (),
 ) -> ReadOutcome:
     path = samples / truth_file.path
     content = path.read_bytes()
@@ -401,10 +424,19 @@ def read_file(
             return ReadOutcome(truth_file.file_id, file_sha, result, True, 0.0)
     started = time.monotonic()
     if file_format is FileFormat.PDF:
-        result = parse_pdf_isolated(content, hints, languages=languages, engine_name=engine_name)
+        result = parse_pdf_isolated(
+            content,
+            hints,
+            languages=languages,
+            engine_name=engine_name,
+            einvoice_keys=einvoice_public_keys,
+        )
     else:
         result = parse(content, hints)
     seconds = time.monotonic() - started
+    if result.reason_code == _TIMEOUT:
+        # Never cache a timeout: the next run must read the file again.
+        return ReadOutcome(truth_file.file_id, file_sha, result, False, seconds)
     cache.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(
         json.dumps(
@@ -667,6 +699,7 @@ class Parsed:
     truth_id: str | None
     # Read from XML/CSV (a structured record), not from a PDF.
     structured: bool = False
+    page_hashes: tuple[PageImageHash, ...] = ()
 
 
 @dataclass
@@ -674,10 +707,11 @@ class SystemDocument:
     document_id: UUID
     natural_key: str
     versions: list[Parsed]
+    current_version_index: int = 0
 
     @property
     def current(self) -> Parsed:
-        return self.versions[-1]
+        return self.versions[self.current_version_index]
 
 
 @dataclass
@@ -692,20 +726,128 @@ class SimVendor:
 
 
 def build_workspace(parsed: list[Parsed]) -> list[SystemDocument]:
-    """Identity in upload order: the same ``document_natural_key`` makes a new version."""
+    """Group evidence-matched re-scans in upload order, matching the app policy."""
 
-    by_key: dict[str, SystemDocument] = {}
+    documents: list[SystemDocument] = []
     for item in parsed:
-        key = document_natural_key(item.document, item.file_sha)
-        existing = by_key.get(key)
+        incoming_identity = rescan_identity_payload(
+            item.document,
+            item.file_sha,
+            page_hashes=item.page_hashes,
+            structured=item.structured,
+        )
+        rescan_key = document_rescan_key(
+            item.document,
+            item.file_sha,
+            page_hashes=item.page_hashes,
+            structured=item.structured,
+        )
+        natural_key = document_natural_key(
+            item.document,
+            item.file_sha,
+            page_hashes=item.page_hashes,
+            structured=item.structured,
+        )
+        incoming_natural_identity = identity_payload(
+            item.document,
+            item.file_sha,
+            page_hashes=item.page_hashes,
+            structured=item.structured,
+        )
+        matching_documents: set[UUID] = set()
+        for candidate in documents:
+            for version in candidate.versions:
+                if (
+                    document_rescan_key(
+                        version.document,
+                        version.file_sha,
+                        page_hashes=version.page_hashes,
+                        structured=version.structured,
+                    )
+                    == rescan_key
+                ):
+                    matching_documents.add(candidate.document_id)
+                    break
+
+        if not matching_documents and incoming_identity["kind"] == "fingerprint":
+            same_source_documents = {
+                candidate.document_id
+                for candidate in documents
+                for version in candidate.versions
+                if version.file_sha == item.file_sha
+                and version.document.source_locator == item.document.source_locator
+                and version.document.header.doc_type is item.document.header.doc_type
+                and rescan_identity_payload(
+                    version.document,
+                    version.file_sha,
+                    page_hashes=version.page_hashes,
+                    structured=version.structured,
+                )["kind"]
+                == "source"
+            }
+            if len(same_source_documents) == 1:
+                matching_documents = same_source_documents
+
+        if not matching_documents and incoming_identity["kind"] == "fingerprint":
+            for candidate in documents:
+                for version in candidate.versions:
+                    candidate_identity = rescan_identity_payload(
+                        version.document,
+                        version.file_sha,
+                        page_hashes=version.page_hashes,
+                        structured=version.structured,
+                    )
+                    if (
+                        candidate_identity["kind"] == "fingerprint"
+                        and incoming_identity["content_fingerprint"]
+                        == candidate_identity["content_fingerprint"]
+                        and page_hashes_within_distance(
+                            incoming_identity["page_hashes"],
+                            candidate_identity["page_hashes"],
+                        )
+                    ):
+                        matching_documents.add(candidate.document_id)
+                        break
+
+        if not matching_documents and incoming_natural_identity["kind"] == "verified":
+            matching_documents = {
+                candidate.document_id
+                for candidate in documents
+                if candidate.natural_key == natural_key
+            }
+        existing = None
+        if len(matching_documents) == 1:
+            existing = next(
+                candidate for candidate in documents if candidate.document_id in matching_documents
+            )
         if existing is None:
-            by_key[key] = SystemDocument(_stable_id("document", key), key, [item])
+            if any(candidate.natural_key == natural_key for candidate in documents):
+                natural_key = document_identity_collision_key(
+                    item.document,
+                    item.file_sha,
+                    page_hashes=item.page_hashes,
+                    structured=item.structured,
+                )
+            documents.append(
+                SystemDocument(_stable_id("document", rescan_key), natural_key, [item])
+            )
         elif split_pages(item.document) and existing.current.structured:
             # As ``_upsert_document``: a bundle page never replaces a structured version.
             continue
         else:
             existing.versions.append(item)
-    return list(by_key.values())
+            current_confidence = verified_field_confidence(
+                existing.current.document, structured=existing.current.structured
+            )
+            incoming_confidence = verified_field_confidence(
+                item.document, structured=item.structured
+            )
+            if current_confidence is None or (
+                incoming_confidence is not None and incoming_confidence >= current_confidence
+            ):
+                existing.current_version_index = len(existing.versions) - 1
+                existing.natural_key = natural_key
+    return documents
 
 
 def simulate_vendors(
@@ -1054,6 +1196,10 @@ def score_links(
     }
 
 
+def _has_duplicate_flag(case: CaseResult) -> bool:
+    return case.status is CaseStatus.DUPLICATE or ReasonCode.DUP_SUSPECTED in case.reason_codes
+
+
 def score_recon(
     documents: list[SystemDocument],
     cases: tuple[CaseResult, ...],
@@ -1070,13 +1216,16 @@ def score_recon(
             system_by_truth[item.current.truth_id].append(item)
 
     extra_documents = sum(len(items) - 1 for items in system_by_truth.values())
+    extra_documents_by_type: Counter[str] = Counter()
+    for truth_id, items in system_by_truth.items():
+        extra_documents_by_type[truth_by_id[truth_id].doc_type.value] += max(0, len(items) - 1)
     wrong_merges = sum(
         len({version.truth_id for version in item.versions if version.truth_id}) > 1
         for item in documents
     )
     caught = missed = false_duplicates = 0
     for case in cases:
-        if case.status is not CaseStatus.DUPLICATE or case.duplicate_of_id is None:
+        if not _has_duplicate_flag(case) or case.duplicate_of_id is None:
             continue
         own = truth_of.get(case.invoice_id) if case.invoice_id is not None else None
         if own is None or own != truth_of.get(case.duplicate_of_id):
@@ -1089,7 +1238,7 @@ def score_recon(
             copy_case = cases_by_invoice.get(copy.document_id)
             if (
                 copy_case is not None
-                and copy_case.status is CaseStatus.DUPLICATE
+                and _has_duplicate_flag(copy_case)
                 and copy_case.duplicate_of_id is not None
                 and truth_of.get(copy_case.duplicate_of_id) == truth_id
             ):
@@ -1109,7 +1258,7 @@ def score_recon(
             for system in system_by_truth.get(expected_doc.doc_id, [])
         ]
         primary = next(
-            (pair for pair in candidates if pair[1] and pair[1].status is not CaseStatus.DUPLICATE),
+            (pair for pair in candidates if pair[1] and not _has_duplicate_flag(pair[1])),
             candidates[0] if candidates else None,
         )
         if primary is None or primary[1] is None or not expected_doc.expected_status:
@@ -1142,6 +1291,7 @@ def score_recon(
     return {
         "system_documents": len(documents),
         "extra_documents": extra_documents,
+        "extra_documents_by_type": dict(sorted(extra_documents_by_type.items())),
         "wrong_merges": wrong_merges,
         "duplicates_caught": caught,
         "duplicates_missed": missed,
@@ -1253,6 +1403,7 @@ def _print_summary(report: Mapping[str, Any]) -> None:
     recon = report["recon"]
     print(
         f"Identity: system docs={recon['system_documents']} extra={recon['extra_documents']} "
+        f"extra-by-type={recon['extra_documents_by_type']} "
         f"wrong-merges={recon['wrong_merges']}  duplicates caught={recon['duplicates_caught']} "
         f"missed={recon['duplicates_missed']} false={recon['false_duplicates']}"
     )
@@ -1266,6 +1417,36 @@ def _print_summary(report: Mapping[str, Any]) -> None:
     print("=" * 72)
 
 
+def vision_arm(arguments: argparse.Namespace) -> accuracy_vision.VisionArm:
+    """The run's one vision provider and reader settings (WI-EV1; refused before any read)."""
+
+    if getattr(arguments, "vision_primary_sim", False):
+        raise accuracy_vision.ArmRefused(
+            "--vision-primary-sim needs merge_readings from WI-BE7, which does not exist yet; "
+            "nothing was run"
+        )
+    arm = accuracy_vision.VisionArm(
+        provider=getattr(arguments, "vision_provider", "gemini"),
+        thinking=getattr(arguments, "vision_thinking", None),
+        sampling=getattr(arguments, "vision_sampling", None),
+        strategy=getattr(arguments, "vision_strategy", "full"),
+        base_url=getattr(arguments, "vision_base_url", None),
+        repeats=getattr(arguments, "repeat", 1),
+        prompt_variant=getattr(arguments, "vision_prompt_variant", None),
+        send_from_repeat=getattr(arguments, "send_from_repeat", 0),
+    )
+    return accuracy_vision.check_arm(
+        arm, allowlist=os.environ.get("RB_AI_VLLM_ENDPOINTS"), model=arguments.vision_model
+    )
+
+
+def _scan_type(pages: Iterable[Any]) -> str:
+    flags = [page.is_ocr for page in pages]
+    if not flags:
+        return "unknown"
+    return "scan" if all(flags) else "mixed" if any(flags) else "digital"
+
+
 def run_vision(
     arguments: argparse.Namespace,
     truth: Truth,
@@ -1273,7 +1454,8 @@ def run_vision(
     parsed: list[Parsed],
     languages: tuple[str, ...],
     fingerprint: Mapping[str, str],
-) -> dict[str, Any]:
+    arm: accuracy_vision.VisionArm = accuracy_vision.DEFAULT_ARM,
+) -> tuple[dict[str, Any], accuracy_vision.VisionRun]:
     """Vision readings for every parsed PDF document (AC-5); counts only."""
 
     paths = {item.file_id: item.path for item in truth.files}
@@ -1283,6 +1465,8 @@ def run_vision(
             continue
         outcome = reads[item.file_id]
         page_count = max((page.page for page in outcome.result.page_texts), default=0)
+        pages = accuracy_vision.document_pages(item.document, page_count)
+        own = [page for page in outcome.result.page_texts if page.page in pages]
         targets.append(
             accuracy_vision.VisionTarget(
                 file_id=item.file_id,
@@ -1291,7 +1475,10 @@ def run_vision(
                 doc_type=item.document.header.doc_type,
                 document=item.document,
                 content=(arguments.samples / paths[item.file_id]).read_bytes(),
-                pages=accuracy_vision.document_pages(item.document, page_count),
+                pages=pages,
+                ocr_pages=any(page.is_ocr for page in outcome.result.page_texts),
+                scan_type=_scan_type(own),
+                ocr_text="\n".join(page.content for page in own),
             )
         )
     accuracy_vision.prepare(
@@ -1303,25 +1490,51 @@ def run_vision(
         refresh=arguments.refresh,
         model=arguments.vision_model,
         workers=arguments.workers,
+        arm=arm,
     )
-    run = accuracy_vision.VisionRun(arguments.vision, arguments.vision_model, targets)
+    run = accuracy_vision.VisionRun(arguments.vision, arguments.vision_model, targets, arm=arm)
+    compat_v1 = arguments.vision_cache_v1 if arguments.vision_cache_compat == "v1" else None
+    if compat_v1 is not None and not accuracy_vision.compat_v1_applies(arm):
+        print("Vision: --vision-cache-compat v1 ignored (reader parameters differ from v1).")
     missing = [
         target
         for target in targets
-        if target.key is not None and not (arguments.vision_cache / f"{target.key}.json").is_file()
+        if target.key is not None and _missing_answers(target, arguments, compat_v1, arm)
     ]
+    retry: frozenset[str] = frozenset()
+    if getattr(arguments, "vision_retry_invalid", False):
+        # Only requests whose recorded answer is unusable; no new document is added.
+        retry = accuracy_vision.unusable_keys(targets, arguments.vision_cache)
+        missing = [
+            target
+            for target in targets
+            if any(key in retry for key in (target.key, *target.repeat_keys))
+        ]
     if missing:
         # Most informative documents first, so a run cut short still has the best data.
-        missing = _priority_subset(missing, truth.by_id(), arguments.max_provider_calls)
+        waiting = {id(target) for target in missing}
+        covered = frozenset(
+            str(target.truth_id)
+            for target in targets
+            if not retry
+            and target.key is not None
+            and target.truth_id
+            and id(target) not in waiting
+        )
+        missing = _priority_subset(missing, truth.by_id(), arguments.max_provider_calls, covered)
     if arguments.vision == "provider" and missing:
         if not arguments.allow_provider:
             raise SystemExit(
                 "--vision provider sends page images; add --allow-provider (owner only)"
             )
-        pages = sum(len(target.rows) for target in missing)
+        pages = sum(
+            len(target.rows) * _missing_answers(target, arguments, compat_v1, arm, retry)
+            for target in missing
+        )
+        destination = "the vLLM server" if arm.local else arguments.vision_model
         print(
             f"Vision: {len(missing)} document(s), {pages} masked page image(s) to send to "
-            f"{arguments.vision_model}; page budget {arguments.max_provider_pages}."
+            f"{destination}; page budget {arguments.max_provider_pages}."
         )
         if pages > arguments.max_provider_pages:
             run.provider = {"not_sent_over_budget": len(missing)}
@@ -1331,15 +1544,50 @@ def run_vision(
                 missing,
                 arguments.vision_cache,
                 model=arguments.vision_model,
-                api_key=accuracy_vision.provider_key(),
+                # The company server needs no key (plan §0.5); Gemini's is never read here.
+                api_key=os.environ.get("BENCH_VLLM_KEY", "")
+                if arm.local
+                else accuracy_vision.provider_key(),
                 max_output_tokens=arguments.vision_max_output_tokens,
                 failures=run.failures,
                 pause_seconds=arguments.vision_pause,
+                arm=arm,
+                retry=retry,
             )
+    crops: dict[str, Any] | None = None
+    if arm.strategy in accuracy_vision.CROP_STRATEGIES:
+        # WI-BE8 (D97): pass 2 on flagged pages; crops are sent only with the flag.
+        crops = accuracy_vision.crop_pass(
+            targets,
+            arguments.vision_cache,
+            arm=arm,
+            model=arguments.vision_model,
+            send_crops=bool(arguments.vision_crops_send and arguments.allow_provider),
+            max_calls=arguments.max_provider_pages,
+            failures=run.failures,
+            api_key=os.environ.get("BENCH_VLLM_KEY", ""),
+        )
+        print(f"Vision crops: {crops}")
     accuracy_vision.check_answers(
-        targets, arguments.vision_cache, truth.buyer_entities_hints(), run.usage
+        targets,
+        arguments.vision_cache,
+        truth.buyer_entities_hints(),
+        run.usage,
+        compat_v1=compat_v1,
+        arm=arm,
+        repeat_usage=run.repeat_usage,
     )
-    return accuracy_vision.summary(
+    if compat_v1 is not None:
+        served = sum(
+            1
+            for target in targets
+            if target.key is not None
+            and not (arguments.vision_cache / f"{target.key}.json").is_file()
+            and accuracy_vision.answer_path(target, arguments.vision_cache, compat_v1, arm)
+            is not None
+        )
+        print(f"Vision: {served} answer(s) read from the v1 cache (read-only).")
+    result = accuracy_vision.summary(
         run,
         truth.by_id(),
         score_document,
@@ -1348,17 +1596,56 @@ def run_vision(
         _same,
         _HEADER_FIELDS,
     )
+    if crops is not None:
+        result["crops"] = crops
+    return result, run
+
+
+def _missing_answers(
+    target: accuracy_vision.VisionTarget,
+    arguments: argparse.Namespace,
+    compat_v1: Path | None,
+    arm: accuracy_vision.VisionArm,
+    retry: frozenset[str] = frozenset(),
+) -> int:
+    """How many of the target's requests (repeat 0 and each repeat) will be sent: no
+    answer yet, or (``--vision-retry-invalid``) an unusable one."""
+
+    start = arm.send_from_repeat  # earlier repeats are scored, never sent
+    main = accuracy_vision.answer_path(target, arguments.vision_cache, compat_v1, arm) is None
+    return int(start == 0 and (main or target.key in retry)) + sum(
+        not (arguments.vision_cache / f"{key}.json").is_file() or key in retry
+        for index, key in enumerate(target.repeat_keys, start=1)
+        if index >= start
+    )
+
+
+def _print_consensus(block: Mapping[str, Any]) -> None:
+    upper = block.get("upper_bound", {})
+    fields = upper.get("by_field_type", {})
+    print("CONSENSUS SHADOW (upper bound; crop not required)")
+    for name, counts in sorted(fields.items()):
+        print(
+            f"  {name}: L1={counts['l1']} correct={counts['l1_correct']} "
+            f"wrong={counts['l1_wrong']} gate={counts['gate']}"
+        )
 
 
 def _priority_subset(
     missing: list[accuracy_vision.VisionTarget],
     truth_by_id: Mapping[str, TruthDocument],
     limit: int | None,
+    covered: frozenset[str] = frozenset(),
 ) -> list[accuracy_vision.VisionTarget]:
     """At most ``limit`` (or all) distinct requests, most informative first.
 
     Order: truth with handwritten refs, truth with lines, other truth, no truth; copies
     with the same request key count once. Deterministic for a given truth file.
+
+    With a ``limit``, each request is a different truth document: another file or
+    bundle page of a truth document already chosen, or already answered
+    (``covered``), takes no slot and is not sent. Documents without truth each count
+    as their own. Without a limit every missing request is kept.
     """
 
     def rank(target: accuracy_vision.VisionTarget) -> tuple[int, str, int]:
@@ -1375,12 +1662,16 @@ def _priority_subset(
 
     chosen: list[accuracy_vision.VisionTarget] = []
     keys: set[str] = set()
+    truths: set[str] = set(covered)
     for target in sorted(missing, key=rank):
         if target.key in keys:
             chosen.append(target)
             continue
-        if limit is not None and len(keys) >= limit:
-            continue
+        if limit is not None:
+            if len(keys) >= limit or (target.truth_id is not None and target.truth_id in truths):
+                continue
+            if target.truth_id is not None:
+                truths.add(target.truth_id)
         keys.add(str(target.key))
         chosen.append(target)
     return chosen
@@ -1408,6 +1699,27 @@ def _print_vision(block: Mapping[str, Any]) -> None:
         print(f"  OCR x vision: {block['agreement']['all']}")
         print(f"  dropped by checks: {block.get('dropped', {})}")
         print(f"  output tokens per answer: {block.get('output_tokens_per_call', {})}")
+
+
+def _print_vision_eval(block: Mapping[str, Any]) -> None:
+    arm = block["arm"]
+    print(
+        f"VISION EVAL ({arm['provider']}, {block['model']}, thinking={arm['thinking']}, "
+        f"sampling={arm['sampling_profile']}, prompt={arm.get('prompt_version')}, "
+        f"repeats={arm['repeats']}, "
+        f"policy={block['agreement_policy']}): documents={block['documents_scored']}"
+    )
+    for group in ("all_pdf", "scan_page"):
+        readers = block["accuracy"].get(group, {})
+        header = {
+            reader: fields.get("header", {}).get("accuracy") for reader, fields in readers.items()
+        }
+        print(f"  {group} header: {header}")
+    print(f"  false-safe: {block['false_safe']}")
+    print(f"  wrong when answered: {block['wrong_when_answered']}")
+    print(f"  LLM x OCR: {block['agree_wrong_llm_x_ocr']}")
+    print(f"  latency ms: {block['latency_ms']}  tokens: {block['tokens']}")
+    print(f"  failures: {block['failures_by_code']}  repeats: {block['repeat_variance']}")
 
 
 def write_prefill(path: Path, truth: Truth, reads: Mapping[str, ReadOutcome]) -> int:
@@ -1457,12 +1769,34 @@ def write_prefill(path: Path, truth: Truth, reads: Mapping[str, ReadOutcome]) ->
     return len(drafts)
 
 
+def config_body(truth: Truth, buyer_entities: str) -> dict[str, Any]:
+    """The seed config with own GSTINs from the truth file, the seed as is, or none."""
+
+    body: dict[str, Any] = json.loads(json.dumps(DEFAULT_CONFIG))
+    if buyer_entities == "truth":
+        body["engine"]["buyer_entities"] = [dict(item) for item in truth.buyer_entities]
+    elif buyer_entities == "none":
+        body["engine"]["buyer_entities"] = []
+    elif buyer_entities != "config":
+        raise ValueError(f"unknown buyer_entities mode: {buyer_entities}")
+    return body
+
+
 def run(arguments: argparse.Namespace) -> int:
+    arm = vision_arm(arguments) if arguments.vision != "off" else accuracy_vision.DEFAULT_ARM
+    policy = getattr(arguments, "agreement_policy", "single")
+    evaluate = arguments.vision != "off" and (
+        getattr(arguments, "vision_eval", False)
+        or arm != accuracy_vision.DEFAULT_ARM
+        or policy != "single"
+    )
     truth = load_truth(arguments.truth)
-    body = json.loads(json.dumps(DEFAULT_CONFIG))
-    body["engine"]["buyer_entities"] = [dict(item) for item in truth.buyer_entities]
+    body = config_body(truth, arguments.buyer_entities)
     languages = tuple(arguments.languages.split("+"))
-    fingerprint = reader_fingerprint(languages, arguments.engine)
+    key_file: Path | None = arguments.einvoice_key_file
+    key_bytes = key_file.read_bytes() if key_file is not None else None
+    public_keys = einvoice_keys(key_file)
+    fingerprint = reader_fingerprint(languages, arguments.engine, key_bytes)
 
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, arguments.workers)) as pool:
@@ -1477,6 +1811,7 @@ def run(arguments: argparse.Namespace) -> int:
                 refresh=arguments.refresh,
                 languages=languages,
                 engine_name=arguments.engine,
+                einvoice_public_keys=public_keys,
             )
             for item in truth.files
         }
@@ -1498,6 +1833,12 @@ def run(arguments: argparse.Namespace) -> int:
         missed_documents += len(truth_docs) - len(set(assigned.values()))
         for index, document in enumerate(documents):
             truth_id = assigned.get(index)
+            own_pages = split_pages(document)
+            document_page_hashes = tuple(
+                page_hash
+                for page_hash in outcome.result.page_image_hashes
+                if not own_pages or page_hash.page in own_pages
+            )
             parsed.append(
                 Parsed(
                     truth_file.file_id,
@@ -1506,6 +1847,7 @@ def run(arguments: argparse.Namespace) -> int:
                     document,
                     truth_id,
                     structured=_format_for(Path(truth_file.path)) is not FileFormat.PDF,
+                    page_hashes=document_page_hashes,
                 )
             )
             if truth_id is None:
@@ -1531,8 +1873,11 @@ def run(arguments: argparse.Namespace) -> int:
             )
 
     vision_block: dict[str, Any] | None = None
+    vision_run: accuracy_vision.VisionRun | None = None
     if arguments.vision != "off":
-        vision_block = run_vision(arguments, truth, reads, parsed, languages, fingerprint)
+        vision_block, vision_run = run_vision(
+            arguments, truth, reads, parsed, languages, fingerprint, arm
+        )
 
     workspace = build_workspace(parsed)
     vendor_of, vendors = simulate_vendors(workspace, body)
@@ -1577,6 +1922,7 @@ def run(arguments: argparse.Namespace) -> int:
             "reader": fingerprint,
             "truth_sha256": truth.digest,
             "run_date": truth.run_date.isoformat(),
+            "buyer_entities": arguments.buyer_entities,
         },
         "segmentation": {
             "files": len(truth.files),
@@ -1602,10 +1948,42 @@ def run(arguments: argparse.Namespace) -> int:
     if vision_block is not None:
         report["vision"] = vision_block
         report["vision_hash"] = _sha256(_canonical_json(vision_block))
+    if evaluate and vision_run is not None:
+        price_file = os.environ.get("RB_AI_PRICE_FILE")
+        eval_block = accuracy_vision_eval.evaluate(
+            vision_run,
+            truth.by_id(),
+            normal=_normal,
+            same=_same,
+            header_fields=_HEADER_FIELDS,
+            critical=_CRITICAL,
+            score_document=score_document,
+            policy=policy,
+            price_file=Path(price_file) if price_file else None,
+        )
+        report["vision_eval"] = eval_block
+        report["vision_eval_hash"] = _sha256(_canonical_json(eval_block))
+    if getattr(arguments, "consensus", "shadow") == "shadow" and vision_run is not None:
+        block = {
+            "upper_bound": accuracy_consensus.summary(
+                vision_run,
+                truth.by_id(),
+                score_document,
+                extraction_summary,
+                _normal,
+                _same,
+                buyer_entities=truth.buyer_entities_hints(),
+                run_date=truth.run_date,
+                require_crop=False,
+            )
+        }
+        report["consensus"] = block
+        report["consensus_hash"] = _sha256(_canonical_json(block))
     report["timing"] = {
         "read_seconds": round(read_seconds, 1),
         "cache_hits": sum(outcome.cached for outcome in reads.values()),
         "files_read": sum(not outcome.cached for outcome in reads.values()),
+        "timeouts": sum(outcome.result.reason_code == _TIMEOUT for outcome in reads.values()),
     }
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
     arguments.out.write_text(
@@ -1621,10 +1999,19 @@ def run(arguments: argparse.Namespace) -> int:
     _print_summary(report)
     if vision_block is not None:
         _print_vision(vision_block)
+    if "consensus" in report:
+        _print_consensus(report["consensus"])
+    if "vision_eval" in report:
+        _print_vision_eval(report["vision_eval"])
     print(
         f"Report: {arguments.out}  (cache hits {report['timing']['cache_hits']}, "
         f"read {report['timing']['files_read']} file(s) in {report['timing']['read_seconds']} s)"
     )
+    if report["timing"]["timeouts"]:
+        print(
+            f"WARNING: {report['timing']['timeouts']} file(s) hit {_TIMEOUT}; "
+            "these reads are not cached and the run must be repeated."
+        )
     return 1 if any(report["hard"].values()) else 0
 
 
@@ -1638,14 +2025,39 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--prefill", type=Path, default=None)
     parser.add_argument("--refresh", action="store_true", help="ignore cached reader outputs")
     parser.add_argument("--details", action="store_true", help="print per-document outcomes")
-    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 3))
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="parallel fresh reads; more than 1 risks sandbox timeouts (cached reads are instant)",
+    )
     parser.add_argument("--languages", default=os.environ.get("RB_PDF_OCR_LANGUAGES", "eng"))
     parser.add_argument("--engine", default=os.environ.get("RB_EXTRACTION_ENGINE", "local_hybrid"))
+    parser.add_argument(
+        "--buyer-entities",
+        choices=("truth", "config", "none"),
+        default="truth",
+        help="own GSTINs: from the truth file (history), the seed config as is, or none",
+    )
+    parser.add_argument(
+        "--einvoice-key-file",
+        type=Path,
+        default=Path(os.environ["RB_EINVOICE_PUBLIC_KEY_FILE"])
+        if os.environ.get("RB_EINVOICE_PUBLIC_KEY_FILE")
+        else None,
+        help="e-invoice portal public key(s), loaded as the app loads them",
+    )
     parser.add_argument(
         "--vision",
         choices=("off", "cached", "provider"),
         default="cached",
         help="page-image reader (AC-5): off, recorded answers only, or record missing ones",
+    )
+    parser.add_argument(
+        "--consensus",
+        choices=("off", "shadow"),
+        default="shadow",
+        help="AC-6 consensus: off or counts-only shadow scoring",
     )
     parser.add_argument(
         "--allow-provider",
@@ -1659,8 +2071,85 @@ def main(argv: Iterable[str] | None = None) -> int:
         help="page budget for --vision provider; nothing is sent when more pages are missing",
     )
     parser.add_argument(
+        "--vision-provider",
+        choices=accuracy_vision.PROVIDERS,
+        default="gemini",
+        help="the one vision provider of this run (Gemini and vLLM are never combined)",
+    )
+    parser.add_argument(
+        "--vision-base-url",
+        default=None,
+        help="vLLM only: the server base URL; refused unless it is on RB_AI_VLLM_ENDPOINTS",
+    )
+    parser.add_argument(
         "--vision-model",
-        default=os.environ.get("RB_BENCH_VISION_MODEL", "gemini-3.8-flash"),
+        default=None,
+        help="default: RB_BENCH_VISION_MODEL or gemini-3.8-flash (Gemini), "
+        f"{accuracy_vision.DEFAULT_VLLM_MODEL} (vLLM)",
+    )
+    parser.add_argument(
+        "--vision-thinking",
+        choices=accuracy_vision.THINKING_CHOICES,
+        default=None,
+        help="default: the reader's own (Gemini low, vLLM off; vLLM takes off only)",
+    )
+    parser.add_argument(
+        "--vision-sampling",
+        choices=accuracy_vision.SAMPLING_CHOICES,
+        default=None,
+        help="default: the reader's own (Gemini provider_default, vLLM qwen_card_nonthinking)",
+    )
+    parser.add_argument(
+        "--send-from-repeat",
+        type=int,
+        default=0,
+        help="send only repeats >= N (earlier ones are scored from the cache, never sent)",
+    )
+    parser.add_argument(
+        "--vision-prompt-variant",
+        choices=tuple(accuracy_vision.VISION_PROMPT_VARIANTS),
+        default=None,
+        help="default: the reader's own (Gemini gemini, vLLM the app's current Qwen wording)",
+    )
+    parser.add_argument(
+        "--vision-strategy",
+        choices=accuracy_vision.STRATEGY_CHOICES,
+        default="full",
+        help="full page images; band reads the top band of page 1 only (WI-Q2); "
+        "crops re-reads flagged pages of the newest repeat as three crops (WI-BE8); "
+        "crops-control scores that newest repeat alone",
+    )
+    parser.add_argument(
+        "--vision-crops-send",
+        action="store_true",
+        help="send the WI-BE8 crop calls (with --allow-provider); otherwise cached crops only",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="read every request N times (the repeat index is in the cache key)",
+    )
+    parser.add_argument(
+        "--agreement-policy",
+        choices=accuracy_vision_eval.POLICIES,
+        default="single",
+        help="vision_eval auto-accept candidates: the LLM alone, or only where OCR agrees",
+    )
+    parser.add_argument(
+        "--vision-primary-sim",
+        action="store_true",
+        help="refused until WI-BE7's merge_readings exists",
+    )
+    parser.add_argument(
+        "--vision-retry-invalid",
+        action="store_true",
+        help="send again only requests whose recorded answer fails the strict parse",
+    )
+    parser.add_argument(
+        "--vision-eval",
+        action="store_true",
+        help="write the counts-only vision_eval block for the default reader too",
     )
     parser.add_argument(
         "--vision-max-output-tokens",
@@ -1682,9 +2171,25 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("--vision-cache", type=Path, default=work / "accuracy-cache" / "vision")
     parser.add_argument(
+        "--vision-cache-compat",
+        choices=("none", "v1"),
+        default="none",
+        help="v1: also read answers recorded under the pre-WI-BE5 cache key (read-only)",
+    )
+    parser.add_argument(
+        "--vision-cache-v1", type=Path, default=work / "accuracy-cache" / "vision-v1"
+    )
+    parser.add_argument(
         "--vision-pages", type=Path, default=work / "accuracy-cache" / "vision-pages"
     )
-    return run(parser.parse_args(list(argv) if argv is not None else None))
+    arguments = parser.parse_args(list(argv) if argv is not None else None)
+    if arguments.vision_model is None:
+        arguments.vision_model = (
+            accuracy_vision.DEFAULT_VLLM_MODEL
+            if arguments.vision_provider == "vllm"
+            else os.environ.get("RB_BENCH_VISION_MODEL", "gemini-3.8-flash")
+        )
+    return run(arguments)
 
 
 if __name__ == "__main__":

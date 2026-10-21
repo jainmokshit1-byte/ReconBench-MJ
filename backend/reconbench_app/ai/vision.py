@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -31,7 +34,9 @@ from reconbench_core.extraction.vision import (
     VisionLine,
     VisionPageKind,
     VisionReading,
+    VisionUnreadable,
     check_reading,
+    merge_page_readings,
     vision_document,
 )
 from reconbench_core.parsers.parties import party_hints_from_config
@@ -44,19 +49,28 @@ from reconbench_app.ai.contracts import (
     DocTypeName,
     InvalidOutput,
     VisionOutput,
+    parse_output,
 )
 from reconbench_app.ai.limits import AiLimits
 from reconbench_app.ai.prompts import PromptPayload, vision_prompt
 from reconbench_app.ai.provider import ProviderImage
 from reconbench_app.ai.redaction import IMAGE_MASK_VERSION
 from reconbench_app.db.metadata import metadata
-from reconbench_app.extraction.vision import VISION_RENDER, MediaResolution
+from reconbench_app.extraction.vision import (
+    BAND_TOP,
+    BAND_VERSION,
+    VISION_RENDER,
+    MediaResolution,
+    VisionReaderInfo,
+)
+
+_LOGGER = logging.getLogger(__name__)
 
 HOOK = "h6_vision"
 SUBJECT_TYPE = "document_version"
 WIRED_DOC_TYPES: frozenset[str] = frozenset({"invoice", "po", "grn"})
-# Corrections are saved for invoices only today; PO/GRN suggestions are read-only (AC-7).
-CORRECTABLE_DOC_TYPES: frozenset[str] = frozenset({"invoice"})
+# The existing correction endpoint accepts manual saves for each wired document type.
+CORRECTABLE_DOC_TYPES: frozenset[str] = WIRED_DOC_TYPES
 PDF_METHODS = frozenset({"pdf_text", "pdf_ocr"})
 
 SKIP_SOURCE_CHANGED = "SOURCE_CHANGED"
@@ -77,10 +91,40 @@ LINES = metadata.tables["doc_line"]
 SOURCES = metadata.tables["source_file"]
 PAGES = metadata.tables["document_page_image"]
 REQUESTS = metadata.tables["ai_request"]
+CONSENSUS_RUNS = metadata.tables["consensus_run"]
 CONFIG_ACTIVE = metadata.tables["config_active"]
 CONFIG_VERSIONS = metadata.tables["config_version"]
 
 VisionSkipReason = Literal["MODE_OFF", "NOT_PDF", "NOT_NEEDED", "TOO_MANY_PAGES", "NO_PAGES"]
+ReaderPass = Literal["full", "crop:header", "crop:table", "crop:totals"]
+BoxOrder = Literal["yx", "xy"]
+
+
+def reader_params(reader: VisionReaderInfo, *, reader_pass: ReaderPass = "full") -> dict[str, Any]:
+    """What the reader saw and how it was asked (WI-BE5): stored on ``ai_request`` and
+    hashed into the vision cache key, so an answer is reused only for the same settings."""
+
+    params: dict[str, Any] = {
+        "jpeg_quality": VISION_RENDER.jpeg_quality,
+        "mask_version": IMAGE_MASK_VERSION,
+        "max_pixels": reader.max_pixels,
+        "max_side": VISION_RENDER.max_side,
+        "media_resolution": reader.media_resolution,
+        "pass": reader_pass,
+        "prompt_variant": reader.prompt_variant,
+        "reader": reader.name,
+        "render_version": VISION_RENDER.version,
+        "sampling_profile": reader.sampling_profile,
+        "thinking": reader.thinking,
+    }
+    if reader.band_prompt_variant is not None:
+        # Only readers with the band read carry the key: every other key is unchanged.
+        params["band"] = {
+            "prompt_variant": reader.band_prompt_variant,
+            "top": BAND_TOP,
+            "version": BAND_VERSION,
+        }
+    return params
 
 
 # --------------------------------------------------------------------------- eligibility
@@ -351,10 +395,19 @@ def purge_idle_pages(engine: Engine, *, now: datetime) -> int:
         )
         .exists()
     )
+    consensus_pending = (
+        sa.select(CONSENSUS_RUNS.c.id)
+        .where(
+            CONSENSUS_RUNS.c.workspace_id == PAGES.c.workspace_id,
+            CONSENSUS_RUNS.c.document_version_id == PAGES.c.document_version_id,
+            CONSENSUS_RUNS.c.status == "queued",
+        )
+        .exists()
+    )
     with engine.begin() as connection:
         result = connection.execute(
             sa.update(PAGES)
-            .where(PAGES.c.image.is_not(None), ~live)
+            .where(PAGES.c.image.is_not(None), ~live, ~consensus_pending)
             .values(image=None, purged_at=now)
         )
     return int(result.rowcount or 0)
@@ -382,10 +435,138 @@ def provider_images(
 
 
 def prompt_for(
-    doc_type: DocTypeName, pages: Sequence[PageRow], resolution: MediaResolution
+    doc_type: DocTypeName, pages: Sequence[PageRow], reader: VisionReaderInfo
 ) -> PromptPayload | None:
-    images = provider_images(pages, resolution)
-    return vision_prompt(doc_type, images) if images else None
+    """The reader's prompt variant and schema dialect over these page images."""
+
+    images = provider_images(pages, reader.media_resolution)
+    if not images:
+        return None
+    return vision_prompt(
+        doc_type, images, variant=reader.prompt_variant, dialect=reader.schema_dialect
+    )
+
+
+def page_prompts(
+    doc_type: DocTypeName, pages: Sequence[PageRow], reader: VisionReaderInfo
+) -> tuple[PromptPayload, ...] | None:
+    """One payload per page for a reader that reads one page per call (WI-BE2).
+
+    Each payload is the reader's prompt over a single page image; ``None`` when any
+    page's bytes are gone. A reader without ``pages_per_call`` gets no split.
+    """
+
+    if reader.pages_per_call is None:
+        return ()
+    if reader.pages_per_call != 1:
+        raise ValueError("only one page per call is supported")
+    payloads: list[PromptPayload] = []
+    for page in pages:
+        payload = prompt_for(doc_type, [page], reader)
+        if payload is None:
+            return None
+        payloads.append(payload)
+    return tuple(payloads)
+
+
+def merge_page_answers(output_texts: Sequence[str], *, pages: Sequence[int]) -> str:
+    """The per-page answers as one ``vision.schema.v4`` answer (JSON text).
+
+    Each answer's top level must parse on its own; items placed on a page other than
+    the one sent are dropped by the core merge. The other items are merged as
+    answered, so the parse of the merged answer is the one place a schema-breaking
+    item is dropped and counted (D73).
+    """
+
+    if len(output_texts) != len(pages):
+        raise InvalidOutput("invalid_output", "one answer per page is required")
+    answers = []
+    for page, text in zip(pages, output_texts, strict=True):
+        parse_output(HOOK, text)
+        answers.append((page, json.loads(text)))
+    merged = merge_page_readings(answers)
+    if merged.dropped_off_page:
+        _LOGGER.info("vision_page_merge dropped_off_page=%d", merged.dropped_off_page)
+    return json.dumps(merged.answer, ensure_ascii=False, separators=(",", ":"))
+
+
+def band_prompt(
+    doc_type: DocTypeName, band: PageRow, reader: VisionReaderInfo
+) -> PromptPayload | None:
+    """The reader's band prompt over page 1's header band (WI-Q2), or ``None``."""
+
+    if reader.band_prompt_variant is None:
+        return None
+    images = provider_images([band], reader.media_resolution)
+    if not images:
+        return None
+    return vision_prompt(
+        doc_type, images, variant=reader.band_prompt_variant, dialect=reader.schema_dialect
+    )
+
+
+def _band_box(box: object, top: int, order: BoxOrder) -> list[int] | None:
+    """A band box on the page's 0-1000 scale: only the vertical edges are rescaled."""
+
+    if not (isinstance(box, list) and len(box) == 4 and all(type(v) is int for v in box)):
+        return None
+    moved = list(box)
+    for index in (0, 2) if order == "yx" else (1, 3):
+        moved[index] = round(moved[index] * top / 1000)
+    return moved
+
+
+def _note_key(item: Mapping[str, Any]) -> tuple[str, str]:
+    return (str(item.get("looks_like", "")), "".join(str(item.get("text", "")).split()).upper())
+
+
+def merge_answers_with_band(
+    output_texts: Sequence[str],
+    *,
+    pages: Sequence[int],
+    band_page: int,
+    band_top: int = BAND_TOP,
+    box_order: BoxOrder = "yx",
+) -> str:
+    """Per-page answers plus a last header-band answer as one answer (WI-Q2, D93).
+
+    The page answers merge as :func:`merge_page_answers`. From the band answer only
+    its annotations are taken (handwritten or stamped text, never a field or a line),
+    moved to page ``band_page`` with their boxes rescaled from the band to the page;
+    one the page answers already hold (same type and text) is not added twice. A band
+    answer that does not parse is ignored and logged: the band adds hints, it never
+    fails a reading.
+    """
+
+    if len(output_texts) != len(pages) + 1:
+        raise InvalidOutput("invalid_output", "one answer per page and one band answer")
+    merged = json.loads(merge_page_answers(output_texts[:-1], pages=pages))
+    try:
+        parse_output(HOOK, output_texts[-1])
+        band = json.loads(output_texts[-1])
+    except (InvalidOutput, ValueError) as exc:
+        _LOGGER.info("vision_band_ignored reason=%s", getattr(exc, "code", type(exc).__name__))
+        return json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+    notes = merged.setdefault("annotations", [])
+    seen = {_note_key(item) for item in notes if isinstance(item, Mapping)}
+    added = dropped = 0
+    raw = band.get("annotations") if isinstance(band, Mapping) else None
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, Mapping):
+            dropped += 1
+            continue
+        box = _band_box(item.get("box_2d"), band_top, box_order)
+        # The band call saw one image, sent as page 1 of the document.
+        if box is None or type(item.get("page")) is not int or item["page"] != band_page:
+            dropped += 1
+            continue
+        if _note_key(item) in seen:
+            continue
+        seen.add(_note_key(item))
+        notes.append({**dict(item), "page": band_page, "box_2d": box})
+        added += 1
+    _LOGGER.info("vision_band_merge added=%d dropped=%d", added, dropped)
+    return json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
 
 
 # --------------------------------------------------------------------------- checking
@@ -400,6 +581,10 @@ class VisionContext:
     buyer_entities: tuple[BuyerEntityHint, ...] = ()
     gst_rates: tuple[Decimal, ...] = ()
     ocr: Document | None = None
+    as_of: date | None = None
+    """Day the D42 date window is measured from; ``None`` skips that check."""
+    box_order: BoxOrder = "yx"
+    """Coordinate order the reader returns; ``xy`` boxes are swapped before any check."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,18 +597,26 @@ class VisionValidation:
         return self.check.accepted_count > 0
 
 
-def reading_from_output(output: VisionOutput) -> VisionReading:
+def _yx(box: Sequence[int], order: BoxOrder) -> tuple[int, ...]:
+    """``[ymin, xmin, ymax, xmax]``; an ``xy`` box ``[xmin, ymin, xmax, ymax]`` is swapped."""
+
+    if order == "xy" and len(box) == 4:
+        return (box[1], box[0], box[3], box[2])
+    return tuple(box)
+
+
+def reading_from_output(output: VisionOutput, *, box_order: BoxOrder = "yx") -> VisionReading:
     return VisionReading(
         doc_kind=output.doc_kind,
         pages=tuple(VisionPageKind(item.page, item.kind, item.title) for item in output.pages),
         fields=tuple(
-            VisionField(item.name, item.text, item.page, tuple(item.box_2d), item.label)
+            VisionField(item.name, item.text, item.page, _yx(item.box_2d, box_order), item.label)
             for item in output.fields
         ),
         lines=tuple(
             VisionLine(
                 item.page,
-                tuple(item.box_2d),
+                _yx(item.box_2d, box_order),
                 {
                     name: value
                     for name, value in item.model_dump(exclude={"page", "box_2d"}).items()
@@ -433,8 +626,14 @@ def reading_from_output(output: VisionOutput) -> VisionReading:
             for item in output.lines
         ),
         annotations=tuple(
-            VisionAnnotation(item.kind, item.text, item.looks_like, item.page, tuple(item.box_2d))
+            VisionAnnotation(
+                item.kind, item.text, item.looks_like, item.page, _yx(item.box_2d, box_order)
+            )
             for item in output.annotations
+        ),
+        unreadable=tuple(
+            VisionUnreadable(item.name, item.page, _yx(item.box_2d, box_order))
+            for item in output.unreadable
         ),
     )
 
@@ -442,10 +641,18 @@ def reading_from_output(output: VisionOutput) -> VisionReading:
 def validate_vision(output: VisionOutput, context: VisionContext) -> VisionValidation:
     """Check an answer; raise ``ungrounded`` when it had readings and none survived."""
 
-    reading = reading_from_output(output)
+    reading = reading_from_output(output, box_order=context.box_order)
     check = check_reading(
-        reading, pages=context.pages, buyer_entities=context.buyer_entities, ocr=context.ocr
+        reading,
+        pages=context.pages,
+        buyer_entities=context.buyer_entities,
+        ocr=context.ocr,
+        as_of=context.as_of,
     )
+    if output.schema_dropped:
+        dropped = Counter(check.dropped)
+        dropped.update(output.schema_dropped)
+        check = replace(check, dropped=MappingProxyType(dict(dropped)))
     if reading.item_count and not check.accepted_count:
         raise InvalidOutput("ungrounded", "no reading survived the page, box and rule checks")
     document = vision_document(
@@ -537,6 +744,8 @@ def context_for(
     version_id: UUID,
     doc_type: DocTypeName,
     pages: Sequence[PageRow],
+    *,
+    box_order: BoxOrder = "yx",
 ) -> VisionContext:
     buyers, rates = party_hints(connection, workspace_id)
     return VisionContext(
@@ -545,6 +754,8 @@ def context_for(
         buyer_entities=buyers,
         gst_rates=rates,
         ocr=ocr_document(connection, workspace_id, version_id, doc_type),
+        as_of=datetime.now(UTC).date(),
+        box_order=box_order,
     )
 
 
@@ -566,12 +777,16 @@ __all__ = [
     "VisionFacts",
     "VisionSubject",
     "VisionValidation",
+    "band_prompt",
     "context_for",
     "eligibility",
     "fingerprint",
     "load_pages",
     "load_subject",
+    "merge_answers_with_band",
+    "merge_page_answers",
     "ocr_document",
+    "page_prompts",
     "party_hints",
     "prompt_for",
     "provider_images",

@@ -304,6 +304,29 @@ def test_scn_05_missing_grn_is_pending_then_ages_to_exception() -> None:
     assert delivered.status is CaseStatus.MATCHED
 
 
+def test_scn_05_aged_grn_pending_review_case_is_promoted_to_exception() -> None:
+    po = _record(1, _document(_po_xml().replace("20260101", "20260115"), DocType.PO), DocType.PO)
+    invoice = _record(3, _document(_invoice_xml("INV-2201", 10), DocType.INVOICE), DocType.INVOICE)
+    review_document = invoice.document.model_copy(
+        update={"reason_codes": (ReasonCode.NO_TEXT_LAYER,)}
+    )
+    invoice = invoice.model_copy(update={"document": review_document})
+    snapshot = ReconciliationSnapshot(
+        documents=(po, invoice),
+        links=(_link(11, invoice.document_id, po.document_id),),
+    )
+
+    review = evaluate(snapshot, ReconciliationConfig(), date(2026, 2, 28))[0]
+    aged = evaluate(snapshot, ReconciliationConfig(), date(2026, 3, 5))[0]
+
+    assert review.status is CaseStatus.NEEDS_REVIEW
+    assert not review.aged
+    assert aged.status is CaseStatus.EXCEPTION
+    assert aged.aged
+    assert ReasonCode.GRN_PENDING in aged.reason_codes
+    assert ReasonCode.NO_TEXT_LAYER in aged.reason_codes
+
+
 def test_scn_17_prior_period_documents_are_in_scope_and_absent_po_stays_unlinked() -> None:
     po = _record(
         1,
@@ -615,6 +638,7 @@ def test_near_duplicate_is_flagged_for_review_but_not_blocked_as_exact() -> None
 
     assert results[1].status is CaseStatus.NEEDS_REVIEW
     assert ReasonCode.DUP_SUSPECTED in results[1].reason_codes
+    assert results[1].lines[0].billed_before == Decimal("1")
     assert any(
         check.check_id == "s1.suspected_duplicate"
         and check.evidence.get("possible_duplicate_of_id") == str(first.document_id)
@@ -662,28 +686,59 @@ def test_reconciliation_helpers_cover_amount_ledger_rate_and_payment_terms() -> 
     assert _rule(ReconciliationConfig(tolerances={}), "missing", _VENDOR, None).pct == 0
 
 
-def test_near_duplicate_requires_date_total_vendor_and_close_invoice_number() -> None:
-    first = _record(21, _document(_invoice_xml("INV-2201", 1), DocType.INVOICE), DocType.INVOICE)
-    close = _record(22, _document(_invoice_xml("INV-2202", 1), DocType.INVOICE), DocType.INVOICE)
-    wrong_total = _record(
-        23, _document(_invoice_xml("INV-2203", 2), DocType.INVOICE), DocType.INVOICE
+def test_duplicate_suspicion_uses_folded_number_or_complete_line_amounts() -> None:
+    first = _record(
+        21,
+        _document(_invoice_xml("INV-OI-2201", 1, rate=100), DocType.INVOICE),
+        DocType.INVOICE,
     )
-    different_vendor = _record(
-        24, _document(_invoice_xml("INV-2204", 1), DocType.INVOICE), DocType.INVOICE
+    folded_number = _record(
+        22,
+        _document(
+            _invoice_xml("INV-01-2201", 1, rate=101).replace("20260201", "20260204"),
+            DocType.INVOICE,
+        ),
+        DocType.INVOICE,
+    )
+    line_amount_match = _record(
+        23,
+        _document(
+            _invoice_xml("UNRELATED-2204", 1, rate=100).replace("20260201", "20260203"),
+            DocType.INVOICE,
+        ),
+        DocType.INVOICE,
     ).model_copy(update={"vendor_id": UUID(int=501)})
+    wrong_total = _record(
+        24,
+        _document(
+            _invoice_xml("INV-01-2201", 1, rate=103).replace("20260201", "20260204"),
+            DocType.INVOICE,
+        ),
+        DocType.INVOICE,
+    )
+    outside_window = _record(
+        25,
+        _document(
+            _invoice_xml("UNRELATED-2206", 1, rate=100).replace("20260201", "20260210"),
+            DocType.INVOICE,
+        ),
+        DocType.INVOICE,
+    )
     snapshot = ReconciliationSnapshot(
-        documents=(first, close, wrong_total, different_vendor),
-        vendor_pan_by_id={_VENDOR: "AAPFU0939F", UUID(int=501): "OTHER12345"},
+        documents=(first, folded_number, line_amount_match, wrong_total, outside_window),
     )
 
     exact, suspected = engine_module._duplicate_map(
-        (first, close, wrong_total, different_vendor),
+        (first, folded_number, line_amount_match, wrong_total, outside_window),
         snapshot,
-        ReconciliationConfig(duplicate_suspect_edit_distance=1),
+        ReconciliationConfig(),
     )
 
     assert not exact
-    assert suspected == {close.document_id: first.document_id}
+    assert suspected == {
+        folded_number.document_id: first.document_id,
+        line_amount_match.document_id: first.document_id,
+    }
 
 
 def test_duplicate_scan_skips_non_invoice_records_and_invoices_without_a_date() -> None:

@@ -20,8 +20,25 @@ from reconbench_core.parsers.common import (
     normalize_label,
 )
 from reconbench_core.parsers.parties import guard_result
+from reconbench_core.parsers.tally import (
+    Sanitized,
+    is_native_voucher,
+    is_order_number,
+    plain_decimal,
+    removal_message,
+    sanitize,
+    voucher_facts,
+)
 from reconbench_core.parsers.types import ParseResult, ParserHints, ParseWarning
-from reconbench_core.schema import DocType, Document, FieldSource, FileFormat, ReasonCode
+from reconbench_core.schema import (
+    DocType,
+    Document,
+    FieldOrigin,
+    FieldSource,
+    FileFormat,
+    ReasonCode,
+    WarnLevel,
+)
 
 _DOCUMENT_TAGS = {
     "VOUCHER",
@@ -168,6 +185,7 @@ def _document_type(element: etree._Element, hints: ParserHints) -> DocType | Non
             "goodsreceipt",
             "material receipt",
             "materialreceipt",
+            "receipt note",
             "grn",
             "mrn",
         )
@@ -275,6 +293,117 @@ def _custom_xpath_value(element: etree._Element, expression: str) -> str | None:
     return None
 
 
+def _apply_native_tally(
+    element: etree._Element,
+    doc_type: DocType,
+    header_raw: dict[str, str],
+    raw_lines: list[dict[str, str]],
+    raw_nodes: list[etree._Element | None],
+    line_extras: list[dict[str, Any]],
+    line_alternatives: list[dict[str, list[str]]],
+    *,
+    custom_fields: set[str],
+    locator: str,
+) -> list[ParseWarning]:
+    """Native Tally voucher (WI-IMP1, D95): item text, signs, ledger totals, GRN orders."""
+
+    facts = voucher_facts(element)
+    warnings: list[ParseWarning] = []
+    signs: list[str] = []
+    for index, node in enumerate(raw_nodes):
+        line = facts.lines.get(node) if node is not None else None
+        if line is None:
+            continue
+        raw = raw_lines[index]
+        # The item text is BASICUSERDESCRIPTION; the stock item name stays the item name.
+        if line.user_description:
+            raw["description"] = line.user_description
+        if line.stock_item:
+            line_extras[index] = {**line_extras[index], "stock_item_name": line.stock_item}
+        if line.gst_rate is not None:
+            raw["tax_rate"] = plain_decimal(line.gst_rate)
+        amount = raw.get("amount", "")
+        if line.deemed_positive and amount.startswith("-"):
+            raw["amount"] = amount[1:].strip()
+            signs.append(f"line {index + 1} amount {amount!r}")
+            alternatives = line_alternatives[index].get("amount")
+            if alternatives:
+                line_alternatives[index]["amount"] = [
+                    value[1:].strip() if value.startswith("-") else value for value in alternatives
+                ]
+        if doc_type is DocType.GRN and line.order_numbers and not raw.get("po_ref"):
+            raw["po_ref"] = line.order_numbers[0]
+    if signs:
+        warnings.append(
+            ParseWarning(
+                code="TALLY_SIGN_NORMALISED",
+                level=WarnLevel.INFO,
+                message=(
+                    "Tally exports purchase-side amounts as negative debits; stored as "
+                    "magnitudes: " + "; ".join(signs) + "."
+                ),
+                locator=locator,
+            )
+        )
+    if doc_type in {DocType.PO, DocType.GRN}:
+        totals = facts.totals()
+        if totals is not None:
+            filled = [name for name in totals if not header_raw.get(name)]
+            for name in filled:
+                header_raw[name] = plain_decimal(totals[name])
+            if filled:
+                warnings.append(
+                    ParseWarning(
+                        code="TALLY_TOTALS_FROM_LEDGERS",
+                        level=WarnLevel.INFO,
+                        message=(
+                            f"Header totals ({', '.join(sorted(filled))}) read from the party "
+                            "and tax ledger entries; they close against the lines within 1."
+                        ),
+                        locator=locator,
+                    )
+                )
+        elif facts.party_entries == 1 and facts.party_amount is not None:
+            if not header_raw.get("grand_total"):
+                header_raw["grand_total"] = plain_decimal(abs(facts.party_amount))
+            warnings.append(
+                ParseWarning(
+                    code="TALLY_TOTALS_NOT_CLOSED",
+                    message=(
+                        "The party ledger amount does not close against the lines, tax and "
+                        "round-off ledgers; only the voucher total was read."
+                    ),
+                    locator=locator,
+                )
+            )
+    if doc_type is DocType.GRN:
+        # A Receipt Note names its purchase order in REFERENCE and in each line's ORDERNO.
+        named = list(dict.fromkeys(ref for ref in (facts.reference, *facts.order_numbers) if ref))
+        if "po_refs" not in custom_fields:
+            # A part without a digit is not an order number (Tally's "Not Applicable").
+            existing = [
+                part.strip()
+                for part in header_raw.get("po_refs", "").split(";")
+                if is_order_number(part)
+            ]
+            merged = list(dict.fromkeys(part for part in (*existing, *named) if part))
+            if merged:
+                header_raw["po_refs"] = ";".join(merged)
+            named = merged
+        if len(named) > 1:
+            warnings.append(
+                ParseWarning(
+                    code="TALLY_GRN_MULTIPLE_PO_REFS",
+                    message=(
+                        f"This receipt note names {len(named)} purchase orders (REFERENCE and "
+                        "line ORDERNO); check which order each line belongs to."
+                    ),
+                    locator=locator,
+                )
+            )
+    return warnings
+
+
 def _parse_one(
     element: etree._Element,
     hints: ParserHints,
@@ -292,6 +421,7 @@ def _parse_one(
     line_node_set = set(line_nodes)
 
     header_alternatives: dict[str, list[str]] = {}
+    custom_fields: set[str] = set()
     header_raw = _raw_fields(
         element,
         _HEADER_FIELDS,
@@ -308,8 +438,10 @@ def _parse_one(
             if custom_value:
                 header_raw[canonical] = custom_value
                 header_alternatives.pop(canonical, None)
+                custom_fields.add(canonical)
 
     raw_lines: list[dict[str, str]] = []
+    raw_nodes: list[etree._Element | None] = []
     line_alternatives: list[dict[str, list[str]]] = []
     line_extras: list[dict[str, Any]] = []
     for line_node in line_nodes:
@@ -323,6 +455,7 @@ def _parse_one(
         if raw_line:
             _unit_from_measures(raw_line)
             raw_lines.append(raw_line)
+            raw_nodes.append(line_node)
             line_alternatives.append(raw_line_alternatives)
             line_extras.append(_extras(line_node, known_tags))
 
@@ -337,8 +470,23 @@ def _parse_one(
         )
         if any(name in single_line for name in ("description", "quantity", "rate", "amount")):
             raw_lines.append(single_line)
+            raw_nodes.append(None)
             line_alternatives.append(single_line_alternatives)
             line_extras.append({})
+
+    tally_warnings: list[ParseWarning] = []
+    if is_native_voucher(element):
+        tally_warnings = _apply_native_tally(
+            element,
+            doc_type,
+            header_raw,
+            raw_lines,
+            raw_nodes,
+            line_extras,
+            line_alternatives,
+            custom_fields=custom_fields,
+            locator=locator,
+        )
 
     document, warnings = build_document(
         doc_type=doc_type,
@@ -350,12 +498,13 @@ def _parse_one(
         line_alternatives=line_alternatives,
         locator=locator,
         source=FieldSource.RULE,
+        origin=FieldOrigin.ERP_IMPORT,
         base_confidence=Decimal("0.95"),
         same_file_dates=same_file_dates,
         uom_aliases=hints.uom_aliases,
         charge_keywords=hints.charge_keywords,
     )
-    return document, warnings
+    return document, (*tally_warnings, *warnings)
 
 
 def _dbc_rows(root: etree._Element) -> list[list[etree._Element]]:
@@ -684,6 +833,7 @@ def _parse_dbc_flat(root: etree._Element, hints: ParserHints, tag_names: set[str
             line_extras=line_extras,
             locator=record_locator,
             source=FieldSource.RULE,
+            origin=FieldOrigin.ERP_IMPORT,
             base_confidence=Decimal("0.95"),
             uom_aliases=hints.uom_aliases,
             charge_keywords=hints.charge_keywords,
@@ -755,8 +905,65 @@ def parse_xml(content: bytes, hints: ParserHints) -> ParseResult:
 
 
 def _parse_xml(content: bytes, hints: ParserHints) -> ParseResult:
-    """Parse secure XML bytes into zero or more canonical documents."""
+    """Parse secure XML bytes into zero or more canonical documents.
 
+    A file that fails the strict parse is tried once more without the characters XML
+    1.0 forbids (Tally's ``&#4;`` marker, stray control characters; WI-IMP1, D95); each
+    removal is logged on the voucher it sat in. A file that parses is read unchanged.
+    """
+
+    result = _parse_xml_bytes(content, hints)
+    if result.reason_code != "XML_PARSE_ERROR" or len(content) > hints.max_bytes:
+        return result
+    sanitized = sanitize(content)
+    if sanitized is None:
+        return result
+    return _parse_xml_bytes(sanitized.content, hints, sanitized)
+
+
+def _removal_warnings(
+    element: etree._Element,
+    doc_type: DocType,
+    sanitized: Sanitized,
+    voucher_order: Mapping[etree._Element, int],
+    synonyms: Mapping[str, tuple[str, ...]],
+) -> list[ParseWarning]:
+    ordinal = voucher_order.get(element)
+    if ordinal is None:
+        return []
+    counts = sanitized.for_voucher(ordinal)
+    if not counts:
+        return []
+    # A removal inside a field the parser reads changed that value: a warning, not a note.
+    # A tag is read only in its own scope: header fields outside the line entries, line
+    # fields inside them.
+    header_tags = set(alias_to_field(synonyms, _HEADER_FIELDS_BY_TYPE[doc_type]))
+    line_tags = set(alias_to_field(synonyms, _LINE_FIELDS))
+    line_nodes = set(_line_nodes(element))
+    removed = {normalize_label(tag).replace(" ", "") for tag in counts}
+    read = False
+    for node in element.iter():
+        tag = _tag_name(node)
+        if tag not in removed:
+            continue
+        inside = _inside_line_node(node, line_nodes)
+        if (inside and tag in line_tags) or (not inside and tag in header_tags):
+            read = True
+            break
+    level = WarnLevel.WARNING if read else WarnLevel.INFO
+    return [
+        ParseWarning(
+            code="XML_INVALID_CHARACTERS_REMOVED",
+            level=level,
+            message=removal_message(counts),
+            locator=element.getroottree().getpath(element),
+        )
+    ]
+
+
+def _parse_xml_bytes(
+    content: bytes, hints: ParserHints, sanitized: Sanitized | None = None
+) -> ParseResult:
     empty_signature = hashlib.sha256(b"xml:empty").hexdigest()
     if len(content) > hints.max_bytes:
         return ParseResult(
@@ -870,6 +1077,25 @@ def _parse_xml(content: bytes, hints: ParserHints) -> ParseResult:
         )
         documents = []
         warnings = []
+        voucher_order: dict[etree._Element, int] = {}
+        if sanitized is not None:
+            vouchers = [node for node in root.iter() if _tag_name(node) == "VOUCHER"]
+            if len(vouchers) == sanitized.voucher_count:
+                voucher_order = {node: index for index, node in enumerate(vouchers)}
+            unplaced = sanitized.outside_vouchers()
+            if not voucher_order:
+                unplaced = sum(sanitized.removed.values())
+            if unplaced:
+                warnings.append(
+                    ParseWarning(
+                        code="XML_INVALID_CHARACTERS_REMOVED",
+                        level=WarnLevel.INFO,
+                        message=(
+                            f"Removed {unplaced} characters XML does not allow outside the "
+                            "vouchers read (masters are ignored); the text around them was kept."
+                        ),
+                    )
+                )
         for element in record_elements:
             try:
                 document, document_warnings = _parse_one(
@@ -899,6 +1125,16 @@ def _parse_xml(content: bytes, hints: ParserHints) -> ParseResult:
                 continue
             documents.append(document)
             warnings.extend(document_warnings)
+            if sanitized is not None:
+                warnings.extend(
+                    _removal_warnings(
+                        element,
+                        document.header.doc_type,
+                        sanitized,
+                        voucher_order,
+                        synonyms,
+                    )
+                )
 
         if not documents:
             return ParseResult(

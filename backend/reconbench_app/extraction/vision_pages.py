@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from PIL import Image, ImageDraw
+from reconbench_core.extraction.consensus import CropNeed
 
 from reconbench_app.ai.redaction import (
     IMAGE_MASK_VERSION,
@@ -33,6 +35,8 @@ from reconbench_app.extraction.vision import VISION_RENDER, VisionRenderSpec
 
 VISION_CPU_SECONDS = 150
 VISION_WALL_SECONDS = 180
+CONSENSUS_CROP_CPU_SECONDS = 180
+CONSENSUS_CROP_WALL_SECONDS = 210
 _POINTS_PER_INCH = 72
 
 
@@ -41,6 +45,118 @@ class _Geometry:
     source: str
     rotation: int
     skew: float
+
+
+@dataclass(frozen=True, slots=True)
+class CropReadPage:
+    """Transient masked page bytes and the geometry needed for crop coordinates."""
+
+    page: int
+    data: bytes
+    sha256: str
+    width: int
+    height: int
+
+
+def _crop_read_results(payload: dict[str, Any]) -> dict[str, str | None]:
+    return {str(key): (str(text) if text is not None else None) for key, text in payload["reads"]}
+
+
+def _crop_read_child_main(
+    connection: Any,
+    start_event: Any,
+    pages: tuple[tuple[int, bytes, str, int, int], ...],
+    needs: tuple[tuple[str, int, tuple[int, int, int, int], str, str], ...],
+    languages: tuple[str, ...],
+    round_no: int,
+    cpu_seconds: int,
+    memory_bytes: int,
+) -> None:
+    try:
+        if not start_event.wait(timeout=10):
+            connection.send({"child_error": True})
+            return
+        from reconbench_app.pdf_sandbox import _set_posix_limits
+
+        _set_posix_limits(cpu_seconds, memory_bytes)
+        from reconbench_app.extraction.local_hybrid import reread_crop
+
+        image_by_page: dict[int, Image.Image] = {}
+        for number, data, digest, width, height in pages:
+            if hashlib.sha256(data).hexdigest() != digest:
+                continue
+            image = Image.open(io.BytesIO(data)).convert("RGB")
+            if image.size == (width, height):
+                image_by_page[number] = image
+        reads: list[tuple[str, str | None]] = []
+        for key, number, box, mode, kind in needs:
+            page_image = image_by_page.get(number)
+            text: str | None = None
+            if page_image is not None:
+                ymin, xmin, ymax, xmax = box
+                pixel_box = (
+                    xmin * page_image.width // 1000,
+                    ymin * page_image.height // 1000,
+                    -(-xmax * page_image.width // 1000),
+                    -(-ymax * page_image.height // 1000),
+                )
+                try:
+                    text = reread_crop(
+                        page_image,
+                        pixel_box,
+                        languages=languages,
+                        mode=mode,
+                        kind=kind,
+                        round_no=round_no,
+                    )
+                except (OSError, ValueError, RuntimeError):
+                    text = None
+            reads.append((key, text))
+        connection.send({"reads": reads})
+    except BaseException:
+        connection.send({"child_error": True})
+    finally:
+        connection.close()
+
+
+def reread_vision_crops_isolated(
+    pages: Sequence[CropReadPage],
+    needs: Sequence[CropNeed],
+    *,
+    languages: tuple[str, ...] = ("eng",),
+    round_no: int = 1,
+) -> dict[str, str | None] | None:
+    """Re-read checked vision boxes with one bounded local OCR strategy."""
+
+    if not needs:
+        return {}
+    if round_no not in {1, 2}:
+        raise ValueError("round_no must be 1 or 2")
+    page_payload = tuple(
+        (page.page, page.data, page.sha256, page.width, page.height) for page in pages
+    )
+    need_payload = tuple(
+        (need.key.text(), need.page, need.box, need.mode, need.kind) for need in needs
+    )
+    from reconbench_app.pdf_sandbox import PDF_MEMORY_BYTES, _run_child
+
+    result: dict[str, str | None] | None = _run_child(
+        _crop_read_child_main,
+        (
+            page_payload,
+            need_payload,
+            languages,
+            round_no,
+            CONSENSUS_CROP_CPU_SECONDS,
+            PDF_MEMORY_BYTES,
+        ),
+        name="reconbench-consensus-crops",
+        cpu_seconds=CONSENSUS_CROP_CPU_SECONDS,
+        memory_bytes=PDF_MEMORY_BYTES,
+        wall_seconds=CONSENSUS_CROP_WALL_SECONDS,
+        convert=_crop_read_results,
+    )
+    return result
 
 
 def _words_and_image(
@@ -257,9 +373,13 @@ def vision_pages_isolated(
 
 
 __all__ = [
+    "CONSENSUS_CROP_CPU_SECONDS",
+    "CONSENSUS_CROP_WALL_SECONDS",
     "VISION_CPU_SECONDS",
     "VISION_WALL_SECONDS",
+    "CropReadPage",
     "render_page",
     "render_vision_pages",
+    "reread_vision_crops_isolated",
     "vision_pages_isolated",
 ]

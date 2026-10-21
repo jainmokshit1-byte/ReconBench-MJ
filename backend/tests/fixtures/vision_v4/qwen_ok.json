@@ -1,0 +1,138 @@
+{
+  "doc_kind": "invoice",
+  "pages": [
+    {
+      "page": 1,
+      "kind": "invoice",
+      "title": "TAX INVOICE"
+    }
+  ],
+  "fields": [
+    {
+      "name": "doc_no",
+      "text": "SYN-INV-0001",
+      "label": "Invoice No.",
+      "page": 1,
+      "box_2d": [
+        80,
+        620,
+        100,
+        820
+      ]
+    },
+    {
+      "name": "doc_date",
+      "text": "01-04-2026",
+      "label": "Dated",
+      "page": 1,
+      "box_2d": [
+        105,
+        620,
+        125,
+        760
+      ]
+    },
+    {
+      "name": "supplier_name",
+      "text": "Synthetic Supplier Pvt Ltd",
+      "label": null,
+      "page": 1,
+      "box_2d": [
+        60,
+        40,
+        85,
+        420
+      ]
+    },
+    {
+      "name": "supplier_gstin",
+      "text": "29AAACS9999K1Z9",
+      "label": "GSTIN",
+      "page": 1,
+      "box_2d": [
+        90,
+        40,
+        110,
+        330
+      ]
+    },
+    {
+      "name": "taxable_total",
+      "text": "1,000.00",
+      "label": "Taxable Value",
+      "page": 1,
+      "box_2d": [
+        700,
+        780,
+        720,
+        960
+      ]
+    },
+    {
+      "name": "igst_total",
+      "text": "180.00",
+      "label": "IGST 18%",
+      "page": 1,
+      "box_2d": [
+        725,
+        780,
+        745,
+        960
+      ]
+    },
+    {
+      "name": "grand_total",
+      "text": "1,180.00",
+      "label": "Total",
+      "page": 1,
+      "box_2d": [
+        750,
+        780,
+        770,
+        960
+      ]
+    }
+  ],
+  "lines": [
+    {
+      "page": 1,
+      "box_2d": [
+        400,
+        30,
+        425,
+        970
+      ],
+      "description": "Synthetic widget",
+      "quantity": "10",
+      "rate": "100.00",
+      "amount": "1,000.00",
+      "uom": "Nos",
+      "line_no": "1",
+      "hsn_sac": "8471",
+      "item_code": null,
+      "discount": null,
+      "tax_rate": null,
+      "cgst": null,
+      "sgst": null,
+      "igst": null,
+      "received_qty": null,
+      "accepted_qty": null,
+      "rejected_qty": null,
+      "serials": null,
+      "po_ref": null
+    }
+  ],
+  "annotations": [],
+  "unreadable": [
+    {
+      "name": "po_ref",
+      "page": 1,
+      "box_2d": [
+        130,
+        620,
+        150,
+        820
+      ]
+    }
+  ]
+}

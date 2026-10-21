@@ -628,6 +628,9 @@ class ReconciliationService:
                         )
                         .where(
                             link_current.c.workspace_id == workspace_id,
+                            # Only PO edges feed the snapshot: an invoice-to-GRN relation
+                            # is evidence for matching, not a PO link (WI-IMP1, D95).
+                            link_current.c.link_type.in_(("inv_po", "grn_po")),
                             # A pending AI suggestion never feeds verdicts (SCN-20).
                             sa.not_(sa.and_(link.c.ai_suggested, link.c.state == "suggested")),
                         )

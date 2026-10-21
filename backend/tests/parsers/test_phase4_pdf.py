@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import io
-import shutil
-import subprocess
 
 import pytest
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from reconbench_app.pdf_sandbox import parse_pdf_isolated
 from reconbench_core.parsers import parse
 from reconbench_core.parsers import pdf as pdf_parser
-from reconbench_core.parsers.types import ParserHints
+from reconbench_core.parsers.types import BuyerEntityHint, ParserHints
 from reconbench_core.schema import DocType, FileFormat, ReasonCode
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -20,6 +18,7 @@ from reportlab.lib.pdfencrypt import StandardEncryption
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from reportlab.platypus import Table, TableStyle
+from tests.support.scan_images import scanned_invoice_pdf, tesseract_with_english
 
 
 def _searchable_invoice_pdf() -> bytes:
@@ -272,12 +271,7 @@ def _scanned_pdf() -> bytes:
 
 def _scanned_invoice_pdf() -> bytes:
     """Build a readable image-only invoice fixture without a hidden text layer."""
-    stream = io.BytesIO()
-    page = canvas.Canvas(stream, pagesize=letter)
-    image = Image.new("RGB", (1700, 2200), "white")
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=42)
-    for index, line in enumerate(
+    return scanned_invoice_pdf(
         (
             "TAX INVOICE",
             "Invoice Number: OCR-SYN-2026-001",
@@ -291,12 +285,7 @@ def _scanned_invoice_pdf() -> bytes:
             "SGST: 18.00",
             "Total Value: 236.00",
         )
-    ):
-        draw.text((110, 120 + index * 170), line, fill="black", font=font)
-    page.drawImage(ImageReader(image), 36, 36, width=540, height=720)
-    page.showPage()
-    page.save()
-    return stream.getvalue()
+    )
 
 
 def _encrypted_pdf() -> bytes:
@@ -424,10 +413,22 @@ def test_pdf_extracts_party_gstins_po_reference_and_total_in_words(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(pdf_parser, "_extract_tables", lambda *_args: ([], set()))
+    content = _invoice_with_party_blocks_and_amount_words_pdf()
     result = parse(
-        _invoice_with_party_blocks_and_amount_words_pdf(),
-        {"file_format": FileFormat.PDF, "doc_type": DocType.INVOICE},
+        content,
+        {
+            "file_format": FileFormat.PDF,
+            "doc_type": DocType.INVOICE,
+            "buyer_entities": (
+                BuyerEntityHint(gstin="29AABCU9603R1ZM", name="Example Buyer Limited"),
+            ),
+        },
     )
+    # Without buyer entities the unlabelled heading beside an unproven GSTIN may be the
+    # buyer's own, so it is left for review (scan fix WI-3, D60).
+    unconfigured = parse(content, {"file_format": FileFormat.PDF, "doc_type": DocType.INVOICE})
+    assert unconfigured.documents[0].header.vendor_name is None
+    assert "vendor_name" in unconfigured.documents[0].header.extras["review_fields"]
 
     assert result.success
     document = result.documents[0]
@@ -481,16 +482,10 @@ def test_pdf_without_text_becomes_hash_keyed_review_shell() -> None:
     assert len(result.page_texts) == 1 and result.page_texts[0].scanned
 
 
-@pytest.mark.skipif(shutil.which("tesseract") is None, reason="Tesseract is not installed")
+@pytest.mark.skipif(
+    not tesseract_with_english(), reason="Tesseract with English data is not installed"
+)
 def test_scanned_invoice_ocr_extracts_evidence_and_requires_review() -> None:
-    executable = shutil.which("tesseract")
-    assert executable is not None
-    languages = subprocess.run(
-        [executable, "--list-langs"], capture_output=True, check=True, text=True, timeout=10
-    ).stdout
-    if "eng" not in languages.split():
-        pytest.skip("Tesseract English trained data is not installed")
-
     result = parse_pdf_isolated(
         _scanned_invoice_pdf(),
         ParserHints(doc_type=DocType.INVOICE, file_format=FileFormat.PDF),

@@ -1,0 +1,33 @@
+# Synthetic golden case mirroring fixtures/SCN-01: one PO, one GRN, one invoice.
+# All values are made up; no real document was used.
+synthetic: true
+source_fixture: fixtures/SCN-01
+expected_status: Matched
+expected_link: SYN-PO-1001
+expected_reason_codes: []
+run_date: "2026-02-02"
+invoice_key: invoice
+documents:
+  - key: po
+    doc_type: po
+    xml: >-
+      <PurchaseOrder><OrderNo>SYN-PO-1001</OrderNo><OrderDate>20260115</OrderDate>
+      <Status>open</Status><Supplier>Synthetic Supplies</Supplier><TaxableTotal>12500</TaxableTotal>
+      <Line><Description>Synthetic widget A</Description><Qty>10</Qty><Rate>1250</Rate>
+      <Amount>12500</Amount></Line></PurchaseOrder>
+  - key: grn
+    doc_type: grn
+    xml: >-
+      <GRN><GRNNo>SYN-GRN-1001</GRNNo><GRNDate>20260120</GRNDate><Supplier>Synthetic Supplies</Supplier>
+      <PORef>SYN-PO-1001</PORef><Line><Description>Synthetic widget A</Description>
+      <AcceptedQty>10</AcceptedQty><ReceivedQty>10</ReceivedQty><RejectedQty>0</RejectedQty></Line></GRN>
+  - key: invoice
+    doc_type: invoice
+    xml: >-
+      <Invoice><InvoiceNo>SYN-INV-1001</InvoiceNo><InvoiceDate>20260201</InvoiceDate>
+      <Supplier>Synthetic Supplies</Supplier><TaxableTotal>12500</TaxableTotal><IGST>2250</IGST>
+      <InvoiceTotal>14750</InvoiceTotal><Line><Description>Synthetic widget A</Description>
+      <Qty>10</Qty><Rate>1250</Rate><Amount>12500</Amount></Line></Invoice>
+links:
+  - {from: grn, to: po}
+  - {from: invoice, to: po}

@@ -16,11 +16,13 @@ from procrastinate.manager import JobManager
 from procrastinate.retry import RetryStrategy
 from sqlalchemy.engine import Connection, Engine, make_url
 
+from reconbench_app.ai.consensus import ConsensusService
 from reconbench_app.ai.enqueue import AiHookEnqueuer
-from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.limits import load_limits
 from reconbench_app.ai.task_contracts import (
+    CONSENSUS_QUEUE,
     RUN_AI_REQUEST,
+    RUN_CONSENSUS,
     register_ai_task_declarations,
     run_request_kwargs,
 )
@@ -205,9 +207,7 @@ def register_ingestion_tasks(
     sync_job_manager = JobManager(connector.get_sync_connector()) if worker_process else None
     queue = ProcrastinateJobQueue(task_registry, sync_job_manager=sync_job_manager)
     ai_hooks = AiHookEnqueuer(
-        gate=DeploymentGate.from_values(
-            settings.ai_external_calls, settings.ai_external_calls_approval_ref
-        ),
+        gate=settings.deployment_gate(),
         queue=queue,
         limits=lambda: load_limits(settings.ai_limits_file),
         vision_reader_name=settings.vision_reader,
@@ -218,6 +218,7 @@ def register_ingestion_tasks(
         queue,
         ocr_languages=tuple(settings.pdf_ocr_languages.split("+")),
         einvoice_keys=einvoice_keys(settings.einvoice_public_key_file),
+        extraction_engine=settings.extraction_engine,
         ai_hooks=ai_hooks,
         ai_limits=lambda: load_limits(settings.ai_limits_file),
     )
@@ -230,6 +231,27 @@ def register_ingestion_tasks(
         ai_hooks=ai_hooks,
     )
     export_service = ExportService(engine, S3ObjectStore(s3_client, settings.s3_bucket))
+
+    def enqueue_consensus_followup(
+        connection: Connection,
+        workspace_id: UUID,
+        document_id: UUID,
+        source_file_id: UUID,
+        doc_type: str,
+    ) -> None:
+        queue.enqueue("resolve_vendors", file_id=source_file_id, connection=connection)
+        if doc_type == "po":
+            queue.enqueue_recompute_po(
+                workspace_id=workspace_id,
+                po_document_id=document_id,
+                connection=connection,
+            )
+
+    consensus_service = ConsensusService(
+        engine,
+        ocr_languages=tuple(settings.pdf_ocr_languages.split("+")),
+        enqueue_followup=enqueue_consensus_followup,
+    )
 
     @task_app.task(
         name="reconbench.ingest_file",
@@ -283,6 +305,27 @@ def register_ingestion_tasks(
         service.prepare_vision_pages(
             UUID(workspace_id), UUID(document_version_id), job_id=context.job.id
         )
+
+    @task_app.task(
+        name=RUN_CONSENSUS,
+        queue=CONSENSUS_QUEUE,
+        retry=_INFRASTRUCTURE_RETRY,
+        pass_context=True,
+    )
+    def process_consensus(context: JobContext, workspace_id: str, consensus_run_id: str) -> None:
+        resolved_workspace_id = UUID(workspace_id)
+        resolved_run_id = UUID(consensus_run_id)
+        try:
+            consensus_service._process(resolved_workspace_id, resolved_run_id)
+        except _RETRYABLE_ERRORS:
+            if context.job.attempts >= MAX_INFRASTRUCTURE_ATTEMPTS:
+                consensus_service._fail(
+                    resolved_workspace_id, resolved_run_id, "INFRASTRUCTURE_FAILED"
+                )
+            raise
+        except Exception:  # noqa: BLE001 - close transient page and run state on final failure.
+            consensus_service._fail(resolved_workspace_id, resolved_run_id, "CONSENSUS_FAILED")
+            raise
 
     @task_app.task(
         name="reconbench.resolve_vendors",
@@ -400,6 +443,7 @@ def register_ingestion_tasks(
             "ingest_file": ingest_file,
             "parse_file": parse_file,
             "prepare_vision_pages": prepare_vision_pages,
+            "process_consensus": process_consensus,
             "resolve_vendors": resolve_vendors,
             "link_vendor": link_vendor,
             "recompute_po": recompute_po,
@@ -423,7 +467,7 @@ def worker_main(
 
     from reconbench_app.api.application import create_engine_and_store
 
-    settings = Settings()  # type: ignore[call-arg]  # BaseSettings loads required values from env.
+    settings = Settings()  # BaseSettings loads required values from env.
     configure_logging(settings.log_level)
     engine, s3_client = create_engine_and_store(settings)
     app, _queue = register_ingestion_tasks(settings, engine, s3_client, worker_process=True)

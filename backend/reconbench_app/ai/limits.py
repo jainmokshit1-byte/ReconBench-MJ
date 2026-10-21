@@ -13,9 +13,18 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 INPUT_TOKEN_OVERHEAD = 512
+# Self-hosted models (WI-BE2): the context window bounds prompt + images + answer.
+# Prompt text is estimated at 3 bytes per token (no local tokenizer; English and
+# JSON run nearer 4), the response schema is not part of the prompt (structured
+# output), and an answer budget below MIN_LOCAL_OUTPUT_TOKENS is not worth a call.
+LOCAL_BYTES_PER_TOKEN = 3
+LOCAL_CONTEXT_MARGIN_TOKENS = 256
+MIN_LOCAL_OUTPUT_TOKENS = 1_024
+# Gemini calls go through the transport guard, which caps a call at 120 s.
+MAX_EXTERNAL_TIMEOUT_SECONDS = 120
 # No local tokenizer is available and template overhead is unknown (Phase 1).
 TOKEN_BOUND_GUARANTEED = False
 
@@ -33,8 +42,15 @@ class CallKindLimits(_Frozen):
     # image is *estimated* to cost (no local tokenizer; the owner probe measures it).
     max_image_bytes: int | None = Field(default=None, ge=10_000, le=20_000_000)
     image_tokens_estimate: int | None = Field(default=None, ge=1, le=20_000)
-    # Overrides the global call timeout for this kind (the transport guard caps 120 s).
-    call_timeout_seconds: int | None = Field(default=None, ge=1, le=120)
+    # Overrides the global call timeout for this kind. Only ``*_local`` kinds may go
+    # above 120 s (the Gemini transport guard caps it there).
+    call_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
+    # Page images per provider call (``None``: every page in one call).
+    pages_per_call: int | None = Field(default=None, ge=1, le=50)
+    # In-flight calls to this kind's provider across all workspaces (a shared server).
+    max_concurrency: int | None = Field(default=None, ge=1, le=50)
+    # After a 429/503 from this kind's provider, wait this long before the next call.
+    backoff_seconds: int | None = Field(default=None, ge=1, le=3_600)
 
 
 def _kind(**values: int) -> CallKindLimits:
@@ -57,6 +73,20 @@ class AiLimits(_Frozen):
         image_tokens_estimate=1_200,
         call_timeout_seconds=120,
     )
+    # h6_vision on a self-hosted server (vLLM, max_model_len 8192): one page per call,
+    # the answer budget computed per call, a slow shared GPU and one call at a time.
+    h6_vision_local: CallKindLimits = _kind(
+        max_input_bytes=16_000,
+        max_output_tokens=4_096,
+        max_pages=1,
+        pages_per_call=1,
+        max_image_bytes=4_000_000,
+        # About 3-4k tokens per full page image (inferred, plan §0.5; the smoke test measures it).
+        image_tokens_estimate=3_500,
+        call_timeout_seconds=300,
+        max_concurrency=1,
+        backoff_seconds=30,
+    )
     synthetic: CallKindLimits = _kind(max_input_bytes=1_000, max_output_tokens=32)
     thought_reserve_tokens: int = Field(default=0, ge=0, le=65_536)
     per_operation_calls: int = Field(default=25, ge=1, le=10_000)
@@ -71,16 +101,34 @@ class AiLimits(_Frozen):
     cooldown_seconds: int = Field(default=60, ge=1, le=3_600)
     cache_ttl_days: int = Field(default=30, ge=1, le=365)
 
-    def for_kind(self, kind: str) -> CallKindLimits:
+    @model_validator(mode="after")
+    def _external_timeouts(self) -> AiLimits:
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if (
+                isinstance(value, CallKindLimits)
+                and not name.endswith("_local")
+                and (value.call_timeout_seconds or 0) > MAX_EXTERNAL_TIMEOUT_SECONDS
+            ):
+                raise ValueError(f"{name}.call_timeout_seconds must be at most 120")
+        return self
+
+    def for_kind(self, kind: str, *, local: bool = False) -> CallKindLimits:
+        """Limits of a call kind; ``local`` picks the ``<kind>_local`` override when one exists."""
+
         if kind in {"provider_test", "synthetic_smoke"}:
             return self.synthetic
+        if local:
+            override = getattr(self, f"{kind}_local", None)
+            if isinstance(override, CallKindLimits):
+                return override
         limits = getattr(self, kind, None)
-        if not isinstance(limits, CallKindLimits):
+        if not isinstance(limits, CallKindLimits) or kind.endswith("_local"):
             raise KeyError(kind)
         return limits
 
-    def timeout_for(self, kind: str) -> int:
-        override = self.for_kind(kind).call_timeout_seconds
+    def timeout_for(self, kind: str, *, local: bool = False) -> int:
+        override = self.for_kind(kind, local=local).call_timeout_seconds
         return override if override is not None else self.call_timeout_seconds
 
 
@@ -159,6 +207,17 @@ def estimate_reservation(
     )
 
 
+def local_output_budget(*, context_window: int, prompt_bytes: int, image_tokens: int) -> int:
+    """Answer tokens left in a self-hosted model's context window (plan §0.5).
+
+    ``max_model_len - estimated prompt tokens - margin``; the caller skips the call
+    with ``CONTEXT_TOO_SMALL`` when this is below :data:`MIN_LOCAL_OUTPUT_TOKENS`.
+    """
+
+    prompt_tokens = -(-prompt_bytes // LOCAL_BYTES_PER_TOKEN) + image_tokens
+    return context_window - prompt_tokens - LOCAL_CONTEXT_MARGIN_TOKENS
+
+
 def cost_usd(price: ModelPrice, *, input_tokens: int, output_tokens: int) -> Decimal:
     million = Decimal(1_000_000)
     value = (
@@ -176,6 +235,10 @@ def usd_cap_offered(model: str, prices: PriceFile | None) -> bool:
 
 __all__ = [
     "INPUT_TOKEN_OVERHEAD",
+    "LOCAL_BYTES_PER_TOKEN",
+    "LOCAL_CONTEXT_MARGIN_TOKENS",
+    "MAX_EXTERNAL_TIMEOUT_SECONDS",
+    "MIN_LOCAL_OUTPUT_TOKENS",
     "TOKEN_BOUND_GUARANTEED",
     "AiLimits",
     "CallKindLimits",
@@ -187,5 +250,6 @@ __all__ = [
     "estimate_reservation",
     "load_limits",
     "load_prices",
+    "local_output_budget",
     "usd_cap_offered",
 ]

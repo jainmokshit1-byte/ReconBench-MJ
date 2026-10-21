@@ -14,26 +14,37 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import boto3
+import httpx
 import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from reconbench_app import ingestion as ingestion_module
+from reconbench_app.ai import consensus as consensus_app
 from reconbench_app.ai import vision
-from reconbench_app.ai.consent import CONSENT_TEXT_VERSION, consent_fingerprint
+from reconbench_app.ai.consensus import ConsensusService, enqueue_consensus_run
+from reconbench_app.ai.consent import (
+    AUTO_VERIFY_CONSENT_TEXT_VERSION,
+    CONSENT_TEXT_VERSION,
+    consent_fingerprint,
+)
+from reconbench_app.ai.contracts import vision_response_schema, vision_response_schema_v5
 from reconbench_app.ai.enqueue import AiHookEnqueuer
 from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.key_seal import SealingPublicKey, key_hint, seal
 from reconbench_app.ai.limits import AiLimits, LimitsState
 from reconbench_app.ai.provider import ProviderRequest, ProviderResult
+from reconbench_app.ai.runtime_checks import fingerprint_for
 from reconbench_app.ai.stub import ScriptedProvider
 from reconbench_app.ai.worker.handlers import default_handlers
 from reconbench_app.ai.worker.key_open import Keyring
 from reconbench_app.ai.worker.keytool import KEYRING_NAME, PUBLIC_KEY_NAME, generate
+from reconbench_app.ai.worker.openai_compat import OpenAICompatProvider
 from reconbench_app.ai.worker.runner import AiRequestRunner
 from reconbench_app.api.application import create_app
 from reconbench_app.authentication import COOKIE_NAME, AuthContext, AuthenticationCheck
@@ -41,6 +52,7 @@ from reconbench_app.configuration import canonical_hash
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.db.seed_data import DEFAULT_CONFIG, REASON_CODES
+from reconbench_app.extraction.vision import DEFAULT_VISION_READER, vision_reader
 from reconbench_app.ingestion import IngestionService
 from reconbench_app.settings import Settings
 from reconbench_app.storage import LocalObjectStore
@@ -66,6 +78,8 @@ REQUESTS = metadata.tables["ai_request"]
 PAGES = metadata.tables["document_page_image"]
 DOCUMENTS = metadata.tables["document"]
 LINKS = metadata.tables["link"]
+CONSENSUS_RUNS = metadata.tables["consensus_run"]
+CONSENSUS_DECISIONS = metadata.tables["consensus_decision"]
 
 
 @pytest.fixture(scope="module")
@@ -81,7 +95,7 @@ def engine() -> Iterator[Engine]:
     finally:
         if _CREATED:
             with created.begin() as connection:
-                for table in ("ai_setting", "secret"):
+                for table in ("ai_provider_config", "ai_setting", "secret"):
                     connection.execute(
                         sa.text(f"DELETE FROM {table} WHERE workspace_id = ANY(:ids)"),
                         {"ids": list(_CREATED)},
@@ -389,7 +403,14 @@ class _Recorder(ScriptedProvider):
         return super().complete(request, api_key=api_key)
 
 
-def _runner(engine: Engine, keyring: Keyring, provider: ScriptedProvider, **limits: Any) -> Any:
+def _runner(
+    engine: Engine,
+    keyring: Keyring,
+    provider: ScriptedProvider,
+    *,
+    consensus_enqueue: Any | None = None,
+    **limits: Any,
+) -> Any:
     provider.name = "gemini"
     return AiRequestRunner(
         engine=engine,
@@ -397,8 +418,8 @@ def _runner(engine: Engine, keyring: Keyring, provider: ScriptedProvider, **limi
         gate=DeploymentGate.from_values("enabled", APPROVAL),
         limits=lambda: LimitsState(AiLimits(**limits)),
         prices=lambda: None,
-        provider=provider,
-        handlers=default_handlers(),
+        providers={provider.name: provider},
+        handlers=default_handlers(consensus_enqueue=consensus_enqueue),
     )
 
 
@@ -473,7 +494,8 @@ def test_page_images_are_read_as_suggestions_and_never_change_the_document(
     assert {"email", "phone", "bank_account", "ifsc", "signature"} <= set(row["mask"]["counts"])
     [request] = _vision_requests(engine, world)
     assert request["redaction_version"] == "image_mask.v1"
-    assert request["schema_version"] == "vision.schema.v3"
+    assert request["schema_version"] == "vision.schema.v4"
+    assert request["prompt_version"] == "vision.prompt.v4.gemini"
     assert request["subject_version"] == vision.fingerprint(
         vision.load_pages(engine.connect(), world.workspace_id, request["subject_id"])
     )
@@ -503,6 +525,277 @@ def test_page_images_are_read_as_suggestions_and_never_change_the_document(
     assert by_field["doc_no"]["box"] and by_field["doc_no"]["start"] is None
     assert [note["text"] for note in view["annotations"]] == [HANDWRITTEN_PO]
     assert all(item["page"] == 1 for item in view["suggestions"])
+
+
+def test_dark_consensus_records_crop_provenance_without_applying_values(
+    engine: Engine,
+    keys: tuple[Keyring, SealingPublicKey],
+    make_world: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = make_world()
+    document_id = _upload(world, synthetic_invoice_pdf(), name="consensus-invoice.pdf")
+    before = _state(engine, document_id)
+    assert _prepare(world) == ["queued"]
+    [request_id] = world.ai_queue.request_ids
+    run_ids: list[UUID] = []
+
+    def defer_job(_connection: Connection, _workspace_id: UUID, run_id: UUID) -> None:
+        run_ids.append(run_id)
+
+    def enqueue(
+        connection: Connection,
+        workspace_id: UUID,
+        version_id: UUID,
+        ai_request_id: UUID,
+        ai_call_id: UUID,
+    ) -> bool:
+        return enqueue_consensus_run(
+            connection,
+            workspace_id=workspace_id,
+            document_version_id=version_id,
+            ai_request_id=ai_request_id,
+            ai_call_id=ai_call_id,
+            defer_job=defer_job,
+        )
+
+    result = _runner(
+        engine,
+        keys[0],
+        _Recorder([json.dumps(recorded_response())]),
+        consensus_enqueue=enqueue,
+    ).run(request_id)
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
+    [consensus_run_id] = run_ids
+    [request] = _vision_requests(engine, world)
+    assert request["cache_key"] and request["ai_cache_id"] is None
+    # WI-BE5: the request carries its reader parameters and the cache row its provenance.
+    reader = vision_reader(DEFAULT_VISION_READER)
+    assert reader is not None
+    assert request["reader_params"] == vision.reader_params(reader)
+    with engine.connect() as connection:
+        cached = (
+            connection.execute(
+                sa.select(metadata.tables["ai_cache"]).where(
+                    metadata.tables["ai_cache"].c.workspace_id == world.workspace_id,
+                    metadata.tables["ai_cache"].c.cache_key == request["cache_key"],
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert (cached["provider"], cached["schema_version"]) == ("gemini", request["schema_version"])
+    assert cached["reader_params"] == request["reader_params"]
+    [page] = _page_rows(engine, world)
+    assert page["image"] is not None  # retained only for the queued local crop pass
+
+    crop_rounds: list[int] = []
+
+    def recorded_crop_reads(
+        _pages: Any, needs: Any, *, languages: tuple[str, ...], round_no: int
+    ) -> dict[str, str]:
+        del languages
+        crop_rounds.append(round_no)
+        return {need.key.text(): "" for need in needs}
+
+    monkeypatch.setattr(consensus_app, "reread_vision_crops_isolated", recorded_crop_reads)
+    service = ConsensusService(engine)
+    assert service._process(world.workspace_id, consensus_run_id) == "succeeded"
+    assert crop_rounds == [1, 2]
+    assert _state(engine, document_id) == before
+    [after_page] = _page_rows(engine, world)
+    assert after_page["image"] is None and after_page["purged_at"] is not None
+    with engine.connect() as connection:
+        run = (
+            connection.execute(
+                sa.select(CONSENSUS_RUNS).where(CONSENSUS_RUNS.c.id == consensus_run_id)
+            )
+            .mappings()
+            .one()
+        )
+        decisions = (
+            connection.execute(
+                sa.select(CONSENSUS_DECISIONS).where(
+                    CONSENSUS_DECISIONS.c.consensus_run_id == consensus_run_id
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert run["status"] == "succeeded" and run["summary"]
+    assert decisions
+    assert all(not item["auto_verified"] and not item["reopened"] for item in decisions)
+    assert any(
+        item["crop"]["outcome"] == "empty"
+        and len(item["crop"]["rounds"]) == 2
+        and [attempt["round"] for attempt in item["crop"]["rounds"]] == [1, 2]
+        for item in decisions
+        if item["crop"] is not None
+    )
+
+
+def test_consented_d42_field_appends_a_same_value_verified_version(
+    engine: Engine,
+    keys: tuple[Keyring, SealingPublicKey],
+    make_world: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = make_world()
+    document_id = _upload(world, synthetic_invoice_pdf(), name="verified-consensus.pdf")
+    with engine.begin() as connection:
+        setting = metadata.tables["ai_setting"]
+        row = (
+            connection.execute(
+                sa.select(setting).where(setting.c.workspace_id == world.workspace_id)
+            )
+            .mappings()
+            .one()
+        )
+        fingerprint = consent_fingerprint(
+            provider="gemini",
+            model=MODEL,
+            mode="ai_first",
+            vision=True,
+            auto_verify_field_types=("doc_no",),
+        )
+        connection.execute(
+            sa.update(setting)
+            .where(setting.c.id == row["id"])
+            .values(
+                auto_verify_field_types=["doc_no"],
+                consent_fingerprint=fingerprint,
+                consent_text_version=AUTO_VERIFY_CONSENT_TEXT_VERSION,
+                version=setting.c.version + 1,
+            )
+        )
+    assert _prepare(world) == ["queued"]
+    [request_id] = world.ai_queue.request_ids
+    run_ids: list[UUID] = []
+
+    def defer_job(_connection: Connection, _workspace_id: UUID, run_id: UUID) -> None:
+        run_ids.append(run_id)
+
+    def enqueue(
+        connection: Connection,
+        workspace_id: UUID,
+        version_id: UUID,
+        ai_request_id: UUID,
+        ai_call_id: UUID,
+    ) -> bool:
+        return enqueue_consensus_run(
+            connection,
+            workspace_id=workspace_id,
+            document_version_id=version_id,
+            ai_request_id=ai_request_id,
+            ai_call_id=ai_call_id,
+            defer_job=defer_job,
+        )
+
+    result = _runner(
+        engine,
+        keys[0],
+        _Recorder([json.dumps(recorded_response())]),
+        consensus_enqueue=enqueue,
+    ).run(request_id)
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
+    [consensus_run_id] = run_ids
+
+    def recorded_crop_reads(
+        _pages: Any, needs: Any, *, languages: tuple[str, ...], round_no: int
+    ) -> dict[str, str]:
+        del languages, round_no
+        return {
+            need.key.text(): (
+                " ".join(need.value) if isinstance(need.value, tuple) else str(need.value)
+            )
+            for need in needs
+        }
+
+    monkeypatch.setattr(consensus_app, "reread_vision_crops_isolated", recorded_crop_reads)
+    followups: list[tuple[UUID, UUID, UUID, str]] = []
+
+    def enqueue_followup(
+        _connection: Connection,
+        workspace_id: UUID,
+        doc_id: UUID,
+        file_id: UUID,
+        doc_type: str,
+    ) -> None:
+        followups.append((workspace_id, doc_id, file_id, doc_type))
+
+    service = ConsensusService(engine, enqueue_followup=enqueue_followup)
+    assert service._process(world.workspace_id, consensus_run_id) == "succeeded"
+
+    with engine.connect() as connection:
+        run = (
+            connection.execute(
+                sa.select(CONSENSUS_RUNS).where(CONSENSUS_RUNS.c.id == consensus_run_id)
+            )
+            .mappings()
+            .one()
+        )
+        document = (
+            connection.execute(sa.select(DOCUMENTS).where(DOCUMENTS.c.id == document_id))
+            .mappings()
+            .one()
+        )
+        assert run["result_version_id"] == document["current_version_id"]
+        assert run["result_version_id"] != run["document_version_id"]
+        versions = (
+            connection.execute(
+                sa.select(
+                    metadata.tables["document_version"].c.id,
+                    metadata.tables["document_version"].c.derived_from_version_id,
+                    metadata.tables["document_version"].c.doc_no,
+                    metadata.tables["document_version"].c.source_file_id,
+                ).where(
+                    metadata.tables["document_version"].c.id.in_(
+                        [run["document_version_id"], run["result_version_id"]]
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+        evidence = (
+            connection.execute(
+                sa.select(metadata.tables["field_evidence"]).where(
+                    metadata.tables["field_evidence"].c.document_version_id
+                    == run["result_version_id"],
+                    metadata.tables["field_evidence"].c.field_name == "doc_no",
+                )
+            )
+            .mappings()
+            .one()
+        )
+        decision = (
+            connection.execute(
+                sa.select(CONSENSUS_DECISIONS).where(
+                    CONSENSUS_DECISIONS.c.consensus_run_id == consensus_run_id,
+                    CONSENSUS_DECISIONS.c.field_key == "header:doc_no",
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert len(versions) == 2
+    assert next(row["doc_no"] for row in versions if row["id"] == run["result_version_id"]) == next(
+        row["doc_no"] for row in versions if row["id"] == run["document_version_id"]
+    )
+    assert (
+        next(
+            row["derived_from_version_id"]
+            for row in versions
+            if row["id"] == run["result_version_id"]
+        )
+        == run["document_version_id"]
+    )
+    assert evidence["confidence"] == Decimal("0.98")
+    assert decision["auto_verified"] is True
+    source_file_id = next(
+        row["source_file_id"] for row in versions if row["id"] == run["document_version_id"]
+    )
+    assert followups == [(world.workspace_id, document_id, source_file_id, "invoice")]
 
 
 def test_correction_save_records_vision_provenance(
@@ -553,7 +846,7 @@ def test_correction_save_records_vision_provenance(
     assert after["state"] == "available"
 
 
-def test_grn_readings_are_shown_read_only(
+def test_grn_readings_remain_suggestions_on_correctable_documents(
     engine: Engine, keys: tuple[Keyring, SealingPublicKey], make_world: Any
 ) -> None:
     world = make_world()
@@ -563,7 +856,7 @@ def test_grn_readings_are_shown_read_only(
     result = _runner(engine, keys[0], _Recorder([json.dumps(_grn_answer())])).run(request_id)
     assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
     view, _etag = _view(world, document_id)
-    assert view["state"] == "available" and view["correctable"] is False
+    assert view["state"] == "available" and view["correctable"] is True
     by_field = {item["field"]: item["value"] for item in view["suggestions"]}
     assert by_field["doc_no"] == GRN_NO and by_field["po_refs"] == GRN_PO
 
@@ -648,3 +941,163 @@ def test_a_superseded_version_discards_the_answer(
     assert (result.state, result.apply_outcome) == ("succeeded", "discarded_stale")
     view, _etag = _view(world, document_id)
     assert view["state"] == "unavailable" and view["code"] == "discarded_stale"
+
+
+def test_vllm_reader_reads_one_page_per_call_and_feeds_the_same_pipeline(
+    engine: Engine, keys: tuple[Keyring, SealingPublicKey], make_world: Any
+) -> None:
+    """WI-BE2/BE3: prepare → one-page vLLM request (MockTransport) → answer → cache → consensus.
+
+    The workspace picks the company server as its one vision reader (``single`` +
+    ``vllm``, WI-BE3): the ledger row names provider ``vllm`` and the served model, no
+    key is stored (key-optional path) and the worker calls the workspace's own
+    allowlisted URL, not the provider's default one.
+    """
+
+    world = make_world()
+    document_id = _upload(world, synthetic_invoice_pdf(), name="vllm-invoice.pdf")
+    before = _state(engine, document_id)
+    base_url = "http://vllm.example.test/vllm/v1"
+    local_model = "qwen3.5:9b"
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(metadata.tables["ai_provider_config"]).values(
+                id=new_id(),
+                workspace_id=world.workspace_id,
+                provider="vllm",
+                enabled=True,
+                model=local_model,
+                base_url=base_url,
+            )
+        )
+        connection.execute(
+            sa.update(metadata.tables["ai_setting"])
+            .where(metadata.tables["ai_setting"].c.workspace_id == world.workspace_id)
+            .values(
+                reader_strategy="single",
+                primary_reader="vllm",
+                version=metadata.tables["ai_setting"].c.version + 1,
+                consent_fingerprint=fingerprint_for(
+                    provider="gemini",
+                    model=MODEL,
+                    mode="ai_first",
+                    reader_strategy="single",
+                    primary_reader="vllm",
+                    vllm_model=local_model,
+                    vllm_base_url=base_url,
+                ),
+            )
+        )
+    world.service.ai_hooks = AiHookEnqueuer(
+        gate=DeploymentGate.from_values(
+            "enabled", APPROVAL, vllm_mode="enabled", vllm_endpoints=base_url
+        ),
+        queue=world.ai_queue,
+        limits=lambda: LimitsState(AiLimits()),
+    )
+    assert _prepare(world) == ["queued"]
+    [request_id] = world.ai_queue.request_ids
+    [page] = _page_rows(engine, world)
+    sent: list[httpx.Request] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": MODEL, "max_model_len": 8_192}]})
+        return httpx.Response(
+            200,
+            json={
+                "model": MODEL,
+                "choices": [
+                    {
+                        "message": {"content": json.dumps(recorded_response())},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 4_100, "completion_tokens": 900},
+            },
+        )
+
+    consensus_calls: list[UUID] = []
+
+    def enqueue(
+        _connection: Connection,
+        _workspace_id: UUID,
+        _version_id: UUID,
+        ai_request_id: UUID,
+        _ai_call_id: UUID,
+    ) -> bool:
+        consensus_calls.append(ai_request_id)
+        return False
+
+    default_url = "http://vllm-default.example.test/v1"
+    provider = OpenAICompatProvider(
+        default_url,
+        frozenset({default_url, base_url}),
+        inner_transport=httpx.MockTransport(server),
+    )
+    runner = AiRequestRunner(
+        engine=engine,
+        keyring=keys[0],
+        gate=DeploymentGate.from_values(
+            "disabled", None, vllm_mode="enabled", vllm_endpoints=f"{default_url},{base_url}"
+        ),
+        limits=lambda: LimitsState(AiLimits()),
+        prices=lambda: None,
+        providers={"vllm": provider},
+        handlers=default_handlers(consensus_enqueue=enqueue),
+    )
+    result = runner.run(request_id)
+
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
+    # One call per page, then the page-1 header band (WI-Q2, D93): an invoice adds one call.
+    assert [request.method for request in sent] == ["GET", "POST", "POST"]
+    assert [str(request.url) for request in sent] == [
+        f"{base_url}/models",
+        f"{base_url}/chat/completions",
+        f"{base_url}/chat/completions",
+    ]
+    assert all("authorization" not in request.headers for request in sent)
+    body = json.loads(sent[1].read())
+    assert body["model"] == local_model
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["response_format"]["json_schema"]["name"] == "vision_reading"
+    assert body["response_format"]["json_schema"]["schema"] == vision_response_schema(
+        "openai_json_schema"
+    )
+    assert body["messages"][0]["content"].startswith("You read one page image")  # qwen variant
+    content = body["messages"][1]["content"]
+    assert [part["type"] for part in content] == ["text", "text", "image_url"]
+    assert content[1]["text"] == "Page 1"
+    assert 1_024 <= body["max_tokens"] <= AiLimits().h6_vision_local.max_output_tokens
+    assert INVOICE_NO not in json.dumps(body["messages"][:1]) + content[0]["text"]
+    band = json.loads(sent[2].read())
+    assert band["response_format"]["json_schema"]["schema"] == vision_response_schema_v5(
+        "openai_json_schema"
+    )
+    assert "looks_like po_number" in band["messages"][0]["content"]  # the v4.q2 band prompt
+    band_content = band["messages"][1]["content"]
+    assert [part["type"] for part in band_content] == ["text", "text", "image_url"]
+    assert band_content[2] != content[2]  # the band image, not the full page
+    assert consensus_calls == [request_id]
+
+    [request] = _vision_requests(engine, world)
+    assert (request["provider"], request["model"]) == ("vllm", local_model)
+    assert request["cache_key"] and request["usage_known"]
+    assert (request["tokens_input"], request["tokens_output"]) == (8_200, 1_800)
+    with engine.connect() as connection:
+        cached = connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(metadata.tables["ai_cache"])
+            .where(
+                metadata.tables["ai_cache"].c.workspace_id == world.workspace_id,
+                metadata.tables["ai_cache"].c.cache_key == request["cache_key"],
+            )
+        )
+    assert cached == 1
+    # Still a suggestion only, through the same checks as the Gemini reader.
+    assert _state(engine, document_id) == before
+    view, _etag = _view(world, document_id)
+    by_field = {item["field"]: item for item in view["suggestions"] if item["scope"] == "header"}
+    assert by_field["doc_no"]["value"] == INVOICE_NO
+    assert page["image_sha256"] == _page_rows(engine, world)[0]["image_sha256"]

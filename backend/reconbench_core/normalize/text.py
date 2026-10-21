@@ -150,7 +150,13 @@ def canonicalize_po_number(value: str) -> str:
             canonical.append(segment.lstrip("0") or "0")
         else:
             canonical.append(segment.upper())
-    return "".join(canonical)
+    result = "".join(canonical)
+    # Joining all-numeric segments can create a new leading-zero run (for
+    # example, "0/0" -> "00"). Normalize that final run as well so the
+    # canonical form is a fixed point when callers normalize it again.
+    if result.isdigit():
+        return result.lstrip("0") or "0"
+    return result
 
 
 def canonicalize_document_number(value: str) -> str:

@@ -1,4 +1,4 @@
-.PHONY: up down clean-local demo check check-static check-python check-web test test-e2e golden openapi migrate schema-drift phase2-catalog phase2-indexes phase2-decisions phase2-migration-safety phase2-table-count seed-phase2 phase2-db-tests queue-schema ingestion-worker ai-keys ai-worker api web web-docker secrets audit services spikes accuracy-bench accuracy-bench-vision vision-probe
+.PHONY: up down clean-local demo check check-static check-python check-web test test-e2e golden openapi migrate schema-drift phase2-catalog phase2-indexes phase2-decisions phase2-migration-safety phase2-table-count seed-phase2 phase2-db-tests queue-schema ingestion-worker ai-keys ai-worker api web web-docker secrets audit services spikes accuracy-bench accuracy-attribution accuracy-bench-vision accuracy-bench-vllm vision-probe
 
 up: ai-keys
 	uv run --project backend python scripts/ensure_local_env.py
@@ -33,7 +33,7 @@ check-web:
 	npm run typecheck --prefix web
 
 test:
-	uv run --project backend pytest backend/tests/unit backend/tests/property backend/tests/scenarios -q
+	uv run --project backend pytest backend/tests/unit backend/tests/parsers backend/tests/property backend/tests/scenarios -q
 	npm run test --prefix web -- --run --pool=threads --maxWorkers=1
 
 test-e2e:
@@ -53,6 +53,12 @@ accuracy-bench:
 		-v "$(CURDIR)/work:/app/work" \
 		reconbench-worker /app/backend/.venv/bin/python /app/scripts/accuracy_bench.py $(BENCH_ARGS)
 
+# Per-stage miss attribution (scan fix plan WI-1) for one bench report, from the
+# reader cache only; exits 2 when the working tree changed since that report.
+#   make accuracy-attribution REPORT=work/accuracy-reports/<name>.json [ATTR_ARGS="--json OUT"]
+accuracy-attribution:
+	docker run --rm --network none 		-v "$(CURDIR)/backend/reconbench_core:/app/backend/reconbench_core:ro" 		-v "$(CURDIR)/backend/reconbench_app:/app/backend/reconbench_app:ro" 		-v "$(CURDIR)/scripts:/app/scripts:ro" 		-v "$(CURDIR)/work:/app/work" 		reconbench-worker /app/backend/.venv/bin/python /app/scripts/accuracy_attribution.py 		--report /app/$(REPORT) $(ATTR_ARGS)
+
 # Owner only (accuracy plan AC-5): records missing page-image readings with the
 # network on. Needs BENCH_GEMINI_KEY and a page budget, for example
 #   BENCH_GEMINI_KEY=... make accuracy-bench-vision BENCH_ARGS="--max-provider-pages 120"
@@ -65,6 +71,22 @@ accuracy-bench-vision:
 		-v "$(CURDIR)/work:/app/work" \
 		reconbench-worker /app/backend/.venv/bin/python /app/scripts/accuracy_bench.py \
 		--vision provider --allow-provider $(BENCH_ARGS)
+
+# Owner only (LLM plan WI-EV1/EV2): the same bench read by the company vLLM server.
+# Network on (the server is reached through the host's company VPN), but the only
+# outbound call is to --vision-base-url, which must be on RB_AI_VLLM_ENDPOINTS; no
+# Gemini client is built and no Gemini key is passed in. For example
+#   RB_AI_VLLM_ENDPOINTS=http://43.242.226.63/vllm/v1 make accuracy-bench-vllm \
+#     BENCH_ARGS="--vision-base-url http://43.242.226.63/vllm/v1 --max-provider-pages 3"
+# With the default page budget (--max-provider-pages 0) nothing is sent; cached answers are scored.
+accuracy-bench-vllm:
+	docker run --rm -e RB_AI_VLLM_ENDPOINTS -e RB_AI_PRICE_FILE \
+		-v "$(CURDIR)/backend/reconbench_core:/app/backend/reconbench_core:ro" \
+		-v "$(CURDIR)/backend/reconbench_app:/app/backend/reconbench_app:ro" \
+		-v "$(CURDIR)/scripts:/app/scripts:ro" \
+		-v "$(CURDIR)/work:/app/work" \
+		reconbench-worker /app/backend/.venv/bin/python /app/scripts/accuracy_bench.py \
+		--vision provider --allow-provider --vision-provider vllm $(BENCH_ARGS)
 
 # Owner only: vision reader probe (dry run unless PROBE_ARGS has --send; key in PROBE_KEY).
 vision-probe:

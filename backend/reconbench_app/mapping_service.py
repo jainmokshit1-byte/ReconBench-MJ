@@ -17,6 +17,8 @@ import sqlalchemy as sa
 from reconbench_core.align import AlignmentConfig, AlignmentWeights
 from reconbench_core.mapping.links import (
     MANUAL_SELECTION_EVIDENCE,
+    OPENING_SUPPORT,
+    FieldVerificationUpdate,
     LinkResolution,
     MappingConfig,
     MappingDocument,
@@ -30,8 +32,10 @@ from reconbench_core.schema import (
     DocType,
     Document,
     FieldEvidence,
+    FieldOrigin,
     FieldSource,
     FieldValue,
+    FieldVerification,
     GRNHeader,
     InvoiceHeader,
     LineType,
@@ -42,6 +46,7 @@ from reconbench_core.schema import (
     POHeader,
     POStatus,
     ResolutionOutcome,
+    ToleranceMode,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
@@ -99,7 +104,7 @@ def _field(value: object | None, evidence_row: RowMapping | None) -> FieldValue[
     )
     return FieldValue(
         value=value,
-        confidence=confidence if confidence is not None else Decimal("0"),
+        confidence=confidence,
         source=source,
         evidence=FieldEvidence(
             page=page,
@@ -108,6 +113,22 @@ def _field(value: object | None, evidence_row: RowMapping | None) -> FieldValue[
             else None,
             bbox=bbox,
         ),
+        origin=(
+            FieldOrigin(str(evidence_row["origin"]))
+            if evidence_row is not None and evidence_row["origin"]
+            else None
+        ),
+        verification=(
+            FieldVerification(str(evidence_row["verification"]))
+            if evidence_row is not None and evidence_row["verification"]
+            else FieldVerification.NONE
+        ),
+        verified_by=(
+            str(evidence_row["verified_by"])
+            if evidence_row is not None and evidence_row["verified_by"]
+            else None
+        ),
+        verified_at=(evidence_row["verified_at"] if evidence_row is not None else None),
     )
 
 
@@ -143,6 +164,14 @@ def mapping_config_from_body(body: object) -> MappingConfig:
     policies = policies if isinstance(policies, Mapping) else {}
     reverse = policies.get("reverse_lookup", {})
     reverse = reverse if isinstance(reverse, Mapping) else {}
+    tolerances = engine.get("tolerances", {})
+    tolerances = tolerances if isinstance(tolerances, Mapping) else {}
+    total_tolerance = tolerances.get("total_vs_expected", {})
+    total_tolerance = total_tolerance if isinstance(total_tolerance, Mapping) else {}
+    rate_tolerance = tolerances.get("unit_rate", {})
+    rate_tolerance = rate_tolerance if isinstance(rate_tolerance, Mapping) else {}
+    quantity_tolerance = tolerances.get("qty_vs_grn", {})
+    quantity_tolerance = quantity_tolerance if isinstance(quantity_tolerance, Mapping) else {}
     weights = engine.get("weights", {})
     weights = weights if isinstance(weights, Mapping) else {}
     align_weights = weights.get("align", {})
@@ -168,6 +197,13 @@ def mapping_config_from_body(body: object) -> MappingConfig:
         reverse_lookup_window_runs=int(reverse.get("window_runs", 6)),
         step3_min_score=_decimal(thresholds.get("step3_min_score"), "0.80"),
         step3_min_lead=_decimal(thresholds.get("step3_min_lead"), "0.15"),
+        amount_tolerance_pct=_decimal(total_tolerance.get("pct"), "1"),
+        amount_tolerance_abs=_decimal(total_tolerance.get("abs"), "10"),
+        rate_tolerance_pct=_decimal(rate_tolerance.get("pct"), "0.5"),
+        rate_tolerance_abs=_decimal(rate_tolerance.get("abs"), "1"),
+        quantity_tolerance_pct=_decimal(quantity_tolerance.get("pct"), "0"),
+        quantity_tolerance_abs=_decimal(quantity_tolerance.get("abs"), "0"),
+        limit_mode=ToleranceMode(str(tolerances.get("limit_mode", "or"))),
         alignment=alignment,
     )
 
@@ -313,6 +349,13 @@ class MappingService:
             source_documents = snapshot.sources
             input_hash = snapshot.input_hash
             resolutions = resolve_links(snapshot.sources, snapshot.purchase_orders, snapshot.config)
+            system_updates = {
+                (item.document_id, item.field_name, item.line_no): item
+                for result in resolutions
+                for item in result.field_verifications
+            }
+            for update in system_updates.values():
+                self._persist_system_check(connection, workspace_id, update)
             result_by_id = {item.document_id: item for item in resolutions}
             current = self._current_links(connection, workspace_id)
             inserted = resolution_count = 0
@@ -1839,6 +1882,72 @@ class MappingService:
         except Exception as exc:  # noqa: BLE001 - AI is optional; rules continue.
             _LOGGER.warning("ai_enqueue_failed hook=h3_rerank error_type=%s", type(exc).__name__)
 
+    @staticmethod
+    def _persist_system_check(
+        connection: Connection,
+        workspace_id: UUID,
+        update: FieldVerificationUpdate,
+    ) -> None:
+        """Append a system verification state without changing extracted evidence."""
+
+        evidence = metadata.tables["field_evidence"]
+        document = metadata.tables["document"]
+        version_id = connection.scalar(
+            sa.select(document.c.current_version_id).where(
+                document.c.workspace_id == workspace_id,
+                document.c.id == update.document_id,
+                document.c.withdrawn_at.is_(None),
+            )
+        )
+        if version_id is None:
+            return
+        if update.line_no is None:
+            owner_clause = evidence.c.document_version_id == version_id
+        else:
+            line = metadata.tables["doc_line"]
+            line_id = connection.scalar(
+                sa.select(line.c.id).where(
+                    line.c.workspace_id == workspace_id,
+                    line.c.document_version_id == version_id,
+                    line.c.line_no == update.line_no,
+                )
+            )
+            if line_id is None:
+                return
+            owner_clause = evidence.c.doc_line_id == line_id
+        latest = (
+            connection.execute(
+                sa.select(*evidence.c)
+                .where(
+                    evidence.c.workspace_id == workspace_id,
+                    owner_clause,
+                    evidence.c.field_name == update.field_name,
+                )
+                .order_by(evidence.c.created_at.desc(), evidence.c.id.desc())
+                .limit(1)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if latest is None or latest["verification"] == FieldVerification.USER.value:
+            return
+        latest_state = FieldVerification(str(latest["verification"]))
+        if latest_state is update.verification:
+            return
+        row = dict(latest)
+        row.update(
+            id=new_id(),
+            verification=update.verification.value,
+            verified_by=(
+                "system" if update.verification is FieldVerification.SYSTEM_CHECK else None
+            ),
+            verified_at=(
+                sa.func.now() if update.verification is FieldVerification.SYSTEM_CHECK else None
+            ),
+        )
+        row.pop("created_at", None)
+        connection.execute(sa.insert(evidence).values(**row))
+
     @requires("links.edit")
     def record_ai_link_suggestion(
         self,
@@ -2349,10 +2458,12 @@ class MappingService:
             if line_ids:
                 evidence_scope.append(evidence_table.c.doc_line_id.in_(line_ids))
             for evidence_row in connection.execute(
-                sa.select(*evidence_table.c).where(
+                sa.select(*evidence_table.c)
+                .where(
                     evidence_table.c.workspace_id == workspace_id,
                     sa.or_(*evidence_scope),
                 )
+                .order_by(evidence_table.c.created_at, evidence_table.c.id)
             ).mappings():
                 document_version_id = cast(UUID | None, evidence_row["document_version_id"])
                 doc_line_id = cast(UUID | None, evidence_row["doc_line_id"])
@@ -2457,6 +2568,7 @@ class MappingService:
                 ledger_rows[cast(UUID, ledger_row["po_document_id"])][
                     int(ledger_row["po_line_no"])
                 ] = ledger_row
+        support_by_source = self._support_by_source(connection, workspace_id, po_ids)
 
         result: list[MappingPO] = []
         for selected_row, document, vendor_id in selected:
@@ -2472,6 +2584,7 @@ class MappingService:
             ).mappings()
             open_qty: dict[int, Decimal] = {}
             grn_qty: dict[int, Decimal] = {}
+            open_grn_qty: dict[int, Decimal] = {}
             derived_balance = Decimal("0")
             for po_line_row in line_rows:
                 line_no = int(po_line_row["line_no"])
@@ -2487,19 +2600,95 @@ class MappingService:
                     if prior is not None
                     else Decimal("0")
                 )
+                open_grn_qty[line_no] = (
+                    cast(Decimal | None, prior["grni_qty"]) or Decimal("0")
+                    if prior is not None
+                    else Decimal("0")
+                )
                 derived_balance += open_qty[line_no] * rate
-            grand_total = cast(Decimal | None, selected_row["grand_total"])
             result.append(
                 MappingPO(
                     document_id=document_id,
                     vendor_id=vendor_id,
                     document=document,
-                    open_balance=grand_total if grand_total is not None else derived_balance,
+                    open_balance=derived_balance,
                     open_qty_by_line=open_qty,
                     grn_support_qty_by_line=grn_qty,
+                    open_grn_qty_by_line=open_grn_qty,
+                    grn_support_by_source=support_by_source.get(document_id, {}),
                 )
             )
         return result
+
+    @staticmethod
+    def _support_by_source(
+        connection: Connection, workspace_id: UUID, po_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[UUID, dict[int, Decimal]]]:
+        """Receipt support per PO, per source document (WI-D4, D90: no self-support).
+
+        Only ledger receipts whose GRN-to-PO link is already auto or confirmed count,
+        plus opening balances (key ``OPENING_SUPPORT``); a suggested link supports no
+        check, and the matcher leaves out each source's own receipt in its own check.
+        """
+
+        if not po_ids:
+            return {}
+        ledger = metadata.tables["po_line_ledger"]
+        entry = metadata.tables["ledger_entry"]
+        pointer = metadata.tables["link_current"]
+        link = metadata.tables["link"]
+        verified = {
+            (cast(UUID, row.from_document_id), cast(UUID, row.to_document_id))
+            for row in connection.execute(
+                sa.select(link.c.from_document_id, link.c.to_document_id)
+                .select_from(
+                    pointer.join(
+                        link,
+                        sa.and_(
+                            pointer.c.workspace_id == link.c.workspace_id,
+                            pointer.c.current_link_id == link.c.id,
+                        ),
+                    )
+                )
+                .where(
+                    pointer.c.workspace_id == workspace_id,
+                    pointer.c.to_document_id.in_(po_ids),
+                    pointer.c.link_type == "grn_po",
+                    link.c.state.in_((LinkState.AUTO.value, LinkState.CONFIRMED.value)),
+                )
+            )
+        }
+        support: dict[UUID, dict[UUID, dict[int, Decimal]]] = defaultdict(dict)
+        for row in connection.execute(
+            sa.select(
+                ledger.c.po_document_id,
+                ledger.c.po_line_no,
+                entry.c.source_document_id,
+                entry.c.opening_balance_id,
+                entry.c.accepted_delta,
+            )
+            .select_from(ledger.join(entry, entry.c.po_line_ledger_id == ledger.c.id))
+            .where(
+                ledger.c.workspace_id == workspace_id,
+                entry.c.workspace_id == workspace_id,
+                ledger.c.po_document_id.in_(po_ids),
+            )
+        ):
+            accepted = cast(Decimal | None, row.accepted_delta) or Decimal("0")
+            if not accepted:
+                continue
+            po_id = cast(UUID, row.po_document_id)
+            source_id = cast(UUID | None, row.source_document_id)
+            if row.opening_balance_id is not None:
+                key = OPENING_SUPPORT
+            elif source_id is not None and (source_id, po_id) in verified:
+                key = source_id
+            else:
+                continue
+            lines = support[po_id].setdefault(key, {})
+            line_no = int(row.po_line_no)
+            lines[line_no] = lines.get(line_no, Decimal("0")) + accepted
+        return support
 
     @staticmethod
     def _mapping_config(connection: Connection, workspace_id: UUID) -> MappingConfig:

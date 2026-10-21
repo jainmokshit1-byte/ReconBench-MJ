@@ -333,6 +333,56 @@ class LocalHybridEngine:
         return DocumentLayout(pages=tuple(pages), page_count=page_count)
 
 
+def reread_crop(
+    image: Image.Image,
+    bbox: tuple[int, int, int, int],
+    *,
+    languages: tuple[str, ...] = ("eng",),
+    mode: str = "line",
+    kind: str = "",
+    round_no: int = 1,
+) -> str | None:
+    """Read one masked crop with one of the two bounded targeted OCR strategies."""
+
+    if mode not in {"line", "block"}:
+        raise ValueError("mode must be 'line' or 'block'")
+    if round_no not in {1, 2}:
+        raise ValueError("round_no must be 1 or 2")
+    x0, y0, x1, y1 = bbox
+    if x0 < 0 or y0 < 0 or x1 > image.width or y1 > image.height or x1 <= x0 or y1 <= y0:
+        return None
+    margin = max(6, (y1 - y0) // 3)
+    crop = image.crop(
+        (
+            max(0, x0 - margin),
+            max(0, y0 - margin),
+            min(image.width, x1 + margin),
+            min(image.height, y1 + margin),
+        )
+    )
+    crop = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
+    with tempfile.TemporaryDirectory(prefix="reconbench-consensus-crop-") as directory:
+        path = os.path.join(directory, "crop.png")
+        crop.save(path)
+        args = ["--psm", "7" if mode == "line" else "6", "-l", "+".join(languages)]
+        if round_no == 2 and kind == "gstin":
+            args = [
+                "--psm",
+                "7",
+                "-l",
+                "+".join(languages),
+                "-c",
+                "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            ]
+        elif round_no == 2:
+            args = ["--psm", "11" if mode == "block" else "6", "-l", "+".join(languages)]
+        try:
+            text = _tesseract(path, args, _OCR_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return None
+    return text.strip()
+
+
 __all__ = [
     "DPI",
     "LocalHybridEngine",
@@ -341,4 +391,5 @@ __all__ = [
     "is_scanned",
     "ocr_page",
     "remove_rules",
+    "reread_crop",
 ]

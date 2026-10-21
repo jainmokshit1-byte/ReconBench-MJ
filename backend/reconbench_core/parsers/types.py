@@ -70,6 +70,13 @@ class PageText(FrozenModel):
     is_ocr: bool = False
 
 
+class PageImageHash(FrozenModel):
+    """Perceptual fingerprint of one source PDF page, kept without image bytes."""
+
+    page: int = Field(ge=1)
+    value: str = Field(pattern=r"^[0-9a-f]{16}$")
+
+
 class ParseResult(FrozenModel):
     success: bool
     file_format: FileFormat | None = None
@@ -78,3 +85,4 @@ class ParseResult(FrozenModel):
     layout_signature: str
     reason_code: str | None = None
     page_texts: tuple[PageText, ...] = ()
+    page_image_hashes: tuple[PageImageHash, ...] = ()

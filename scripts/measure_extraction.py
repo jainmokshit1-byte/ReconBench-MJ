@@ -1,4 +1,10 @@
-"""Measure PDF extraction accuracy against a hand-labelled truth file.
+"""Deprecated (scan fix plan WI-1): use ``scripts/accuracy_bench.py`` instead.
+
+This scorer ignores page splits and the workspace config, so its numbers do not
+match what upload does. ``main`` only points to the bench; deleting this file is
+owner decision DP-3.
+
+Measure PDF extraction accuracy against a hand-labelled truth file.
 
 Usage (inside an image that has OCRmyPDF/Tesseract, e.g. the worker image):
     python scripts/measure_extraction.py --truth TRUTH.json --pdfs DIR [--doc-type invoice]
@@ -150,7 +156,7 @@ def _score_document(score: Score, truth: dict[str, Any], document: Any) -> dict[
     return detail
 
 
-def main() -> int:
+def _legacy_main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--truth", type=Path, required=True)
     parser.add_argument("--pdfs", type=Path, required=True)
@@ -204,6 +210,15 @@ def main() -> int:
     }
     print(json.dumps({"summary": summary}, indent=2))
     return 1 if score.false_safe else 0
+
+
+def main() -> int:
+    print(
+        "scripts/measure_extraction.py is deprecated: its scoring ignores page splits and the "
+        "workspace config. Run scripts/accuracy_bench.py (make accuracy-bench) instead.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 if __name__ == "__main__":

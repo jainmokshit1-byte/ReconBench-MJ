@@ -73,6 +73,75 @@ class ColumnMappingBody(BaseModel):
     column_mapping: dict[str, str] = Field(min_length=3, max_length=128)
 
 
+class DocumentLineCorrection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID | None = None
+    line_no: int = Field(ge=1, le=10_000)
+    line_type: Literal["goods", "charge"] | None = None
+    description: str | None = Field(default=None, max_length=2_000)
+    item_code: str | None = Field(default=None, max_length=256)
+    hsn_sac: str | None = Field(default=None, max_length=64)
+    uom: str | None = Field(default=None, max_length=64)
+    quantity: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    received_qty: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    rejected_qty: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    accepted_qty: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    rate: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    discount: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    amount: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    tax_rate: Decimal | None = Field(default=None, max_digits=5, decimal_places=2)
+    cgst_amount: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    sgst_amount: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    igst_amount: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    po_ref: str | None = Field(default=None, max_length=256)
+    po_line_ref: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_new_line(self) -> DocumentLineCorrection:
+        if self.id is None and not any(
+            value not in (None, "")
+            for value in (
+                self.line_type,
+                self.description,
+                self.item_code,
+                self.hsn_sac,
+                self.quantity,
+                self.received_qty,
+                self.rejected_qty,
+                self.accepted_qty,
+                self.rate,
+                self.discount,
+                self.amount,
+                self.tax_rate,
+                self.cgst_amount,
+                self.sgst_amount,
+                self.igst_amount,
+                self.po_ref,
+                self.po_line_ref,
+            )
+        ):
+            raise ValueError("A new line needs at least one value.")
+        return self
+
+
+class AiSuggestionRefBody(BaseModel):
+    """Marks a corrected value as taken from an H1 suggestion (it must still match)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ai_call_id: UUID
+    scope: Literal["header", "line"]
+    line_no: int | None = Field(default=None, ge=1, le=10_000)
+    field: str = Field(min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> AiSuggestionRefBody:
+        if (self.scope == "header") != (self.line_no is None):
+            raise ValueError("Header references have no line_no; line references need one.")
+        return self
+
+
 class InvoiceLineCorrection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -103,24 +172,7 @@ class InvoiceLineCorrection(BaseModel):
         return self
 
 
-class AiSuggestionRefBody(BaseModel):
-    """Marks a corrected value as taken from an H1 suggestion (it must still match)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    ai_call_id: UUID
-    scope: Literal["header", "line"]
-    line_no: int | None = Field(default=None, ge=1, le=10_000)
-    field: str = Field(min_length=1, max_length=40)
-
-    @model_validator(mode="after")
-    def validate_scope(self) -> AiSuggestionRefBody:
-        if (self.scope == "header") != (self.line_no is None):
-            raise ValueError("Header references have no line_no; line references need one.")
-        return self
-
-
-class InvoiceCorrectionBody(BaseModel):
+class _CorrectionBodyBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     doc_no: str | None = Field(default=None, max_length=256)
@@ -135,16 +187,36 @@ class InvoiceCorrectionBody(BaseModel):
     igst: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
     round_off: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
     grand_total: Decimal | None = Field(default=None, max_digits=18, decimal_places=2)
+    revision: str | None = Field(default=None, max_length=256)
+    status: Literal["open", "closed", "cancelled"] | None = None
+    ship_to: str | None = Field(default=None, max_length=1_000)
+    payment_terms: str | None = Field(default=None, max_length=1_000)
+    delivery_date: date | None = None
     po_refs: list[str] | None = Field(default=None, max_length=50)
     grn_refs: list[str] | None = Field(default=None, max_length=50)
     challan_no: str | None = Field(default=None, max_length=256)
     e_way_bill_no: str | None = Field(default=None, max_length=256)
     irn: str | None = Field(default=None, max_length=256)
     place_of_supply: str | None = Field(default=None, max_length=256)
-    lines: list[InvoiceLineCorrection] | None = Field(default=None, max_length=500)
     verified: bool = False
     reason: str | None = Field(default=None, max_length=500)
     ai_suggestion_refs: list[AiSuggestionRefBody] = Field(default_factory=list, max_length=200)
+
+
+class InvoiceCorrectionBody(_CorrectionBodyBase):
+    lines: list[InvoiceLineCorrection] | None = Field(default=None, max_length=500)
+
+
+class DocumentCorrectionBody(_CorrectionBodyBase):
+    """Typed superset for the existing invoice, PO and GRN correction route."""
+
+    revision: str | None = Field(default=None, max_length=256)
+    status: Literal["open", "closed", "cancelled"] | None = None
+    ship_to: str | None = Field(default=None, max_length=1_000)
+    payment_terms: str | None = Field(default=None, max_length=1_000)
+    delivery_date: date | None = None
+    supplier_invoice_no: str | None = Field(default=None, max_length=256)
+    lines: list[DocumentLineCorrection] | None = Field(default=None, max_length=500)
 
 
 def _actor(request: Request) -> ActorContext:
@@ -779,11 +851,15 @@ def create_manual_invoice(
     )
 
 
-@router.put("/documents/{document_id}/correction", tags=["Documents"])
+@router.put(
+    "/documents/{document_id}/correction",
+    tags=["Documents"],
+    summary="Correct Document",
+)
 @requires("files.upload")
 def correct_invoice_document(
     document_id: UUID,
-    body: InvoiceCorrectionBody,
+    body: DocumentCorrectionBody,
     request: Request,
 ) -> Response:
     expected_version = require_if_match(request.headers.get("if-match"))
@@ -821,7 +897,7 @@ def correct_invoice_document(
             request,
             status=404,
             title="Not found",
-            detail="The invoice was not found.",
+            detail="The document was not found.",
             code="not_found",
         )
     return DecimalJSONResponse(

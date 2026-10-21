@@ -350,7 +350,7 @@ def _runner(engine: Engine, keyring: Keyring, provider: ScriptedProvider) -> AiR
         gate=DeploymentGate.from_values("enabled", APPROVAL),
         limits=lambda: LimitsState(AiLimits()),
         prices=lambda: None,
-        provider=provider,
+        providers={provider.name: provider},
         handlers=default_handlers(),
     )
 

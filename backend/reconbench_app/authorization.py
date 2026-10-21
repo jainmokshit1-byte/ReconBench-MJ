@@ -54,6 +54,11 @@ ROLE_CAPABILITIES: dict[Role, frozenset[Capability]] = {
 }
 
 P0_EFFECTIVE_ROLE: Role = "manager"
+STORED_ROLE_CAPABILITIES: frozenset[Capability] = frozenset({"ai.manage"})
+"""Capabilities checked against the user's stored role (decision O-18, WI-PV3).
+
+Every other capability keeps the P0 policy: all persisted users act as Manager.
+"""
 PUBLIC_ROUTE_ALLOWLIST = frozenset(
     {
         ("/healthz", "GET"),
@@ -103,6 +108,35 @@ def capabilities_for_role(role: Role) -> frozenset[Capability]:
     """Return the complete documented capability set for a role."""
 
     return ROLE_CAPABILITIES[role]
+
+
+def stored_role_grants(stored_role: str | None, capability: Capability) -> bool:
+    """Whether the stored role grants a capability enforced from it (O-18).
+
+    Capabilities outside ``STORED_ROLE_CAPABILITIES`` are not enforced (P0) and always
+    pass; an unknown or missing stored role grants none of the enforced ones.
+    """
+
+    if capability not in STORED_ROLE_CAPABILITIES:
+        return True
+    if stored_role not in ROLE_CAPABILITIES:
+        return False
+    return capability in ROLE_CAPABILITIES[stored_role]
+
+
+def visible_capabilities(stored_role: str | None) -> tuple[Capability, ...]:
+    """P0 capabilities in display order, minus enforced ones the stored role lacks.
+
+    ``None`` (no stored role known, e.g. a synthetic context) keeps the P0 list.
+    """
+
+    allowed = capabilities_for_role(resolve_effective_role(stored_role))
+    return tuple(
+        capability
+        for capability in CAPABILITY_ORDER
+        if capability in allowed
+        and (stored_role is None or stored_role_grants(stored_role, capability))
+    )
 
 
 def requires(

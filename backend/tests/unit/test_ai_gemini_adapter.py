@@ -7,7 +7,9 @@ import httpx
 import pytest
 from reconbench_app.ai.fixtures import PROVIDER_TEST, plain_schema
 from reconbench_app.ai.provider import ProviderFailure, ProviderRequest
+from reconbench_app.ai.worker.config import AiWorkerSettings
 from reconbench_app.ai.worker.gemini import GeminiProvider
+from reconbench_app.ai.worker.providers import build_providers
 
 API_KEY = "AIzaSyD-synthetic-adapter-key-000000000000"
 MODEL = "gemini-3.8-flash"
@@ -90,6 +92,29 @@ def test_request_matches_the_documented_shape_exactly() -> None:
         "store": False,
     }
     assert set(request.extensions["timeout"].values()) == {60.0}
+    assert result.model_reported == MODEL
+
+
+def test_options_never_reach_gemini_and_no_thinking_level_is_omitted() -> None:
+    default = _Recorder(httpx.Response(200, json=_interaction()))
+    _provider(default).complete(_request(), api_key=API_KEY)
+    with_options = _Recorder(httpx.Response(200, json=_interaction()))
+    _provider(with_options).complete(
+        _request(options={"temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}),
+        api_key=API_KEY,
+    )
+    assert with_options.requests[0].read() == default.requests[0].read()
+
+    unset = _Recorder(httpx.Response(200, json=_interaction()))
+    _provider(unset).complete(_request(thinking_level=None), api_key=API_KEY)
+    body = json.loads(unset.requests[0].read())
+    assert body["generation_config"] == {"max_output_tokens": 32}
+
+
+def test_worker_registry_holds_only_gemini() -> None:
+    providers = build_providers(AiWorkerSettings.model_construct())
+    assert list(providers) == ["gemini"]
+    assert isinstance(providers["gemini"], GeminiProvider)
 
 
 @pytest.mark.parametrize(

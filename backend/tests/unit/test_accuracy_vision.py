@@ -92,6 +92,50 @@ def test_pages_are_cached_and_the_request_key_is_stable(tmp_path: Path) -> None:
     assert len(list((tmp_path / "pages").glob("*.jpg"))) == 1
 
 
+def _record(directory: Path, key: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{key}.json").write_text(
+        json.dumps({"model": MODEL, "output_text": json.dumps(recorded_response())}),
+        encoding="utf-8",
+    )
+
+
+def test_v1_answers_are_read_only_through_the_compat_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _target()
+    _prepare([target], tmp_path)
+    assert target.key is not None and target.legacy_key is not None
+    assert target.key != target.legacy_key
+    answers, legacy = tmp_path / "vision", tmp_path / "vision-v1"
+    answers.mkdir()
+    _record(legacy, target.legacy_key)
+    buyers = (BuyerEntityHint(gstin=BUYER_GSTIN, name="Buyer"),)
+    assert accuracy_vision.compat_v1_applies()
+
+    accuracy_vision.check_answers([target], answers, buyers, accuracy_vision.Counter())
+    assert target.outcome == "missing"  # v2 keys never see v1 answers by default
+
+    accuracy_vision.check_answers(
+        [target], answers, buyers, accuracy_vision.Counter(), compat_v1=legacy
+    )
+    assert target.outcome == "read"
+    assert list(answers.iterdir()) == []  # compat mode never writes
+
+    other = _target()
+    _prepare([other], tmp_path)
+    monkeypatch.setattr(
+        accuracy_vision,
+        "V1_READER_PARAMS",
+        {**accuracy_vision.V1_READER_PARAMS, "thinking": "off"},
+    )
+    assert not accuracy_vision.compat_v1_applies()
+    accuracy_vision.check_answers(
+        [other], answers, buyers, accuracy_vision.Counter(), compat_v1=legacy
+    )
+    assert other.outcome == "missing"
+
+
 def test_recorded_answer_is_scored_alone_and_against_ocr(tmp_path: Path) -> None:
     target = _target()
     _prepare([target], tmp_path)

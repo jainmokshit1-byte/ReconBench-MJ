@@ -113,11 +113,28 @@ def scratch_engine() -> Iterator[Engine]:
         try:
             with engine.connect() as connection:
                 revision = connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
-            if revision not in {"0015", "0016", "0017", "0018", "0019", "0020"}:
+            if revision not in {
+                "0015",
+                "0016",
+                "0017",
+                "0018",
+                "0019",
+                "0020",
+                "0021",
+                "0022",
+                "0023",
+                "0024",
+                "0025",
+                "0026",
+                "0027",
+                "0028",
+                "0029",
+                "0030",
+            }:
                 raise RuntimeError(
-                    "Phase 4.11/4.13 source database must be at Alembic revision 0015 to 0020"
+                    "Phase 4.11/4.13 source database must be at Alembic revision 0015 to 0030"
                 )
-            if revision != "0020":
+            if revision != "0030":
                 previous_migrator_url = os.environ.get("RB_MIGRATOR_DATABASE_URL")
                 os.environ["RB_MIGRATOR_DATABASE_URL"] = scratch_url.render_as_string(
                     hide_password=False
@@ -299,7 +316,7 @@ def _invoice_csv_rows(*, invoice_no: str, invoice_date: date, po_no: str) -> byt
                 "18",
                 "18",
                 "1",
-                "Precision Widget",
+                "Precision Widget PW-100",
                 _HSN,
                 "NOS",
                 "2",
@@ -340,7 +357,7 @@ def _po_csv(po_no: str, order_date: date) -> bytes:
                 "472",
                 "open",
                 "1",
-                "Precision Widget",
+                "Precision Widget PW-100",
                 _HSN,
                 "NOS",
                 "4",
@@ -379,7 +396,7 @@ def _grn_csv(grn_no: str, grn_date: date, po_no: str) -> bytes:
                 _GSTIN,
                 "INR",
                 "1",
-                "Precision Widget",
+                "Precision Widget PW-100",
                 _HSN,
                 "NOS",
                 "2",

@@ -13,7 +13,8 @@ function shownValue(value: unknown): string {
 /**
  * Advisory suggestions for one document: H1 (PDF text) or the vision reader (page images).
  * Apply only fills the correction draft; the person still saves (and verifies) through the
- * normal correction flow. PO/GRN readings are shown read-only (corrections come with AC-7).
+ * normal correction flow. Conflicts present explicit current/suggested choices, and neither
+ * choice is persisted until the person saves the correction.
  */
 export function AiSuggestionsPanel({
   documentId,
@@ -21,12 +22,18 @@ export function AiSuggestionsPanel({
   fieldLabels,
   applyBlockedReason,
   onApply,
+  onKeepCurrent,
+  onFocusSource,
+  isRelevantSuggestion,
 }: {
   documentId: string;
   documentVersion: number | null;
   fieldLabels: Record<string, string>;
   applyBlockedReason: (suggestion: AiFieldSuggestion) => string | null;
   onApply: (suggestion: AiFieldSuggestion, aiCallId: string) => void;
+  onKeepCurrent?: (suggestion: AiFieldSuggestion) => void;
+  onFocusSource?: (focus: { page: number; bbox: number[] | null; source: string | null; ai_call_id: string | null }) => void;
+  isRelevantSuggestion?: (suggestion: AiFieldSuggestion) => boolean;
 }) {
   const [view, setView] = useState<AiSuggestionsView | null>(null);
   const [ignored, setIgnored] = useState<Set<string>>(() => new Set());
@@ -52,9 +59,10 @@ export function AiSuggestionsPanel({
 
   const versionMismatch = documentVersion === null || view.document_version !== documentVersion;
   const vision = view.source === "vision";
-  const readOnlyReason = view.correctable ? null : "PO/GRN corrections come with the verify screen";
-  const visible = view.suggestions.filter((item) => !ignored.has(suggestionKey(item)));
-  const ignoredCount = view.suggestions.length - visible.length;
+  const readOnlyReason = view.correctable ? null : "Corrections are not enabled for this document type";
+  const relevant = view.suggestions.filter((item) => isRelevantSuggestion?.(item) ?? true);
+  const visible = relevant.filter((item) => !ignored.has(suggestionKey(item)));
+  const ignoredCount = relevant.length - visible.length;
   const label = (item: AiFieldSuggestion) => {
     const field = fieldLabels[item.field] ?? item.field.replaceAll("_", " ");
     return item.scope === "line" ? `Line ${item.line_no ?? "?"} ${field.toLowerCase()}` : field;
@@ -93,10 +101,11 @@ export function AiSuggestionsPanel({
                   <span>Suggested <b>{item.value}</b></span>
                   <span>Current <b>{shownValue(item.current_value)}</b></span>
                   <small>Page {item.page}{vision ? " (as printed)" : ""}: “{item.quote}”</small>
+                  {onFocusSource ? <button className="table-action" type="button" onClick={() => onFocusSource({ page: item.page, bbox: item.box, source: view.source, ai_call_id: view.ai_call_id })}>View source page {item.page}</button> : null}
                 </div>
                 <div className="ai-suggestion-actions">
-                  <button className="table-action" type="button" disabled={blocked !== null || view.ai_call_id === null} title={blocked ?? undefined} aria-label={`Apply ${label(item)} to draft`} onClick={() => { if (view.ai_call_id) onApply(item, view.ai_call_id); }}>Apply to draft</button>
-                  <button className="table-action" type="button" aria-label={`Ignore ${label(item)}`} onClick={() => setIgnored((current) => new Set(current).add(key))}>Ignore</button>
+                  <button className="table-action" type="button" disabled={blocked !== null || view.ai_call_id === null} title={blocked ?? undefined} aria-label={`${item.matches_current ? "Keep" : "Use suggested"} ${label(item)}`} onClick={() => { if (view.ai_call_id) onApply(item, view.ai_call_id); }}>{item.matches_current ? "Use current" : "Use suggested"}</button>
+                  <button className="table-action" type="button" aria-label={`${item.matches_current ? "Dismiss" : "Keep current for"} ${label(item)}`} onClick={() => { if (!item.matches_current) onKeepCurrent?.(item); setIgnored((current) => new Set(current).add(key)); }}>{item.matches_current ? "Dismiss" : "Keep current"}</button>
                   {blocked && blocked !== "Version mismatch" ? <small>{blocked}</small> : null}
                 </div>
               </li>

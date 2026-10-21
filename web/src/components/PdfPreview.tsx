@@ -5,17 +5,29 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { ChevronLeft, ChevronRight, Minus, Plus } from "lucide-react";
 
 import { fileContentUrl } from "../api/ingestion";
+import { pdfHighlightStyle, type PdfPreviewFocus } from "../utils/pdfEvidence";
 import { PDF_RENDER_OPTIONS } from "../utils/pdfRenderOptions";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
-export function PdfPreview({ fileId }: { fileId: string }) {
+export function PdfPreview({
+  fileId,
+  focus = null,
+  pageNumber,
+  onPageChange,
+}: {
+  fileId: string;
+  focus?: PdfPreviewFocus | null;
+  pageNumber: number;
+  onPageChange: (pageNumber: number) => void;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
-  const [pageNumber, setPageNumber] = useState(1);
   const [scale, setScale] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
+  const [pageView, setPageView] = useState<number[] | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -46,6 +58,8 @@ export function PdfPreview({ fileId }: { fileId: string }) {
     void document.getPage(pageNumber).then((page) => {
       if (!active) return;
       const viewport = page.getViewport({ scale });
+      setViewportSize({ width: viewport.width, height: viewport.height });
+      setPageView(page.view);
       const outputScale = Math.min(window.devicePixelRatio || 1, 2);
       const context = canvas.getContext("2d");
       if (!context) {
@@ -72,6 +86,8 @@ export function PdfPreview({ fileId }: { fileId: string }) {
     };
   }, [document, pageNumber, scale]);
 
+  const focusedBox = focus?.page === pageNumber ? pdfHighlightStyle(focus, pageView) : null;
+
   return (
     <section className="pdf-preview" aria-label="PDF preview">
       <div className="pdf-toolbar">
@@ -81,7 +97,7 @@ export function PdfPreview({ fileId }: { fileId: string }) {
             type="button"
             aria-label="Previous PDF page"
             disabled={!document || pageNumber <= 1}
-            onClick={() => setPageNumber((page) => Math.max(1, page - 1))}
+            onClick={() => onPageChange(Math.max(1, pageNumber - 1))}
           >
             <ChevronLeft size={16} aria-hidden="true" />
           </button>
@@ -91,7 +107,7 @@ export function PdfPreview({ fileId }: { fileId: string }) {
             type="button"
             aria-label="Next PDF page"
             disabled={!document || pageNumber >= document.numPages}
-            onClick={() => setPageNumber((page) => Math.min(document?.numPages ?? page, page + 1))}
+            onClick={() => onPageChange(Math.min(document?.numPages ?? pageNumber, pageNumber + 1))}
           >
             <ChevronRight size={16} aria-hidden="true" />
           </button>
@@ -109,7 +125,10 @@ export function PdfPreview({ fileId }: { fileId: string }) {
       {loading ? <p className="preview-message" role="status">Opening PDF…</p> : null}
       {error ? <p className="preview-error" role="alert">{error}</p> : null}
       <div className="pdf-canvas-scroll">
-        <canvas ref={canvasRef} aria-label={`PDF page ${pageNumber}`} />
+        <div className="pdf-canvas-page" style={{ width: viewportSize.width || undefined, height: viewportSize.height || undefined }}>
+          <canvas ref={canvasRef} aria-label={`PDF page ${pageNumber}`} />
+          {focusedBox ? <div className="pdf-evidence-highlight" style={focusedBox} aria-label="Selected source crop" /> : null}
+        </div>
       </div>
     </section>
   );

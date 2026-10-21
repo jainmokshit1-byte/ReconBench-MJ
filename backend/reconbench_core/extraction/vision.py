@@ -13,6 +13,13 @@ rules as the OCR reader, and the plan §7 hard rejects drop a reading outright:
 * address digits, marketplace or sales-order numbers offered as PO references;
 * two different values for a single-valued field.
 
+Standalone checks (LLM plan WI-BE4) need no OCR: totals arithmetic, the sum of
+line amounts against the taxable total, quantity x rate per line and the D42
+date window. A failure does not drop the value: the item keeps it and is marked
+``check_failed`` with the reason, so it stays a visible suggestion but is never
+merged. Values the model saw but could not read are listed as ``unreadable``
+(name, page, box; no value) and counted.
+
 The checked reading becomes an unverified :class:`Document` (source ``ai``,
 confidence below the review gate), passed through the AC-1 party/GST guard.
 In AC-5 these values are suggestions only; AC-6 decides when they may confirm.
@@ -23,14 +30,16 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from types import MappingProxyType
 from typing import Any, Literal
 
+from reconbench_core.extraction.date_window import date_in_window
 from reconbench_core.extraction.extract import accept_date, accept_doc_no, accept_po
+from reconbench_core.extraction.handwritten_refs import typed_refs
 from reconbench_core.normalize.gstin import validate_gstin
 from reconbench_core.normalize.numbers import parse_decimal
 from reconbench_core.parsers.parties import (
@@ -157,6 +166,9 @@ ANNOTATION_LOOKS = (
     "note",
     "unknown",
 )
+ANNOTATION_LOOKS_V5 = (*ANNOTATION_LOOKS, "service_po_number")
+"""``vision.schema.v5`` (WI-Q2): a service purchase order number becomes its own type.
+The v4 list above stays as it is, so v4 requests and their cache keys are unchanged."""
 _PARTY_NAMES = ("supplier_name", "ship_to_name", "marketplace_name")
 _TAX_TOTALS = ("cgst_total", "sgst_total", "igst_total", "cess_total", "tcs_total")
 _TOTALS = (
@@ -167,6 +179,9 @@ _TOTALS = (
     "round_off",
     "grand_total",
 )
+# A printed value the model could not read names one of these (header field or line cell).
+UNREADABLE_NAMES = frozenset(FIELD_KINDS) | frozenset(LINE_CELLS)
+_WINDOW_DATES = ("doc_date", "supplier_invoice_date", "ack_date")
 _MAX_TEXT = 500
 _MAX_UOM = 20
 # A line row is kept when it carries at least one of these (a GRN row has no amount).
@@ -247,6 +262,15 @@ class VisionPageKind:
 
 
 @dataclass(frozen=True, slots=True)
+class VisionUnreadable:
+    """A value printed on the page that the model could not read with certainty."""
+
+    name: str
+    page: int
+    box: Sequence[int]
+
+
+@dataclass(frozen=True, slots=True)
 class VisionReading:
     """The provider answer after strict parsing (no values interpreted yet)."""
 
@@ -255,6 +279,7 @@ class VisionReading:
     fields: tuple[VisionField, ...] = ()
     lines: tuple[VisionLine, ...] = ()
     annotations: tuple[VisionAnnotation, ...] = ()
+    unreadable: tuple[VisionUnreadable, ...] = ()
 
     @property
     def item_count(self) -> int:
@@ -284,6 +309,8 @@ class AcceptedField:
     page: int
     box: Box
     label: str | None = None
+    check_failed: tuple[str, ...] = ()
+    """Standalone checks this value failed: kept as a suggestion, never merged."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +327,7 @@ class AcceptedLine:
     page: int
     box: Box
     cells: tuple[AcceptedCell, ...]
+    check_failed: tuple[str, ...] = ()
 
     def cell(self, name: str) -> AcceptedCell | None:
         return next((cell for cell in self.cells if cell.name == name), None)
@@ -319,6 +347,13 @@ class AcceptedAnnotation:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptedUnreadable:
+    name: str
+    page: int
+    box: Box
+
+
+@dataclass(frozen=True, slots=True)
 class VisionCheck:
     doc_kind: str
     fields: tuple[AcceptedField, ...]
@@ -326,6 +361,9 @@ class VisionCheck:
     annotations: tuple[AcceptedAnnotation, ...]
     page_kinds: tuple[VisionPageKind, ...]
     dropped: Mapping[str, int] = field(default_factory=dict)
+    unreadable: tuple[AcceptedUnreadable, ...] = ()
+    check_failed: Mapping[str, int] = field(default_factory=dict)
+    """Items marked per standalone check (an item may count under several checks)."""
 
     @property
     def accepted_count(self) -> int:
@@ -537,8 +575,10 @@ def check_reading(
     pages: Mapping[int, SentPage],
     buyer_entities: Sequence[BuyerEntityHint] = (),
     ocr: Document | None = None,
+    as_of: date | None = None,
 ) -> VisionCheck:
-    """Apply the structural checks, normalisation and plan §7 hard rejects."""
+    """Apply the structural checks, normalisation and plan §7 hard rejects, then mark
+    the values that fail a standalone check (the date window only with ``as_of``)."""
 
     dropped: Counter[str] = Counter()
     buyers = buyer_gstins(buyer_entities)
@@ -584,10 +624,17 @@ def check_reading(
     by_name: dict[str, list[AcceptedField]] = {}
     for candidate in candidates:
         by_name.setdefault(candidate.name, []).append(candidate)
+    resolved: set[tuple[str, Value]] = set()
     for name, group in by_name.items():
         if name not in MULTI_FIELDS and len({entry.value for entry in group}) > 1:
-            dropped["conflict"] += len(group)
-            continue
+            chosen = _resolve_conflict(name, group, ocr)
+            if chosen is None:
+                dropped["conflict"] += len(group)
+                continue
+            # D77: keep one value, marked ``page_conflict`` (a suggestion, never merged).
+            dropped["conflict"] += sum(1 for entry in group if entry.value != chosen)
+            group = [entry for entry in group if entry.value == chosen]
+            resolved.add((name, chosen))
         seen: set[Value] = set()
         for entry in group:
             if entry.value in seen and name not in {"other_charge"}:
@@ -676,7 +723,7 @@ def check_reading(
         if not text or len(text) > _MAX_TEXT:
             dropped["empty"] += 1
             continue
-        if note.kind not in ANNOTATION_KINDS or note.looks_like not in ANNOTATION_LOOKS:
+        if note.kind not in ANNOTATION_KINDS or note.looks_like not in ANNOTATION_LOOKS_V5:
             dropped["bad_annotation"] += 1
             continue
         box = _place(note.page, note.box, pages, dropped)
@@ -684,6 +731,29 @@ def check_reading(
             continue
         annotations.append(AcceptedAnnotation(note.kind, text, note.looks_like, note.page, box))
 
+    unreadable: list[AcceptedUnreadable] = []
+    for missing in reading.unreadable:
+        if missing.name not in UNREADABLE_NAMES:
+            dropped["unreadable_unknown"] += 1
+            continue
+        unplaced: Counter[str] = Counter()
+        box = _place(missing.page, missing.box, pages, unplaced)
+        if box is None:
+            dropped.update({f"unreadable_{reason}": count for reason, count in unplaced.items()})
+            continue
+        unreadable.append(AcceptedUnreadable(missing.name, missing.page, box))
+
+    fields, lines, failed = _standalone_checks(fields, lines, as_of)
+    if resolved:
+        fields = [
+            replace(entry, check_failed=(*entry.check_failed, "page_conflict"))
+            if (entry.name, entry.value) in resolved
+            else entry
+            for entry in fields
+        ]
+        failed["page_conflict"] += sum(
+            1 for entry in fields if (entry.name, entry.value) in resolved
+        )
     page_kinds = tuple(
         item for item in reading.pages if item.page in pages and item.kind in PAGE_KINDS
     )
@@ -694,6 +764,109 @@ def check_reading(
         annotations=tuple(annotations),
         page_kinds=page_kinds,
         dropped=MappingProxyType(dict(dropped)),
+        unreadable=tuple(unreadable),
+        check_failed=MappingProxyType(dict(failed)),
+    )
+
+
+def _fold_value(value: object) -> str:
+    return re.sub(r"[^0-9A-Z]", "", str(value).upper())
+
+
+def _ocr_agrees(name: str, value: Value, ocr: Document | None) -> bool:
+    """Whether the rules reader read the same value for this header field."""
+
+    target = _HEADER_MAP.get(name)
+    item = getattr(ocr.header, target, None) if ocr is not None and target else None
+    if item is None or item.value is None:
+        return False
+    if isinstance(value, Decimal):
+        try:
+            return Decimal(str(item.value)) == value
+        except (InvalidOperation, ValueError):
+            return False
+    if isinstance(value, date):
+        return bool(item.value == value)
+    return bool(_fold_value(value)) and _fold_value(value) == _fold_value(item.value)
+
+
+def _resolve_conflict(
+    name: str, group: Sequence[AcceptedField], ocr: Document | None
+) -> Value | None:
+    """The one value to keep when a single-valued field was read with different values.
+
+    D77: one page per call returns the same field from several pages. Keep the value
+    the rules reader also read; otherwise, when the values come from different pages,
+    the first page's value (totals: the last page's), if that page gave one value.
+    ``None`` (drop them all, as before) for anything else.
+    """
+
+    values = list(dict.fromkeys(entry.value for entry in group))
+    agreeing = [value for value in values if _ocr_agrees(name, value, ocr)]
+    if len(agreeing) == 1:
+        return agreeing[0]
+    pages = {entry.page for entry in group}
+    if len(pages) < 2:
+        return None
+    page = max(pages) if name in _TOTALS else min(pages)
+    on_page = {entry.value for entry in group if entry.page == page}
+    return on_page.pop() if len(on_page) == 1 else None
+
+
+def _standalone_checks(
+    fields: list[AcceptedField], lines: list[AcceptedLine], as_of: date | None
+) -> tuple[list[AcceptedField], list[AcceptedLine], Counter[str]]:
+    """Mark (never drop) values that fail a check needing no OCR (WI-BE4)."""
+
+    field_marks: list[list[str]] = [[] for _ in fields]
+    line_marks: list[list[str]] = [[] for _ in lines]
+
+    totals: dict[str, Decimal] = {}
+    for entry in fields:
+        if entry.name in _TOTALS and isinstance(entry.value, Decimal):
+            totals[entry.name] = totals.get(entry.name, Decimal("0")) + entry.value
+    if _totals_consistent(totals) is False:
+        for index, entry in enumerate(fields):
+            if entry.name in _TOTALS:
+                field_marks[index].append("totals_arithmetic")
+
+    taxable = totals.get("taxable_total")
+    amounts = [amount for line in lines if isinstance(amount := line.value("amount"), Decimal)]
+    if (
+        taxable is not None
+        and lines
+        and len(amounts) == len(lines)
+        and abs(sum(amounts, Decimal("0")) - taxable) > _TOLERANCE
+    ):
+        for index, entry in enumerate(fields):
+            if entry.name == "taxable_total":
+                field_marks[index].append("lines_vs_taxable")
+        for marks in line_marks:
+            marks.append("lines_vs_taxable")
+
+    for index, line in enumerate(lines):
+        quantity, rate, amount = line.value("quantity"), line.value("rate"), line.value("amount")
+        if _line_consistent(quantity, rate, amount) is False:
+            line_marks[index].append("line_arithmetic")
+
+    if as_of is not None:
+        for index, entry in enumerate(fields):
+            if entry.name in _WINDOW_DATES and not date_in_window(entry.value, as_of):
+                field_marks[index].append("date_window")
+
+    failed: Counter[str] = Counter()
+    for marks in (*field_marks, *line_marks):
+        failed.update(marks)
+    return (
+        [
+            replace(entry, check_failed=tuple(marks)) if marks else entry
+            for entry, marks in zip(fields, field_marks, strict=True)
+        ],
+        [
+            replace(line, check_failed=tuple(marks)) if marks else line
+            for line, marks in zip(lines, line_marks, strict=True)
+        ],
+        failed,
     )
 
 
@@ -750,6 +923,17 @@ _LINE_MAP = {
     "igst": "igst_amount",
     "po_ref": "po_ref",
 }
+
+# Read-only field maps shared with AC-6 consensus. Keep these views aligned
+# with ``vision_document`` so the reader mapping has one source of truth.
+VISION_HEADER_FIELDS: Mapping[str, str] = MappingProxyType(_HEADER_MAP)
+VISION_TYPE_FIELDS: Mapping[DocType, Mapping[str, str]] = MappingProxyType(
+    {key: MappingProxyType(dict(value)) for key, value in _TYPE_MAP.items()}
+)
+VISION_REF_FIELDS: Mapping[DocType, Mapping[str, str]] = MappingProxyType(
+    {key: MappingProxyType(dict(value)) for key, value in _REF_FIELDS.items()}
+)
+VISION_LINE_FIELDS: Mapping[str, str] = MappingProxyType(_LINE_MAP)
 
 
 def _evidence(page: int, box: Box, text: str) -> dict[str, Any]:
@@ -815,8 +999,18 @@ def vision_document(
     handwritten_refs = [
         note.text
         for note in check.annotations
-        if note.looks_like in {"po_number", "grn_number", "invoice_number"}
+        if note.looks_like in {"po_number", "grn_number", "invoice_number", "service_po_number"}
     ]
+    doc_date_field = header.get("doc_date")
+    doc_date = doc_date_field.get("value") if isinstance(doc_date_field, dict) else None
+    # Typed references (WI-Q2): annotations stay hints, never header fields (MG-9).
+    handwritten_typed = typed_refs(
+        (
+            {"kind": note.kind, "text": note.text, "looks_like": note.looks_like, "page": note.page}
+            for note in check.annotations
+        ),
+        doc_date=doc_date if isinstance(doc_date, date) else None,
+    )
     header["extras"] = {
         "vision": {
             "doc_kind": check.doc_kind,
@@ -840,6 +1034,11 @@ def vision_document(
         },
         **({"marketplace_order_no": marketplace[0]} if marketplace else {}),
         **({"annotation_refs": handwritten_refs} if handwritten_refs else {}),
+        **(
+            {"typed_refs": [item.as_dict() for item in handwritten_typed]}
+            if handwritten_typed
+            else {}
+        ),
     }
 
     lines: list[dict[str, Any]] = []
@@ -949,6 +1148,56 @@ def align_lines(
     return result
 
 
+# --------------------------------------------------------------------------- page merge
+
+_PAGE_LISTS = ("pages", "fields", "lines", "annotations", "unreadable")
+
+
+@dataclass(frozen=True, slots=True)
+class MergedAnswer:
+    answer: dict[str, Any]
+    dropped_off_page: int
+    """Items an answer placed on a page other than the one image it was sent."""
+
+
+def merge_page_readings(answers: Sequence[tuple[int, Mapping[str, Any]]]) -> MergedAnswer:
+    """One document answer from answers that each read exactly one page (LLM plan WI-BE2).
+
+    ``answers`` are ``(page sent, raw answer object)``. Each list item keeps its own
+    page; an item that names any other page is dropped (the call saw no other page,
+    the same rule as "page was not sent"). ``doc_kind`` is the first page's unless
+    that page said ``other`` and a later page named a document kind. Nothing is
+    deduplicated or reconciled across pages: :func:`check_reading` rejects two
+    different values for a single-valued field.
+    """
+
+    ordered = sorted(answers, key=lambda item: item[0])
+    merged: dict[str, Any] = {name: [] for name in _PAGE_LISTS}
+    kinds: list[str] = []
+    dropped = 0
+    for page, answer in ordered:
+        kind = answer.get("doc_kind")
+        if isinstance(kind, str) and kind:
+            kinds.append(kind)
+        for name in _PAGE_LISTS:
+            items = answer.get(name)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                # ``type is int``: a JSON ``true`` must not pass for page 1.
+                if (
+                    isinstance(item, Mapping)
+                    and type(item.get("page")) is int
+                    and (item["page"] == page)
+                ):
+                    merged[name].append(dict(item))
+                else:
+                    dropped += 1
+    named = [kind for kind in kinds if kind != "other"]
+    merged["doc_kind"] = named[0] if named else (kinds[0] if kinds else "other")
+    return MergedAnswer(merged, dropped)
+
+
 __all__ = [
     "ANNOTATION_KINDS",
     "ANNOTATION_LOOKS",
@@ -958,12 +1207,15 @@ __all__ = [
     "LINE_CELLS",
     "MULTI_FIELDS",
     "PAGE_KINDS",
+    "UNREADABLE_NAMES",
     "VISION_CONFIDENCE",
     "AcceptedAnnotation",
     "AcceptedCell",
     "AcceptedField",
     "AcceptedLine",
+    "AcceptedUnreadable",
     "Box",
+    "MergedAnswer",
     "SentPage",
     "VisionAnnotation",
     "VisionCheck",
@@ -971,8 +1223,14 @@ __all__ = [
     "VisionLine",
     "VisionPageKind",
     "VisionReading",
+    "VisionUnreadable",
+    "VISION_HEADER_FIELDS",
+    "VISION_LINE_FIELDS",
+    "VISION_REF_FIELDS",
+    "VISION_TYPE_FIELDS",
     "align_lines",
     "check_reading",
+    "merge_page_readings",
     "normalize_field",
     "parse_money",
     "parse_quantity",

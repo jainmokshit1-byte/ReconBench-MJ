@@ -46,6 +46,11 @@ class AiWorkerSettings(BaseSettings):
     ai_external_calls_approval_ref: str | None = Field(
         default=None, validation_alias="RB_AI_EXTERNAL_CALLS_APPROVAL_REF"
     )
+    # Self-hosted vLLM server (WI-BE2): its own gate switch, the endpoint allowlist and
+    # the base URL this worker calls (must be on the allowlist). Unset: not registered.
+    ai_vllm_calls: str = Field(default="disabled", validation_alias="RB_AI_VLLM_CALLS")
+    ai_vllm_endpoints: str | None = Field(default=None, validation_alias="RB_AI_VLLM_ENDPOINTS")
+    ai_vllm_base_url: str | None = Field(default=None, validation_alias="RB_AI_VLLM_BASE_URL")
     ai_limits_file: Path | None = Field(default=None, validation_alias="RB_AI_LIMITS_FILE")
     ai_price_file: Path | None = Field(default=None, validation_alias="RB_AI_PRICE_FILE")
     ai_heartbeat_seconds: float = Field(default=10.0, gt=0, le=60)
@@ -57,7 +62,10 @@ class AiWorkerSettings(BaseSettings):
 
     def deployment_gate(self) -> DeploymentGate:
         return DeploymentGate.from_values(
-            self.ai_external_calls, self.ai_external_calls_approval_ref
+            self.ai_external_calls,
+            self.ai_external_calls_approval_ref,
+            vllm_mode=self.ai_vllm_calls,
+            vllm_endpoints=self.ai_vllm_endpoints,
         )
 
 

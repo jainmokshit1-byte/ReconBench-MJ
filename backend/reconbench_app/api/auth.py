@@ -21,13 +21,12 @@ from reconbench_app.authentication import (
     LoginRateLimited,
 )
 from reconbench_app.authorization import (
-    CAPABILITY_ORDER,
     PUBLIC_ROUTE_ALLOWLIST,
     ActorContext,
-    capabilities_for_role,
     public_endpoint,
     requires,
     resolve_effective_role,
+    visible_capabilities,
 )
 from reconbench_app.json_serialization import DecimalJSONResponse
 
@@ -63,17 +62,17 @@ def socket_peer_ip(request: Request) -> str:
     return ipaddress.ip_address(peer[0]).compressed
 
 
-def _capabilities_for(role: str) -> list[str]:
-    effective_role = resolve_effective_role(role)
-    allowed = capabilities_for_role(effective_role)
-    return [capability for capability in CAPABILITY_ORDER if capability in allowed]
+def _capabilities_for(stored_role: str | None) -> list[str]:
+    # P0 capabilities, minus ``ai.manage`` when the stored role lacks it (O-18), so the
+    # AI settings screen opens read-only for such a user.
+    return list(visible_capabilities(stored_role))
 
 
 def _auth_payload(context: AuthContext) -> dict[str, Any]:
     return {
         "name": context.display_name,
         "role": context.role,
-        "capabilities": _capabilities_for(context.role),
+        "capabilities": _capabilities_for(context.stored_role),
         "csrf_token": context.csrf_token,
     }
 
@@ -219,7 +218,7 @@ def login(body: LoginRequest, request: Request) -> Response:
         content={
             "name": session.display_name,
             "role": session.role,
-            "capabilities": _capabilities_for(session.role),
+            "capabilities": _capabilities_for(session.stored_role),
             "csrf_token": session.csrf_token,
         }
     )

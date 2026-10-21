@@ -47,7 +47,11 @@ jobs:
       - name: Lint and type check
         run: make check-static
 
-      # 2. Unit, property, and scenario smoke tests
+      # 2. Unit, parser, property, and scenario smoke tests
+      # Tesseract lets the OCR-marked parser tests run instead of skipping.
+      - name: Install Tesseract OCR
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng
+
       - name: Run Python and web smoke tests
         run: make test
 
@@ -276,7 +280,7 @@ jobs:
         run: uv sync --project backend --all-groups --locked
 
       - name: Build the previous schema
-        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0019
+        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0029
 
       - name: Test the migration on a copy of the previous schema
         run: uv run --project backend python scripts/check_migration_safety.py

@@ -19,8 +19,8 @@ from reconbench_core.schema import CaseResult, LineResult
 from sqlalchemy import create_engine, text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.limits import load_limits
+from reconbench_app.ai.provider_connection import ProviderConnectionService
 from reconbench_app.ai.settings_service import AiServiceConfig, AiSettingsService
 from reconbench_app.api.ai import router as ai_router
 from reconbench_app.api.auth import AuthSessionMiddleware
@@ -119,16 +119,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ai_settings_service = AiSettingsService(
         engine,
         AiServiceConfig(
-            gate=DeploymentGate.from_values(
-                resolved_settings.ai_external_calls,
-                resolved_settings.ai_external_calls_approval_ref,
-            ),
+            gate=resolved_settings.deployment_gate(),
             public_key_file=resolved_settings.ai_seal_public_key_file,
             limits_file=resolved_settings.ai_limits_file,
             price_file=resolved_settings.ai_price_file,
             vision_reader=resolved_settings.vision_reader,
         ),
         job_queue,
+    )
+    app.state.ai_provider_connection_service = ProviderConnectionService(
+        app.state.ai_settings_service
     )
 
     @app.exception_handler(StarletteHTTPException)

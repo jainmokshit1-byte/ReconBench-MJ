@@ -10,11 +10,13 @@ import json
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import boto3
+import httpx
 import pytest
 import sqlalchemy as sa
 from argon2 import PasswordHasher
@@ -28,9 +30,15 @@ from reconbench_app.ai.stub import ScriptedProvider
 from reconbench_app.ai.worker.handlers import default_handlers
 from reconbench_app.ai.worker.key_open import Keyring
 from reconbench_app.ai.worker.keytool import KEYRING_NAME, PUBLIC_KEY_NAME, generate
+from reconbench_app.ai.worker.openai_compat import OpenAICompatProvider
 from reconbench_app.ai.worker.runner import AiRequestRunner
+from reconbench_app.ai.worker.sweeps import provider_health
 from reconbench_app.api.application import create_app
-from reconbench_app.authorization import _iter_routes, authorization_declaration
+from reconbench_app.authorization import (
+    _iter_routes,
+    authorization_declaration,
+    capabilities_for_role,
+)
 from reconbench_app.db.metadata import metadata
 from reconbench_app.settings import Settings
 from sqlalchemy.engine import Engine, make_url
@@ -89,7 +97,7 @@ class Harness:
             gate=DeploymentGate.from_values("synthetic_only", None),
             limits=lambda: LimitsState(AiLimits()),
             prices=lambda: None,
-            provider=provider,
+            providers={provider.name: provider},
             handlers=default_handlers(),
         )
 
@@ -117,7 +125,14 @@ def _reset(engine: Engine) -> tuple[UUID, UUID, str]:
             ),
             {"w": workspace_id},
         ).one()
-        for table in ("ai_call_log", "ai_request", "ai_setting", "secret", "session"):
+        for table in (
+            "ai_call_log",
+            "ai_request",
+            "ai_provider_config",
+            "ai_setting",
+            "secret",
+            "session",
+        ):
             connection.execute(
                 sa.text(f"DELETE FROM {table} WHERE workspace_id = :w"), {"w": workspace_id}
             )
@@ -427,6 +442,51 @@ def test_consent_preview_lets_the_card_turn_ai_on_from_rules_only(harness: Harne
         assert SENTINEL_KEY not in bad.text
 
 
+def test_auto_verify_field_selection_is_opt_in_and_reconsented(harness: Harness) -> None:
+    _enable(harness)
+    current = harness.get()
+    assert current["auto_verify"]["field_types"] == []
+    assert [item["type"] for item in current["auto_verify"]["available_field_types"]] == [
+        "doc_date",
+        "doc_no",
+        "gstin",
+        "line_amount",
+        "reference",
+    ]
+    params = [
+        ("mode", "ai_assisted"),
+        ("model", MODEL),
+        ("auto_verify_field_types", "doc_no"),
+        ("auto_verify_field_types", "gstin"),
+    ]
+    preview_response = harness.client.get("/api/v1/ai/consent-preview", params=params)
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    assert preview["text_version"] == "consent.v2"
+    assert preview["auto_verify_field_types"] == ["doc_no", "gstin"]
+    assert "document number" in preview["text"] and "GSTIN" in preview["text"]
+
+    missing_consent = harness.put({"auto_verify_field_types": ["doc_no", "gstin"]})
+    assert missing_consent.status_code == 422
+    assert missing_consent.json()["code"] == "consent_required"
+    saved = harness.put(
+        {
+            "auto_verify_field_types": ["doc_no", "gstin"],
+            "consent": {"accept": True, "fingerprint": preview["fingerprint"]},
+        }
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["auto_verify"]["field_types"] == ["doc_no", "gstin"]
+    assert saved.json()["consent"]["current"] is True
+    assert saved.json()["consent"]["text_version"] == "consent.v2"
+
+    changed_again = harness.put({"auto_verify_field_types": ["doc_no"]})
+    assert changed_again.status_code == 422
+    assert changed_again.json()["code"] == "consent_required"
+    invalid = harness.put({"auto_verify_field_types": ["amount"]})
+    assert invalid.status_code == 422
+
+
 def test_status_ladder_never_says_connected(
     harness: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -650,3 +710,385 @@ def test_page_images_need_their_own_consent_and_a_server_reader(harness: Harness
     assert harness.get()["vision"]["available"] is False
     closed = harness.client.get("/api/v1/ai/consent-preview", params=params)
     assert closed.status_code == 422 and closed.json()["code"] == "vision_unavailable"
+
+
+# -- WI-BE3: separate providers (Gemini and the company vLLM server) -------------------------
+
+VLLM_URL = "http://vllm.example.test/vllm/v1"
+VLLM_MODEL = "qwen3.5:9b"
+LOCAL_SENTINEL_KEY = "local-SENTINEL-vllm-key-000000"
+
+
+def _vllm_gate(h: Harness, mode: str = "enabled", endpoints: str = VLLM_URL) -> None:
+    service = h.app.state.ai_settings_service
+    service.config = replace(
+        service.config,
+        gate=DeploymentGate.from_values(
+            "enabled", "CMP-1", vllm_mode=mode, vllm_endpoints=endpoints
+        ),
+    )
+
+
+def _vllm_card(**overrides: Any) -> dict[str, Any]:
+    return {
+        "provider": "vllm",
+        "enabled": True,
+        "model": VLLM_MODEL,
+        "base_url": VLLM_URL,
+        **overrides,
+    }
+
+
+def _audit(h: Harness, action: str) -> list[Any]:
+    with h.engine.connect() as connection:
+        return list(
+            connection.execute(
+                sa.text(
+                    "SELECT before_state, after_state FROM audit_log "
+                    "WHERE workspace_id = :w AND action = :a ORDER BY seq"
+                ),
+                {"w": h.workspace_id, "a": action},
+            ).mappings()
+        )
+
+
+def _vllm_preview(h: Harness) -> dict[str, Any]:
+    response = h.client.get(
+        "/api/v1/ai/consent-preview",
+        params={
+            "mode": "ai_assisted",
+            "model": MODEL,
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "vllm_model": VLLM_MODEL,
+            "vllm_base_url": VLLM_URL,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+def test_legacy_settings_keep_their_fingerprint_and_get_a_gemini_card(harness: Harness) -> None:
+    view = _enable(harness)
+    # A legacy save is unchanged: same fingerprint, Gemini card mirrors the text settings.
+    assert view["consent"]["required_fingerprint"] == ai_consent.consent_fingerprint(
+        provider="gemini", model=MODEL, mode="ai_assisted"
+    )
+    assert (view["reader_strategy"], view["primary_reader"], view["secondary_reader"]) == (
+        "off",
+        None,
+        None,
+    )
+    assert view["apply_mode"] == "suggest" and view["vllm_calls"] == "disabled"
+    gemini, vllm = view["providers"]
+    assert (gemini["provider"], gemini["enabled"], gemini["model"]) == ("gemini", True, MODEL)
+    assert gemini["key"]["set"] is True and gemini["external"] is True
+    assert "Google Gemini API" in gemini["data_destination"]
+    assert (vllm["provider"], vllm["enabled"], vllm["base_url"]) == ("vllm", False, None)
+    # The legacy "vision" flag is single + Gemini with the legacy fingerprint.
+    legacy = ai_consent.consent_fingerprint(
+        provider="gemini", model=MODEL, mode="ai_assisted", vision=True
+    )
+    saved = harness.put({"vision": True, "consent": {"accept": True, "fingerprint": legacy}})
+    assert saved.status_code == 200, saved.text
+    on = saved.json()
+    assert (on["reader_strategy"], on["primary_reader"]) == ("single", "gemini")
+    assert on["vision"]["enabled"] is True and on["consent"]["current"] is True
+    with harness.engine.connect() as connection:
+        row = connection.execute(
+            sa.text(
+                "SELECT vision_enabled, reader_strategy, primary_reader FROM ai_setting "
+                "WHERE workspace_id = :w"
+            ),
+            {"w": harness.workspace_id},
+        ).one()
+    assert tuple(row) == (True, "single", "gemini")
+    change = _audit(harness, "ai.reader_strategy_change")[-1]
+    assert change["after_state"] == {"reader_strategy": "single", "primary_reader": "gemini"}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://169.254.169.254/latest",
+        "http://user@vllm.example.test/vllm/v1",
+        "http://vllm.example.test/vllm/v1?y=1",
+        "http://vllm.example.test/vllm/v1/x",
+        "http://vllm.example.test/vllm",
+        "http://[::1]/vllm/v1",
+        "https://vllm.example.test/vllm/v1",
+        "http://vllm.example.test:8000/vllm/v1",
+        "http://vllm.example.test/vllm/../v1",
+        "file:///etc/passwd",
+    ],
+)
+def test_company_server_url_must_match_the_allowlist_exactly(
+    harness: Harness, base_url: str
+) -> None:
+    _vllm_gate(harness)
+    response = harness.put({"providers": [_vllm_card(base_url=base_url)]})
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == "endpoint_not_allowed"
+    preview = harness.client.get(
+        "/api/v1/ai/consent-preview",
+        params={
+            "mode": "ai_assisted",
+            "model": MODEL,
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "vllm_model": VLLM_MODEL,
+            "vllm_base_url": base_url,
+        },
+    )
+    assert preview.status_code == 422 and preview.json()["code"] == "endpoint_not_allowed"
+    with harness.engine.connect() as connection:
+        assert not connection.scalar(
+            sa.text("SELECT count(*) FROM ai_provider_config WHERE workspace_id = :w"),
+            {"w": harness.workspace_id},
+        )
+
+
+def test_company_server_url_is_stored_normalised_and_audited_by_origin(harness: Harness) -> None:
+    _vllm_gate(harness)
+    response = harness.put(
+        {"providers": [_vllm_card(base_url="HTTP://VLLM.Example.TEST:80/vllm/v1/")]}
+    )
+    assert response.status_code == 200, response.text
+    vllm = response.json()["providers"][1]
+    assert (vllm["enabled"], vllm["model"], vllm["base_url"]) == (True, VLLM_MODEL, VLLM_URL)
+    assert vllm["key"]["set"] is False and vllm["external"] is False
+    assert VLLM_URL in vllm["data_destination"]
+    saved = _audit(harness, "ai.provider_config_save")[-1]
+    assert saved["before_state"] is None
+    assert saved["after_state"]["base_url_origin"] == "http://vllm.example.test"
+    assert "base_url" not in saved["after_state"] and saved["after_state"]["key_set"] is False
+    # With no allowlist, a URL cannot be (re)submitted; other fields still save.
+    _vllm_gate(harness, mode="disabled", endpoints="")
+    model_only = harness.put({"providers": [{"provider": "vllm", "model": "qwen3.5:4b"}]})
+    assert model_only.status_code == 200, model_only.text
+    moved = harness.put({"providers": [_vllm_card()]})
+    assert moved.status_code == 422 and moved.json()["code"] == "endpoint_not_allowed"
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        {"provider": "vllm", "model": "bad model with spaces"},
+        {"provider": "vllm", "model": "-leading-dash"},
+        {"provider": "gemini", "base_url": VLLM_URL},
+        {"provider": "gemini", "model": VLLM_MODEL},
+        {"provider": "vllm", "api_key": "short"},
+        {"provider": "vllm", "limits": {"max_concurrency": 9}},
+        {"provider": "vllm", "limits": {"anything": 1}},
+        {"provider": "claude"},
+    ],
+)
+def test_invalid_provider_cards_are_rejected(harness: Harness, card: dict[str, Any]) -> None:
+    _vllm_gate(harness)
+    response = harness.put({"providers": [card]})
+    assert response.status_code == 422
+    assert LOCAL_SENTINEL_KEY not in response.text
+
+
+def test_company_server_key_is_optional_write_only_and_removable(harness: Harness) -> None:
+    _vllm_gate(harness)
+    keyless = harness.put({"providers": [_vllm_card()]})
+    assert keyless.status_code == 200 and keyless.json()["providers"][1]["key"]["set"] is False
+    keyed = harness.put({"providers": [_vllm_card(api_key=LOCAL_SENTINEL_KEY)]})
+    assert keyed.status_code == 200, keyed.text
+    key = keyed.json()["providers"][1]["key"]
+    assert key == {
+        "set": True,
+        "hint": "****" + LOCAL_SENTINEL_KEY[-4:],
+        "storage": "saved",
+        "expires_at": None,
+    }
+    bodies = [keyed.text, json.dumps(harness.get())]
+    with harness.engine.connect() as connection:
+        for table in ("secret", "ai_setting", "ai_provider_config", "audit_log"):
+            rows = connection.execute(
+                sa.text(f"SELECT * FROM {table} WHERE workspace_id = :w"),
+                {"w": harness.workspace_id},
+            ).all()
+            bodies.extend(repr(tuple(row)) for row in rows)
+    for body in bodies:
+        assert LOCAL_SENTINEL_KEY not in body
+    assert _secret_count(harness) == 1
+    removed = harness.put({"providers": [{"provider": "vllm", "remove_key": True}]})
+    assert removed.status_code == 200 and removed.json()["providers"][1]["key"]["set"] is False
+    assert _secret_count(harness) == 0
+
+
+def test_session_company_server_key_ends_with_the_session(harness: Harness) -> None:
+    _vllm_gate(harness)
+    saved = harness.put(
+        {"providers": [_vllm_card(api_key=LOCAL_SENTINEL_KEY, key_storage="session")]}
+    )
+    assert saved.status_code == 200 and saved.json()["providers"][1]["key"]["storage"] == "session"
+    version = saved.json()["version"]
+    assert harness.client.post("/api/v1/auth/logout", headers=harness.headers()).status_code == 204
+    assert _secret_count(harness) == 0
+    harness.login()
+    view = harness.get()
+    assert view["providers"][1]["key"]["set"] is False and view["version"] > version
+
+
+def test_switching_the_reader_to_the_company_server_needs_new_consent(harness: Harness) -> None:
+    _vllm_gate(harness)
+    _enable(harness)
+    card = harness.put({"providers": [_vllm_card()]})
+    assert card.status_code == 200 and card.json()["consent"]["current"] is True
+    refused = harness.put({"reader_strategy": "single", "primary_reader": "vllm"})
+    assert refused.status_code == 422 and refused.json()["code"] == "consent_required"
+    preview = _vllm_preview(harness)
+    assert preview["hooks"][0]["hook"] == "h6_vision:fallback"
+    assert "company vLLM server" in preview["text"] and VLLM_URL in preview["text"]
+    assert preview["providers"][1]["data_destination"].startswith("Company vLLM server at")
+    assert preview["fingerprint"] != ai_consent.consent_fingerprint(
+        provider="gemini", model=MODEL, mode="ai_assisted", vision=True
+    )
+    saved = harness.put(
+        {
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "consent": {"accept": True, "fingerprint": preview["fingerprint"]},
+        }
+    )
+    assert saved.status_code == 200, saved.text
+    on = saved.json()
+    assert (on["reader_strategy"], on["primary_reader"]) == ("single", "vllm")
+    assert on["consent"]["current"] is True and on["vision"]["enabled"] is True
+    change = _audit(harness, "ai.reader_strategy_change")[-1]
+    assert change["before_state"] == {"reader_strategy": "off", "primary_reader": None}
+    # A new model on the server is a new data destination: consent is outdated again.
+    moved = harness.put({"providers": [_vllm_card(model="qwen3.5:4b")]})
+    assert moved.status_code == 422 and moved.json()["code"] == "consent_required"
+    # Disabling the server card while it is the reader is refused.
+    disabled = harness.put({"providers": [_vllm_card(enabled=False)]})
+    assert disabled.status_code == 422 and disabled.json()["code"] == "provider_not_configured"
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "code"),
+    [
+        ({"apply_mode": "merge"}, 422, "merge_not_enabled"),
+        ({"reader_strategy": "single", "primary_reader": "vllm"}, 422, "provider_not_configured"),
+        ({"reader_strategy": "off", "primary_reader": "gemini"}, 422, "invalid_reader_strategy"),
+        ({"reader_strategy": "dual_agree", "primary_reader": "gemini"}, 422, None),
+        ({"secondary_reader": "vllm"}, 422, None),
+        ({"providers": [_vllm_card(), _vllm_card()]}, 422, None),
+    ],
+)
+def test_unsupported_strategies_are_refused(
+    harness: Harness, body: dict[str, Any], status: int, code: str | None
+) -> None:
+    _vllm_gate(harness)
+    _enable(harness)
+    response = harness.put(body)
+    assert response.status_code == status, response.text
+    if code is not None:
+        assert response.json()["code"] == code
+    assert harness.get()["apply_mode"] == "suggest"
+
+
+def test_only_managers_hold_ai_manage() -> None:
+    # P0 maps every session to manager; the capability table is what later roles get.
+    assert "ai.manage" in capabilities_for_role("manager")
+    assert "ai.manage" not in capabilities_for_role("ap_executive")
+    assert "ai.manage" not in capabilities_for_role("auditor")
+
+
+def test_company_server_test_is_keyless_synthetic_and_recorded_on_its_card(
+    harness: Harness,
+) -> None:
+    harness.heartbeat()
+    _vllm_gate(harness, mode="synthetic_only")
+    _enable(harness)
+    harness.put({"providers": [_vllm_card()]})
+    image = harness.client.post(
+        "/api/v1/ai/test/provider",
+        json={"provider": "vllm", "kind": "image"},
+        headers=harness.headers(),
+    )
+    assert image.status_code == 422 and image.json()["code"] == "image_test_not_available"
+    queued = harness.client.post(
+        "/api/v1/ai/test/provider", json={"provider": "vllm"}, headers=harness.headers()
+    )
+    assert queued.status_code == 202, queued.text
+    request_id = UUID(queued.json()["request_id"])
+    with harness.engine.connect() as connection:
+        row = connection.execute(
+            sa.text("SELECT provider, model, call_kind FROM ai_request WHERE id = :id"),
+            {"id": request_id},
+        ).one()
+    assert tuple(row) == ("vllm", VLLM_MODEL, "provider_test")
+    requested = _audit(harness, "ai.test_requested")[-1]
+    assert requested["after_state"]["provider"] == "vllm"
+
+    sent: list[httpx.Request] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": VLLM_MODEL, "max_model_len": 8192}]})
+        return httpx.Response(
+            200,
+            json={
+                "model": VLLM_MODEL,
+                "choices": [{"message": {"content": '{"status":"ok"}'}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 4},
+            },
+        )
+
+    provider = OpenAICompatProvider(
+        VLLM_URL, frozenset({VLLM_URL}), inner_transport=httpx.MockTransport(server)
+    )
+    runner = AiRequestRunner(
+        engine=harness.engine,
+        keyring=harness.keyring,
+        gate=DeploymentGate.from_values(
+            "disabled", None, vllm_mode="synthetic_only", vllm_endpoints=VLLM_URL
+        ),
+        limits=lambda: LimitsState(AiLimits()),
+        prices=lambda: None,
+        providers={"vllm": provider},
+        handlers=default_handlers(),
+    )
+    result = runner.run(request_id)
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
+    assert all("authorization" not in request.headers for request in sent)
+    view = harness.get()
+    assert view["providers"][1]["last_test"]["ok"] is True
+    # The Gemini status ladder is not satisfied by a company-server test.
+    assert view["status"]["code"] == "NOT_TESTED"
+    usage = harness.client.get("/api/v1/ai/usage", params={"provider": "vllm"})
+    assert usage.status_code == 200 and usage.json()["provider"] == "vllm"
+    assert usage.json()["usd_today"] is None
+    assert harness.client.get("/api/v1/ai/usage", params={"provider": "x"}).status_code == 422
+
+
+def test_health_heartbeat_marks_each_enabled_server_card(harness: Harness) -> None:
+    _vllm_gate(harness)
+    harness.put({"providers": [_vllm_card()]})
+    calls: list[str] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"data": [{"id": VLLM_MODEL, "max_model_len": 8192}]})
+
+    default_url = "http://vllm-default.example.test/v1"
+    provider = OpenAICompatProvider(
+        default_url, frozenset({default_url, VLLM_URL}), inner_transport=httpx.MockTransport(server)
+    )
+    now = datetime.now(UTC)
+    assert provider_health(harness.engine, provider, now) == 1
+    assert calls == [f"{VLLM_URL}/models"]
+    health = harness.get()["providers"][1]["health"]
+    assert health["ok"] is True and health["at"] is not None
+    # A URL that is no longer allowlisted is marked unhealthy without any request.
+    narrowed = OpenAICompatProvider(
+        default_url, frozenset({default_url}), inner_transport=httpx.MockTransport(server)
+    )
+    assert provider_health(harness.engine, narrowed, now) == 1
+    assert calls == [f"{VLLM_URL}/models"]
+    assert harness.get()["providers"][1]["health"]["ok"] is False

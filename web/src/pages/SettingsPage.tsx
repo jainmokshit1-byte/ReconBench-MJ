@@ -127,6 +127,7 @@ export function SettingsPage() {
 
   const engine = engineOf(config?.body);
   const defaults = engineOf(config?.defaults);
+  const savedEngine = engineOf(saved?.body);
   const changes = useMemo(() => (saved && config ? diffConfig(saved.body, config.body) : []), [saved, config]);
   const clientErrors = useMemo(() => (engine ? validateEngine(engine) : {}), [engine]);
   const errors = { ...serverErrors, ...clientErrors };
@@ -236,6 +237,7 @@ export function SettingsPage() {
     {notice === "saved" ? <div className="mapping-info" role="status">Configuration saved as version {config?.seq}. Existing reconciliation cases are now stale and keep their old settings until you re-run. <Link className="text-link" to="/reconciliation">Open Reconciliation to re-run</Link></div> : notice ? <div className="mapping-info" role="status">{notice}</div> : null}
     {loading ? <div className="panel">Loading workspace settings…</div> : null}
     {!canChangeSettings && config ? <div className="mapping-info" role="note">You can view settings. Only a manager can change them.</div> : null}
+    {savedEngine && !savedEngine.buyer_entities.some((entity) => entity.gstin.trim()) ? <div className="mapping-info" role="note" aria-label="Buyer entities not configured">Your company's own GSTINs are not set. Until they are, PDF readings cannot tell your GSTIN apart from the supplier's, so every supplier GSTIN needs review. Uploads still work. <a className="text-link" href="#buyer-entities">Add buyer entities</a></div> : null}
     {config && sectionProps ? <>
       <TolerancesSection {...sectionProps} vendors={vendors} />
       <PoliciesSection {...sectionProps} />
