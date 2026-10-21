@@ -17,6 +17,7 @@ import {
   type MappingVendor,
   type VendorAlias,
 } from "../api/mapping";
+import { AiProvidersPanel } from "../components/AiProvidersPanel";
 import { PageHeader } from "../components/PageHeader";
 import { useAuth } from "../auth/useAuth";
 import { diffConfig, validateEngine, type ConfigChange, type EngineBody } from "../settings/configModel";
@@ -238,6 +239,7 @@ export function SettingsPage() {
     {loading ? <div className="panel">Loading workspace settings…</div> : null}
     {!canChangeSettings && config ? <div className="mapping-info" role="note">You can view settings. Only a manager can change them.</div> : null}
     {savedEngine && !savedEngine.buyer_entities.some((entity) => entity.gstin.trim()) ? <div className="mapping-info" role="note" aria-label="Buyer entities not configured">Your company's own GSTINs are not set. Until they are, PDF readings cannot tell your GSTIN apart from the supplier's, so every supplier GSTIN needs review. Uploads still work. <a className="text-link" href="#buyer-entities">Add buyer entities</a></div> : null}
+    <AiProvidersPanel />
     {config && sectionProps ? <>
       <TolerancesSection {...sectionProps} vendors={vendors} />
       <PoliciesSection {...sectionProps} />

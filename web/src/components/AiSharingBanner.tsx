@@ -6,16 +6,37 @@ import type { AiSharingSummary } from "../api/ai";
 
 const providerNames: Record<string, string> = { gemini: "Google Gemini" };
 
-function sharingText(summary: AiSharingSummary): string {
+/** Page reading: the selected reader. The company server has its own gate. */
+function pageReadingText(summary: AiSharingSummary): string | null {
+  const model = summary.page_reader_model ? ` (${summary.page_reader_model})` : "";
+  if (summary.page_reader === "vllm") {
+    return summary.vllm_calls === "disabled"
+      ? "Page reading by the company vLLM server is disabled on this deployment."
+      : `Page reading: masked page images are read by Qwen${model} on the company vLLM server; they do not leave the company network.`;
+  }
+  if (summary.page_reader === "gemini") {
+    return summary.external_calls === "enabled"
+      ? `Page reading: masked page images are sent to Google Gemini${model}.`
+      : "Page reading by Google Gemini is disabled on this deployment.";
+  }
+  return null;
+}
+
+/** Text assist (item match, PO re-rank, vendor opinion): the workspace's Gemini model. */
+function textAssistText(summary: AiSharingSummary): string {
   if (summary.external_calls === "disabled") {
-    return "External calls are disabled on this deployment, so no document data leaves ReconBench.";
+    return "Text assist: external calls are disabled on this deployment, so no document text is sent.";
   }
   if (summary.external_calls === "synthetic_only") {
-    return "External calls are limited to built-in synthetic test fixtures; uploaded documents are not sent.";
+    return "Text assist: limited to built-in synthetic test fixtures; uploaded documents are not sent.";
   }
   const provider = summary.provider ? providerNames[summary.provider] ?? summary.provider : "the AI provider";
   const model = summary.model ? ` (${summary.model})` : "";
-  return `Eligible document text is redacted and sent to ${provider}${model}.`;
+  return `Text assist: eligible document text is redacted and sent to ${provider}${model}.`;
+}
+
+function sharingText(summary: AiSharingSummary): string {
+  return [pageReadingText(summary), textAssistText(summary)].filter(Boolean).join(" ");
 }
 
 /** Shown on review screens whenever AI Assist is on; nothing is shown in rules-only mode. */

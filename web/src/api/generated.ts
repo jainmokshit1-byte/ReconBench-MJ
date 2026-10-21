@@ -602,6 +602,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/documents/{document_id}/links/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm Document Links
+         * @description Confirm the listed current links of one document to one PO in a single transaction.
+         */
+        post: operations["confirm_document_links_api_v1_documents__document_id__links_confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/documents/{document_id}/raw": {
         parameters: {
             query?: never;
@@ -1757,6 +1777,16 @@ export interface components {
             /** Uom */
             uom?: string | null;
         };
+        /** DocumentLinksConfirmBody */
+        DocumentLinksConfirmBody: {
+            /** Links */
+            links: components["schemas"]["LinkVersionBody"][];
+            /**
+             * To Document Id
+             * Format: uuid
+             */
+            to_document_id: string;
+        };
         /** DuplicatePolicyBody */
         DuplicatePolicyBody: {
             /** Suspect Days */
@@ -2105,6 +2135,16 @@ export interface components {
             /** Po No */
             po_no: string;
             state: components["schemas"]["LinkState"];
+        };
+        /** LinkVersionBody */
+        LinkVersionBody: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Version No */
+            version_no: number;
         };
         /** LoginRequest */
         LoginRequest: {
@@ -3815,6 +3855,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["DocumentCorrectionBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    confirm_document_links_api_v1_documents__document_id__links_confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocumentLinksConfirmBody"];
             };
         };
         responses: {

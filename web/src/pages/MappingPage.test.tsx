@@ -120,11 +120,11 @@ describe("Mapping workflow", () => {
           links: [],
         }]) : response(200, [invoice]);
       }
-      if (url.pathname === `/api/v1/links/${linkId}` && method === "PATCH") {
-        expect(new Headers(init.headers).get("If-Match")).toBe('"1"');
+      if (url.pathname === `/api/v1/documents/${invoiceId}/links/confirm` && method === "POST") {
         expect(new Headers(init.headers).get("X-CSRF-Token")).toBe("csrf-mapping-test");
+        expect(JSON.parse(String(init.body))).toEqual({ to_document_id: poId, links: [{ id: linkId, version_no: 1 }] });
         currentState = "confirmed";
-        return response(200, currentLink());
+        return response(200, { confirmed: 1, items: [currentLink()] });
       }
       throw new Error(`Unexpected request: ${method} ${url.pathname}${url.search}`);
     });
@@ -138,12 +138,76 @@ describe("Mapping workflow", () => {
     expect(within(row).getByText(/labeled · 99%/)).toBeInTheDocument();
     fireEvent.click(within(row).getByText("Evidence"));
     expect(within(row).getByText("Purchase Order No: PO-2026-001")).toBeInTheDocument();
-    fireEvent.click(within(row).getByRole("button", { name: /Confirm/ }));
+    fireEvent.click(within(row).getByRole("button", { name: /Confirm link/ }));
     await waitFor(() => expect(request).toHaveBeenCalledWith(
-      expect.stringContaining(`/api/v1/links/${linkId}`),
-      expect.objectContaining({ method: "PATCH" }),
+      expect.stringContaining(`/api/v1/documents/${invoiceId}/links/confirm`),
+      expect.objectContaining({ method: "POST" }),
     ));
-    expect(await screen.findByRole("status")).toHaveTextContent(/Link confirm was saved/);
+    expect(await screen.findByRole("status")).toHaveTextContent(/1 link was confirmed/);
+  });
+
+  it("confirms an invoice's line links in one click, flags unlinked lines and survives choosing a PO", async () => {
+    const lineLink = (lineNo: number) => ({
+      id: `line-link-${lineNo}`,
+      version_no: 1,
+      po_document_id: poId,
+      po_no: "PO-2026-001",
+      method: "content",
+      confidence: "0.88",
+      state: "suggested",
+      ai_suggested: false,
+      evidence: null,
+      level: "line",
+      line_no: lineNo,
+    });
+    const invoice = {
+      id: invoiceId,
+      doc_type: "invoice",
+      doc_no: "INV-2026-003",
+      vendor_name: "Acme Components",
+      vendor_gstin: "27AAPFU0939F1ZV",
+      doc_date: "2026-04-02",
+      grand_total: "236.00",
+      currency: "INR",
+      source_file_id: "file-synthetic-1",
+      vendor_id: vendorId,
+      needs_verification: false,
+      links: [lineLink(1), lineLink(2)],
+      line_nos: [1, 2, 3],
+      resolution: { outcome: "suggested", resolved_step: 3, detail_code: null, cited_refs: [], candidates: [] },
+    };
+    const request = installFetch((url, init) => {
+      const method = init.method ?? "GET";
+      if (url.pathname === "/api/v1/vendors" && method === "GET") return response(200, [vendor]);
+      if (url.pathname === "/api/v1/vendor-merge-suggestions" && method === "GET") return response(200, []);
+      if (url.pathname === `/api/v1/vendors/${vendorId}/documents` && method === "GET") {
+        return url.searchParams.get("doc_type") === "po"
+          ? response(200, [{ ...invoice, id: poId, doc_type: "po", doc_no: "PO-2026-001", links: [], line_nos: [1] }])
+          : response(200, [invoice]);
+      }
+      if (url.pathname === `/api/v1/documents/${invoiceId}/links/confirm` && method === "POST") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          to_document_id: poId,
+          links: [{ id: "line-link-1", version_no: 1 }, { id: "line-link-2", version_no: 1 }],
+        });
+        return response(200, { confirmed: 2, items: [] });
+      }
+      throw new Error(`Unexpected request: ${method} ${url.pathname}${url.search}`);
+    });
+
+    renderMapping();
+    const row = await screen.findByRole("row", { name: /INV-2026-003/ });
+    expect(within(row).getByText("2 of 3 lines linked")).toBeInTheDocument();
+    expect(within(row).getByRole("note")).toHaveTextContent(/line 3 has no link to this PO/);
+    // Choosing a replacement PO used to blank the page (the event was read inside a state updater).
+    fireEvent.change(within(row).getByRole("combobox"), { target: { value: poId } });
+    expect(within(row).getByRole("button", { name: "Change" })).toBeInTheDocument();
+    fireEvent.click(within(row).getByRole("button", { name: /Confirm link \(2 lines\)/ }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith(
+      expect.stringContaining(`/api/v1/documents/${invoiceId}/links/confirm`),
+      expect.objectContaining({ method: "POST" }),
+    ));
+    expect(await screen.findByRole("status")).toHaveTextContent(/2 links were confirmed/);
   });
 
   it("pins Unassigned and allows a person to assign a document", async () => {

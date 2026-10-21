@@ -178,6 +178,8 @@ export async function downloadReconciliationExport(exportId: string): Promise<vo
 
 export async function listReconciliationCases(filters: {
   vendorId?: string | null;
+  /** Only the cases this run evaluated. */
+  runId?: string | null;
   status?: string | null;
   from?: string | null;
   to?: string | null;
@@ -185,6 +187,7 @@ export async function listReconciliationCases(filters: {
 }): Promise<CasesPage> {
   const params = new URLSearchParams();
   if (filters.vendorId) params.set("vendor_id", filters.vendorId);
+  if (filters.runId) params.set("run_id", filters.runId);
   if (filters.status) params.append("status", filters.status);
   if (filters.from) params.set("from", filters.from);
   if (filters.to) params.set("to", filters.to);

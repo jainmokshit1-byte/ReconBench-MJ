@@ -38,6 +38,10 @@ export interface AiSharingSummary {
   mode_label: string;
   provider: string | null;
   model: string | null;
+  /** Provider that reads page images now (null when page reading is off). */
+  page_reader: "gemini" | "vllm" | null;
+  page_reader_model: string | null;
+  vllm_calls: string;
   external_calls: string;
   status: { code: string; label: string };
 }
@@ -118,11 +122,20 @@ export async function getAiSharingSummary(): Promise<AiSharingSummary> {
   if (!isObject(value) || typeof value["mode"] !== "string" || !isObject(value["status"])) {
     throw new Error("The server returned invalid AI settings.");
   }
+  const strategy = value["reader_strategy"];
+  const primary = value["primary_reader"];
+  const reader = strategy === "single" || strategy === "shadow" ? (primary === "vllm" || primary === "gemini" ? primary : null) : null;
+  const readerCard = Array.isArray(value["providers"])
+    ? value["providers"].find((card: unknown) => isObject(card) && card["provider"] === reader)
+    : undefined;
   return {
     mode: value["mode"],
     mode_label: text(value["mode_label"]) ?? value["mode"],
     provider: text(value["provider"]),
     model: text(value["model"]),
+    page_reader: reader,
+    page_reader_model: isObject(readerCard) ? text(readerCard["model"]) : null,
+    vllm_calls: text(value["vllm_calls"]) ?? "disabled",
     external_calls: text(value["external_calls"]) ?? "disabled",
     status: { code: text(value["status"]["code"]) ?? "UNKNOWN", label: text(value["status"]["label"]) ?? "" },
   };
@@ -202,8 +215,27 @@ export interface AiAutoVerifyFieldOption {
   label: string;
 }
 
+export type AiProviderName = "gemini" | "vllm";
+export type AiReaderStrategy = "off" | "shadow" | "single";
+
+/** One provider card from `GET /ai/settings` (Gemini or the company vLLM server). */
+export interface AiProviderCard {
+  provider: AiProviderName;
+  enabled: boolean;
+  model: string | null;
+  base_url: string | null;
+  external: boolean;
+  data_destination: string;
+  connection: { state: string; reason_code: string | null; checked_at: string | null; connected_at: string | null };
+}
+
 /** `GET /ai/settings`; the key is never part of it, only a four-character hint. */
 export interface AiSettingsView {
+  /** Which provider reads page images (`single`), or none (`off`). */
+  reader_strategy: AiReaderStrategy;
+  primary_reader: AiProviderName | null;
+  vllm_calls: string;
+  providers: AiProviderCard[];
   version: number;
   mode: AiMode;
   mode_label: string;
@@ -270,6 +302,8 @@ export interface AiSettingsUpdate {
   withdraw_consent?: boolean;
   vision?: boolean;
   auto_verify_field_types?: AiAutoVerifyFieldType[];
+  reader_strategy?: AiReaderStrategy;
+  primary_reader?: AiProviderName;
 }
 
 export class AiApiError extends Error {
@@ -309,6 +343,43 @@ function parseHooks(value: unknown): AiHookDisclosure[] {
 const aiModes: readonly AiMode[] = ["rules_only", "ai_assisted", "ai_first"];
 const autoVerifyTypes: readonly AiAutoVerifyFieldType[] = ["doc_date", "doc_no", "gstin", "line_amount", "reference"];
 
+function parseProviderCard(value: unknown): AiProviderCard[] {
+  if (!isObject(value) || (value["provider"] !== "gemini" && value["provider"] !== "vllm")) return [];
+  const connection = isObject(value["connection"]) ? value["connection"] : {};
+  return [{
+    provider: value["provider"],
+    enabled: value["enabled"] === true,
+    model: text(value["model"]),
+    base_url: text(value["base_url"]),
+    external: value["external"] !== false,
+    data_destination: text(value["data_destination"]) ?? "",
+    connection: {
+      state: text(connection["state"]) ?? "not_connected",
+      reason_code: text(connection["reason_code"]),
+      checked_at: text(connection["checked_at"]),
+      connected_at: text(connection["connected_at"]),
+    },
+  }];
+}
+
+/** Reader part of a consent preview, so a saved reader choice keeps its own fingerprint. */
+export interface AiReaderPreview {
+  reader_strategy: AiReaderStrategy;
+  primary_reader: AiProviderName | null;
+  vllm_model?: string | null;
+  vllm_base_url?: string | null;
+}
+
+/** The reader settings a preview must use to describe what is saved now. */
+export function currentReaderPreview(view: Pick<AiSettingsView, "reader_strategy" | "primary_reader" | "providers">): AiReaderPreview {
+  const vllm = view.providers.find((card) => card.provider === "vllm");
+  return {
+    reader_strategy: view.reader_strategy,
+    primary_reader: view.primary_reader,
+    ...(view.primary_reader === "vllm" ? { vllm_model: vllm?.model ?? null, vllm_base_url: vllm?.base_url ?? null } : {}),
+  };
+}
+
 function parseSettings(value: unknown): AiSettingsView {
   if (!isObject(value) || typeof value["version"] !== "number" || !aiModes.includes(value["mode"] as AiMode)
     || !isObject(value["key"]) || !isObject(value["consent"]) || !isObject(value["status"])) {
@@ -329,7 +400,14 @@ function parseSettings(value: unknown): AiSettingsView {
       ? [{ type: item["type"] as AiAutoVerifyFieldType, label: text(item["label"]) ?? item["type"] as AiAutoVerifyFieldType }]
       : [])
     : [];
+  const readerStrategy = value["reader_strategy"];
+  const primaryReader = value["primary_reader"];
+  const providers = Array.isArray(value["providers"]) ? value["providers"].flatMap(parseProviderCard) : [];
   return {
+    reader_strategy: readerStrategy === "shadow" || readerStrategy === "single" ? readerStrategy : "off",
+    primary_reader: primaryReader === "gemini" || primaryReader === "vllm" ? primaryReader : null,
+    vllm_calls: text(value["vllm_calls"]) ?? "disabled",
+    providers,
     version: value["version"],
     mode: value["mode"] as AiMode,
     mode_label: text(value["mode_label"]) ?? String(value["mode"]),
@@ -388,9 +466,16 @@ export async function getAiConsentPreview(
   model: string,
   vision = false,
   autoVerifyFieldTypes: readonly AiAutoVerifyFieldType[] = [],
+  reader?: AiReaderPreview,
 ): Promise<AiConsentPreview> {
   const query = new URLSearchParams({ mode, model });
   if (vision) query.set("vision", "true");
+  if (reader) {
+    query.set("reader_strategy", reader.reader_strategy);
+    if (reader.primary_reader) query.set("primary_reader", reader.primary_reader);
+    if (reader.vllm_model) query.set("vllm_model", reader.vllm_model);
+    if (reader.vllm_base_url) query.set("vllm_base_url", reader.vllm_base_url);
+  }
   for (const fieldType of autoVerifyFieldTypes) query.append("auto_verify_field_types", fieldType);
   const value: unknown = await (await aiSend(`/ai/consent-preview?${query.toString()}`)).json();
   if (!isObject(value) || typeof value["fingerprint"] !== "string" || typeof value["text"] !== "string") {
@@ -408,8 +493,11 @@ export async function getAiConsentPreview(
   };
 }
 
-export async function startAiProviderTest(csrf: string): Promise<string> {
-  const value: unknown = await (await aiSend("/ai/test/provider", { method: "POST" }, csrf)).json();
+export async function startAiProviderTest(csrf: string, provider?: AiProviderName): Promise<string> {
+  const init: RequestInit = provider
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider }) }
+    : { method: "POST" };
+  const value: unknown = await (await aiSend("/ai/test/provider", init, csrf)).json();
   if (!isObject(value) || typeof value["request_id"] !== "string") throw new Error("The server did not queue the provider test.");
   return value["request_id"];
 }

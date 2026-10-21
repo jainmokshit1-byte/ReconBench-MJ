@@ -143,9 +143,12 @@ export function ReconciliationPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailEtag, setDetailEtag] = useState('"1"');
   const selectedCaseId = searchParams.get("case_id");
+  // A run opened from Mapping or the Run button covers invoices of any date, so its cases
+  // are shown without the period's date filter until the user picks dates again.
+  const runInView = searchParams.get("run_id");
   const [status, setStatus] = useState("");
-  const [fromDate, setFromDate] = useState(monthStart);
-  const [toDate, setToDate] = useState(today);
+  const [fromDate, setFromDate] = useState(() => (runInView ? "" : monthStart()));
+  const [toDate, setToDate] = useState(() => (runInView ? "" : today()));
   const [kpis, setKpis] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -172,11 +175,11 @@ export function ReconciliationPage() {
     const month = Number(period.slice(5, 7));
     const lastDay = new Date(year, month, 0).getDate();
     const timer = window.setTimeout(() => {
-      setFromDate(`${period}-01`);
-      setToDate(`${period}-${String(lastDay).padStart(2, "0")}`);
+      setFromDate(runInView ? "" : `${period}-01`);
+      setToDate(runInView ? "" : `${period}-${String(lastDay).padStart(2, "0")}`);
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [period]);
+  }, [period, runInView]);
 
   const refreshCases = useCallback(async (nextCursor: string | null = null) => {
     if (nextCursor && loadingMoreRef.current) return;
@@ -186,6 +189,7 @@ export function ReconciliationPage() {
     try {
       const page = await listReconciliationCases({
         vendorId: searchParams.get("vendor_id"),
+        runId: searchParams.get("run_id"),
         status: status || null,
         from: fromDate || null,
         to: toDate || null,
@@ -533,6 +537,7 @@ export function ReconciliationPage() {
         <label><span>To</span><input type="date" value={toDate} onChange={(event) => setToDate(event.currentTarget.value)} /></label>
         <label><span>Status</span><select value={status} onChange={(event) => setStatus(event.currentTarget.value)}>{statusOptions.map(([value, text]) => <option key={value} value={value}>{text}</option>)}</select></label>
         {searchParams.get("vendor_id") ? <button className="button button-subtle" type="button" onClick={() => setSearchParams({})}>Clear vendor scope</button> : null}
+        {runInView ? <small className="recon-all-dates">Showing the cases of this run{!fromDate && !toDate ? " (all invoice dates)" : ""}. <button className="text-button" type="button" onClick={() => setSearchParams((previous) => { const next = new URLSearchParams(previous); next.delete("run_id"); return next; })}>Show all cases</button></small> : null}
         <span className="recon-run-state" role="status">{totalLabel}</span>
       </section>
 

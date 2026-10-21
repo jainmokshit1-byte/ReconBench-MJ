@@ -9,13 +9,14 @@ import {
   Settings,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { NavLink, Outlet, useNavigate } from "react-router";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 
 import { listRecentReconciliationRuns } from "../api/reconciliation";
 import { useAuth } from "../auth/useAuth";
 import { PeriodProvider } from "../contexts/PeriodContext";
 import { usePeriod } from "../contexts/usePeriod";
 import { CapabilityNavLink } from "./CapabilityNavLink";
+import { ErrorBoundary } from "./ErrorBoundary";
 import type { Capability } from "../auth/session";
 
 const mainNavigation = [
@@ -32,6 +33,7 @@ export function AppShell() {
 function AppShellContent() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const { period, setPeriod } = usePeriod();
   const [activeRuns, setActiveRuns] = useState<string[]>([]);
 
@@ -129,7 +131,7 @@ function AppShellContent() {
             </details>
           </div>
         </header>
-        <main className="page-content"><Outlet /></main>
+        <main className="page-content"><ErrorBoundary resetKey={location.pathname}><Outlet /></ErrorBoundary></main>
       </div>
     </div>
   );

@@ -1890,6 +1890,31 @@
         "title": "DocumentLineCorrection",
         "type": "object"
       },
+      "DocumentLinksConfirmBody": {
+        "additionalProperties": false,
+        "properties": {
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/LinkVersionBody"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Links",
+            "type": "array"
+          },
+          "to_document_id": {
+            "format": "uuid",
+            "title": "To Document Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "to_document_id",
+          "links"
+        ],
+        "title": "DocumentLinksConfirmBody",
+        "type": "object"
+      },
       "DuplicatePolicyBody": {
         "additionalProperties": false,
         "properties": {
@@ -3118,6 +3143,27 @@
           "state"
         ],
         "title": "LinkSummary",
+        "type": "object"
+      },
+      "LinkVersionBody": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "version_no": {
+            "minimum": 1.0,
+            "title": "Version No",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version_no"
+        ],
+        "title": "LinkVersionBody",
         "type": "object"
       },
       "LoginRequest": {
@@ -6542,6 +6588,59 @@
         "tags": [
           "API v1",
           "Documents"
+        ]
+      }
+    },
+    "/api/v1/documents/{document_id}/links/confirm": {
+      "post": {
+        "description": "Confirm the listed current links of one document to one PO in a single transaction.",
+        "operationId": "confirm_document_links_api_v1_documents__document_id__links_confirm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentLinksConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Document Links",
+        "tags": [
+          "API v1",
+          "Mapping"
         ]
       }
     },

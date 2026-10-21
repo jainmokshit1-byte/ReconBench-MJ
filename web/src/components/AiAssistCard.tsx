@@ -15,6 +15,7 @@ import {
   saveAiSettings,
   startAiProviderTest,
 } from "../api/ai";
+import { currentReaderPreview } from "../api/ai";
 import type { AiAutoVerifyFieldType, AiConsentPreview, AiKeyStorage, AiMode, AiSettingsUpdate, AiSettingsView, AiUsage } from "../api/ai";
 import { useAuth } from "../auth/useAuth";
 
@@ -159,16 +160,21 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
   }, [loadUsage]);
 
   const modelValid = AI_MODEL_PATTERN.test(model);
+  // With page images on, preview the reader that is saved (Gemini or the company server), so
+  // the fingerprint matches what a save keeps; the reader itself is chosen in Settings.
+  const savedReader = vision && view.reader_strategy === "single" ? currentReaderPreview(view) : undefined;
+  const readerKey = savedReader ? JSON.stringify(savedReader) : "";
   useEffect(() => {
     if (mode === "rules_only" || !modelValid) return undefined;
     let active = true;
+    const reader = readerKey ? JSON.parse(readerKey) as ReturnType<typeof currentReaderPreview> : undefined;
     const timer = window.setTimeout(() => {
-      getAiConsentPreview(mode, model, vision, autoVerifyFieldTypes)
+      getAiConsentPreview(mode, model, vision, autoVerifyFieldTypes, reader)
         .then((next) => { if (active) { setPreview(next); setPreviewError(null); } })
         .catch((cause: unknown) => { if (active) { setPreview(null); setPreviewError(message(cause, "The consent text could not be loaded.")); } });
     }, 250);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [mode, model, modelValid, vision, autoVerifyFieldTypes]);
+  }, [mode, model, modelValid, vision, autoVerifyFieldTypes, readerKey]);
 
   const activePreview = mode !== "rules_only" && preview?.mode === mode && preview.model === model && preview.vision === vision && sameFieldTypes(preview.auto_verify_field_types, autoVerifyFieldTypes) ? preview : null;
   const consentOnRecord = activePreview !== null && view.consent.current && view.consent.required_fingerprint === activePreview.fingerprint;
@@ -374,7 +380,7 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
             <label className="ai-card-field">
               <span id="ai-provider-label">Provider</span>
               <select value="gemini" disabled aria-labelledby="ai-provider-label" aria-describedby="ai-provider-note"><option value="gemini">Google Gemini</option></select>
-              <small id="ai-provider-note">Gemini is the only supported provider.</small>
+              <small id="ai-provider-note">Gemini runs text assist (item match, PO re-rank, vendor opinion). The page reader (Gemini or Qwen on the company server) is chosen in Settings → AI providers.</small>
             </label>
             <label className="ai-card-field">
               <span id="ai-model-label">Model</span>

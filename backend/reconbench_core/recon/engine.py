@@ -379,6 +379,18 @@ def _accepted_grn_qty(line: DocLine) -> tuple[Decimal, Decimal, bool]:
     return received, rejected, True
 
 
+def _link_needs_confirming(link: ReconciliationLink, config: ReconciliationConfig) -> bool:
+    """A suggested or below-threshold link needs a person; a confirmed link already had one.
+
+    A person's confirmation is the resolution LINK_INFERRED asks for, so a confirmed link
+    is never flagged again for the confidence the matcher gave it before the confirmation.
+    """
+
+    if link.state is LinkState.CONFIRMED:
+        return False
+    return link.state is LinkState.SUGGESTED or link.confidence < config.link_auto_accept
+
+
 def _active_links(snapshot: ReconciliationSnapshot) -> tuple[ReconciliationLink, ...]:
     return tuple(link for link in snapshot.links if link.state in _ACTIVE_LINK_STATES)
 
@@ -422,16 +434,20 @@ def _build_grn_ledger(
         if documents[link.from_document_id].document.header.doc_type is DocType.GRN
         and documents[link.to_document_id].document.header.doc_type is DocType.PO
     )
-    for link in sorted(
-        grn_links,
-        key=lambda item: (str(item.from_document_id), str(item.to_document_id), item.line_no or 0),
-    ):
-        grn_record = documents[link.from_document_id]
-        po_record = po_documents[link.to_document_id]
+    # A GRN can hold a header link and line links to the same PO. Each GRN line counts
+    # once per PO: its own line link if it has one, else the header link (as on the
+    # invoice side), so one receipt is never added to the PO ledger twice.
+    links_by_pair: dict[tuple[UUID, UUID], list[ReconciliationLink]] = {}
+    for link in grn_links:
+        links_by_pair.setdefault((link.from_document_id, link.to_document_id), []).append(link)
+    for grn_id, po_id in sorted(links_by_pair, key=lambda pair: (str(pair[0]), str(pair[1]))):
+        pair_links = links_by_pair[(grn_id, po_id)]
+        grn_record = documents[grn_id]
+        po_record = po_documents[po_id]
+        line_linked = {item.line_no for item in pair_links if item.level is LinkLevel.LINE}
+        has_header = any(item.level is LinkLevel.HEADER for item in pair_links)
         selected_lines = tuple(
-            line
-            for line in grn_record.document.lines
-            if link.level is LinkLevel.HEADER or line.line_no == link.line_no
+            line for line in grn_record.document.lines if line.line_no in line_linked or has_header
         )
         aligned = align_lines(selected_lines, po_record.document.lines, config.alignment)
         grn_line_by_no = {line.line_no: line for line in selected_lines}
@@ -445,10 +461,10 @@ def _build_grn_ledger(
             if grn_line is None:
                 continue
             qty, rejected_qty, assumed = _accepted_grn_qty(grn_line)
-            key = (link.to_document_id, match.po_line_no)
+            key = (po_id, match.po_line_no)
             accepted[key] = accepted.get(key, _ZERO) + qty
             rejected[key] = rejected.get(key, _ZERO) + rejected_qty
-            grn_ids.setdefault(key, set()).add(link.from_document_id)
+            grn_ids.setdefault(key, set()).add(grn_id)
             if assumed:
                 fallback_received[key] = True
     return accepted, rejected, grn_ids, fallback_received
@@ -1309,9 +1325,8 @@ def evaluate(
             if po_record is None:
                 works.append(_LineWork(invoice, line, None, None, None, None))
                 continue
-            if selected_link.link_id not in checked_link_ids and (
-                selected_link.state is LinkState.SUGGESTED
-                or selected_link.confidence < config.link_auto_accept
+            if selected_link.link_id not in checked_link_ids and _link_needs_confirming(
+                selected_link, config
             ):
                 checked_link_ids.add(selected_link.link_id)
                 case_header_checks[invoice.document_id].append(
@@ -1331,10 +1346,7 @@ def evaluate(
                     grn_record.document.header.doc_type is not DocType.GRN
                     or grn_link.to_document_id != selected_link.to_document_id
                     or grn_link.link_id in checked_grn_link_ids
-                    or (
-                        grn_link.state is not LinkState.SUGGESTED
-                        and grn_link.confidence >= config.link_auto_accept
-                    )
+                    or not _link_needs_confirming(grn_link, config)
                 ):
                     continue
                 checked_grn_link_ids.add(grn_link.link_id)
@@ -1639,7 +1651,10 @@ def evaluate(
                     invoice.document.confidence is None
                     or invoice.document.confidence < config.extraction_gate
                     or work.link is None
-                    or work.link.confidence < config.link_auto_accept
+                    or (
+                        work.link.state is not LinkState.CONFIRMED
+                        and work.link.confidence < config.link_auto_accept
+                    )
                 )
                 line_status = _line_status(tuple(checks), low_confidence)
             reason_codes.extend(reasons)

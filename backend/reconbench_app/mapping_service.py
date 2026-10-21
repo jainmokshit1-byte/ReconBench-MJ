@@ -654,6 +654,20 @@ class MappingService:
                 if ids
                 else []
             )
+            doc_line = metadata.tables["doc_line"]
+            version_ids = [row["current_version_id"] for row in rows]
+            line_rows = (
+                connection.execute(
+                    sa.select(doc_line.c.document_version_id, doc_line.c.line_no)
+                    .where(
+                        doc_line.c.workspace_id == workspace_id,
+                        doc_line.c.document_version_id.in_(version_ids),
+                    )
+                    .order_by(doc_line.c.document_version_id, doc_line.c.line_no)
+                ).all()
+                if version_ids
+                else []
+            )
             resolution = metadata.tables["link_resolution"]
             resolution_rows = (
                 connection.execute(
@@ -691,6 +705,11 @@ class MappingService:
                     "line_no": link_row.from_line_no,
                 }
             )
+        line_nos_by_version: dict[UUID, list[int]] = defaultdict(list)
+        for line_row in line_rows:
+            line_nos_by_version[cast(UUID, line_row.document_version_id)].append(
+                int(line_row.line_no)
+            )
         resolution_by_document = {
             cast(UUID, row["document_id"]): {
                 "outcome": row["outcome"],
@@ -715,6 +734,9 @@ class MappingService:
                 "vendor_id": row["vendor_merged_into"] or row["vendor_id"],
                 "needs_verification": row["needs_verification"],
                 "links": link_by_document.get(cast(UUID, row["id"]), []),
+                # Line numbers of the current version, so a reviewer sees which lines a
+                # line-level link set still leaves without a PO link.
+                "line_nos": line_nos_by_version.get(cast(UUID, row["current_version_id"]), []),
                 "resolution": resolution_by_document.get(cast(UUID, row["id"])),
             }
             for row in rows
@@ -2077,239 +2099,45 @@ class MappingService:
         expected_version: int,
         to_document_id: UUID | None = None,
     ) -> dict[str, Any] | None:
+        with self.engine.begin() as connection:
+            return self._edit_link_in(
+                connection,
+                actor,
+                link_id,
+                action=action,
+                expected_version=expected_version,
+                to_document_id=to_document_id,
+            )
+
+    @requires("links.edit")
+    def confirm_document_links(
+        self,
+        actor: ActorContext,
+        document_id: UUID,
+        *,
+        to_document_id: UUID,
+        links: Sequence[tuple[UUID, int]],
+    ) -> list[dict[str, Any]]:
+        """Confirm the listed current links of one source document to one PO, all or nothing.
+
+        Each link goes through the same checks, audit row and scope marking as a single
+        confirm. Any stale version, foreign link or AI proposal fails the whole request, so
+        a person never confirms a set that differs from what they saw.
+        """
+
+        if not links:
+            raise ValueError("choose at least one link to confirm")
+        if len({link_id for link_id, _version in links}) != len(links):
+            raise ValueError("each link can be confirmed only once per request")
         pointer = metadata.tables["link_current"]
         link = metadata.tables["link"]
-        document = metadata.tables["document"]
-        vendor = metadata.tables["vendor"]
-        source_document = document.alias("edit_source_document")
-        source_vendor = vendor.alias("edit_source_vendor")
-        old_target_document = document.alias("edit_old_target_document")
-        old_target_vendor = vendor.alias("edit_old_target_vendor")
+        confirmed: list[dict[str, Any]] = []
         with self.engine.begin() as connection:
-            current = (
-                connection.execute(
-                    sa.select(*link.c)
-                    .select_from(
-                        pointer.join(
-                            link,
-                            sa.and_(
-                                pointer.c.workspace_id == link.c.workspace_id,
-                                pointer.c.current_link_id == link.c.id,
-                            ),
-                        )
-                    )
-                    .where(pointer.c.workspace_id == actor.workspace_id, link.c.id == link_id)
-                    .with_for_update(of=link)
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if current is None:
-                return None
-            if int(current["version_no"]) != expected_version:
-                raise VersionConflict(dict(current))
-            if action not in {"confirm", "change", "unlink"}:
-                raise ValueError("link action must be confirm, change, or unlink")
-            source_id = cast(UUID, current["from_document_id"])
-            old_target_id = cast(UUID, current["to_document_id"])
-            source_row = connection.execute(
-                sa.select(
-                    source_document.c.doc_type,
-                    sa.func.coalesce(
-                        source_vendor.c.merged_into, source_document.c.vendor_id
-                    ).label("effective_vendor_id"),
-                )
-                .select_from(
-                    source_document.outerjoin(
-                        source_vendor,
-                        sa.and_(
-                            source_vendor.c.workspace_id == source_document.c.workspace_id,
-                            source_vendor.c.id == source_document.c.vendor_id,
-                        ),
-                    )
-                )
-                .where(
-                    source_document.c.workspace_id == actor.workspace_id,
-                    source_document.c.id == source_id,
-                )
-            ).one_or_none()
-            old_target = connection.execute(
-                sa.select(
-                    old_target_document.c.doc_type,
-                    sa.func.coalesce(
-                        old_target_vendor.c.merged_into, old_target_document.c.vendor_id
-                    ).label("effective_vendor_id"),
-                )
-                .select_from(
-                    old_target_document.outerjoin(
-                        old_target_vendor,
-                        sa.and_(
-                            old_target_vendor.c.workspace_id == old_target_document.c.workspace_id,
-                            old_target_vendor.c.id == old_target_document.c.vendor_id,
-                        ),
-                    )
-                )
-                .where(
-                    old_target_document.c.workspace_id == actor.workspace_id,
-                    old_target_document.c.id == old_target_id,
-                )
-            ).one_or_none()
-            if source_row is None or old_target is None:
-                return None
-            if source_row.doc_type not in {DocType.INVOICE.value, DocType.GRN.value}:
-                raise ValueError("only invoice or GRN links can be edited")
-            if old_target.doc_type != DocType.PO.value:
-                raise ValueError("the current link target is not a purchase order")
-            if action == "confirm" and (
-                source_row.effective_vendor_id is None
-                or old_target.effective_vendor_id is None
-                or source_row.effective_vendor_id != old_target.effective_vendor_id
-            ):
-                raise ValueError(
-                    "a link cannot be confirmed until source and PO have the same resolved vendor"
-                )
-
-            affected_ids = {source_id, old_target_id}
-            audit_action: str
-            if action == "confirm" and bool(current["ai_suggested"]):
-                # An accepted AI suggestion becomes the operator's own selection: the
-                # same manual header link the resolver re-proposes on every later run.
-                proposal = ProposedLink(
-                    from_document_id=source_id,
-                    to_document_id=old_target_id,
-                    link_type=LinkType(str(current["link_type"])),
-                    level=LinkLevel.HEADER,
-                    method=LinkMethod.MANUAL,
-                    confidence=Decimal("1.00"),
-                    state=LinkState.CONFIRMED,
-                    evidence=MANUAL_SELECTION_EVIDENCE,
-                )
-                created_id = self._append_link(
-                    connection,
-                    workspace_id=actor.workspace_id,
-                    proposal=proposal,
-                    old=current,
-                    detail_code=cast(str | None, current["detail_code"]),
-                    actor_id=actor.actor_id,
-                    ai_suggested=True,
-                )
-                audit_action = "link.confirm"
-            elif action == "confirm":
-                proposal = ProposedLink(
-                    from_document_id=source_id,
-                    to_document_id=old_target_id,
-                    link_type=LinkType(str(current["link_type"])),
-                    level=LinkLevel(str(current["level"])),
-                    method=LinkMethod(str(current["method"])),
-                    confidence=cast(Decimal, current["confidence"]),
-                    state=LinkState.CONFIRMED,
-                    evidence=str(current["evidence_snippet"] or "Confirmed by an operator."),
-                    line_no=cast(int | None, current["from_line_no"]),
-                )
-                created_id = self._append_link(
-                    connection,
-                    workspace_id=actor.workspace_id,
-                    proposal=proposal,
-                    old=current,
-                    detail_code=cast(str | None, current["detail_code"]),
-                    actor_id=actor.actor_id,
-                )
-                audit_action = "link.confirm"
-            elif action == "unlink":
-                proposal = ProposedLink(
-                    from_document_id=source_id,
-                    to_document_id=old_target_id,
-                    link_type=LinkType(str(current["link_type"])),
-                    level=LinkLevel(str(current["level"])),
-                    method=LinkMethod.MANUAL,
-                    confidence=Decimal("1.00"),
-                    state=LinkState.REJECTED,
-                    evidence="Unlinked by an operator; this decision persists on re-run.",
-                    line_no=cast(int | None, current["from_line_no"]),
-                )
-                created_id = self._append_link(
-                    connection,
-                    workspace_id=actor.workspace_id,
-                    proposal=proposal,
-                    old=current,
-                    detail_code="manual_unlink",
-                    actor_id=actor.actor_id,
-                )
-                audit_action = "link.reject"
-            else:
-                if to_document_id is None:
-                    raise ValueError("a replacement purchase order is required")
-                target_row = connection.execute(
-                    sa.select(
-                        document.c.doc_type,
-                        sa.func.coalesce(vendor.c.merged_into, document.c.vendor_id).label(
-                            "effective_vendor_id"
-                        ),
-                    )
-                    .select_from(
-                        document.outerjoin(
-                            vendor,
-                            sa.and_(
-                                vendor.c.workspace_id == document.c.workspace_id,
-                                vendor.c.id == document.c.vendor_id,
-                            ),
-                        )
-                    )
-                    .where(
-                        document.c.workspace_id == actor.workspace_id,
-                        document.c.id == to_document_id,
-                        document.c.withdrawn_at.is_(None),
-                    )
-                    .with_for_update(of=document)
-                ).one_or_none()
-                if target_row is None or target_row.doc_type != DocType.PO.value:
-                    raise ValueError("the replacement target must be a current workspace PO")
-                if (
-                    source_row.effective_vendor_id is None
-                    or target_row.effective_vendor_id is None
-                    or source_row.effective_vendor_id != target_row.effective_vendor_id
-                ):
-                    raise ValueError(
-                        "a link can only point to a PO in the same resolved vendor group"
-                    )
-                rejected_old = ProposedLink(
-                    from_document_id=source_id,
-                    to_document_id=old_target_id,
-                    link_type=LinkType(str(current["link_type"])),
-                    level=LinkLevel(str(current["level"])),
-                    method=LinkMethod.MANUAL,
-                    confidence=Decimal("1.00"),
-                    state=LinkState.REJECTED,
-                    evidence="Replaced by an operator-selected PO.",
-                    line_no=cast(int | None, current["from_line_no"]),
-                )
-                self._append_link(
-                    connection,
-                    workspace_id=actor.workspace_id,
-                    proposal=rejected_old,
-                    old=current,
-                    detail_code="manual_link_change",
-                    actor_id=actor.actor_id,
-                )
-                new_link_type = (
-                    LinkType.INV_PO
-                    if source_row.doc_type == DocType.INVOICE.value
-                    else LinkType.GRN_PO
-                )
-                proposal = ProposedLink(
-                    from_document_id=source_id,
-                    to_document_id=to_document_id,
-                    link_type=new_link_type,
-                    level=LinkLevel(str(current["level"])),
-                    method=LinkMethod.MANUAL,
-                    confidence=Decimal("1.00"),
-                    state=LinkState.CONFIRMED,
-                    evidence="Manually selected by an operator.",
-                    line_no=cast(int | None, current["from_line_no"]),
-                )
-                target_pointer = (
+            for link_id, expected_version in links:
+                current = (
                     connection.execute(
-                        sa.select(link)
+                        sa.select(link.c.from_document_id, link.c.to_document_id, link.c.state)
+                        .add_columns(link.c.ai_suggested)
                         .select_from(
                             pointer.join(
                                 link,
@@ -2319,48 +2147,321 @@ class MappingService:
                                 ),
                             )
                         )
-                        .where(
-                            pointer.c.workspace_id == actor.workspace_id,
-                            pointer.c.link_type == new_link_type.value,
-                            pointer.c.from_document_id == source_id,
-                            pointer.c.from_line_no.is_not_distinct_from(current["from_line_no"]),
-                            pointer.c.to_document_id == to_document_id,
-                        )
-                        .with_for_update(of=link)
+                        .where(pointer.c.workspace_id == actor.workspace_id, link.c.id == link_id)
                     )
                     .mappings()
                     .one_or_none()
                 )
-                created_id = self._append_link(
+                if current is None:
+                    # Raise, not return: leaving the block normally would commit earlier confirms.
+                    raise LookupError("a listed link is not current")
+                if current["from_document_id"] != document_id:
+                    raise ValueError("a listed link belongs to another document")
+                if current["to_document_id"] != to_document_id:
+                    raise ValueError("a listed link points to a different purchase order")
+                if current["state"] not in {LinkState.AUTO.value, LinkState.SUGGESTED.value}:
+                    raise ValueError("only auto or suggested links can be confirmed")
+                if bool(current["ai_suggested"]):
+                    raise ValueError("AI-suggested links are confirmed one at a time")
+                result = self._edit_link_in(
                     connection,
-                    workspace_id=actor.workspace_id,
-                    proposal=proposal,
-                    old=target_pointer,
-                    detail_code="manual_link_change",
-                    actor_id=actor.actor_id,
+                    actor,
+                    link_id,
+                    action="confirm",
+                    expected_version=expected_version,
                 )
-                affected_ids.add(to_document_id)
-                audit_action = "link.create"
+                if result is None:
+                    raise LookupError("a listed link is not current")
+                confirmed.append(result)
+        return confirmed
 
-            self._mark_affected_scopes(
+    def _edit_link_in(
+        self,
+        connection: Connection,
+        actor: ActorContext,
+        link_id: UUID,
+        *,
+        action: str,
+        expected_version: int,
+        to_document_id: UUID | None = None,
+    ) -> dict[str, Any] | None:
+        pointer = metadata.tables["link_current"]
+        link = metadata.tables["link"]
+        document = metadata.tables["document"]
+        vendor = metadata.tables["vendor"]
+        source_document = document.alias("edit_source_document")
+        source_vendor = vendor.alias("edit_source_vendor")
+        old_target_document = document.alias("edit_old_target_document")
+        old_target_vendor = vendor.alias("edit_old_target_vendor")
+        current = (
+            connection.execute(
+                sa.select(*link.c)
+                .select_from(
+                    pointer.join(
+                        link,
+                        sa.and_(
+                            pointer.c.workspace_id == link.c.workspace_id,
+                            pointer.c.current_link_id == link.c.id,
+                        ),
+                    )
+                )
+                .where(pointer.c.workspace_id == actor.workspace_id, link.c.id == link_id)
+                .with_for_update(of=link)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if current is None:
+            return None
+        if int(current["version_no"]) != expected_version:
+            raise VersionConflict(dict(current))
+        if action not in {"confirm", "change", "unlink"}:
+            raise ValueError("link action must be confirm, change, or unlink")
+        source_id = cast(UUID, current["from_document_id"])
+        old_target_id = cast(UUID, current["to_document_id"])
+        source_row = connection.execute(
+            sa.select(
+                source_document.c.doc_type,
+                sa.func.coalesce(source_vendor.c.merged_into, source_document.c.vendor_id).label(
+                    "effective_vendor_id"
+                ),
+            )
+            .select_from(
+                source_document.outerjoin(
+                    source_vendor,
+                    sa.and_(
+                        source_vendor.c.workspace_id == source_document.c.workspace_id,
+                        source_vendor.c.id == source_document.c.vendor_id,
+                    ),
+                )
+            )
+            .where(
+                source_document.c.workspace_id == actor.workspace_id,
+                source_document.c.id == source_id,
+            )
+        ).one_or_none()
+        old_target = connection.execute(
+            sa.select(
+                old_target_document.c.doc_type,
+                sa.func.coalesce(
+                    old_target_vendor.c.merged_into, old_target_document.c.vendor_id
+                ).label("effective_vendor_id"),
+            )
+            .select_from(
+                old_target_document.outerjoin(
+                    old_target_vendor,
+                    sa.and_(
+                        old_target_vendor.c.workspace_id == old_target_document.c.workspace_id,
+                        old_target_vendor.c.id == old_target_document.c.vendor_id,
+                    ),
+                )
+            )
+            .where(
+                old_target_document.c.workspace_id == actor.workspace_id,
+                old_target_document.c.id == old_target_id,
+            )
+        ).one_or_none()
+        if source_row is None or old_target is None:
+            return None
+        if source_row.doc_type not in {DocType.INVOICE.value, DocType.GRN.value}:
+            raise ValueError("only invoice or GRN links can be edited")
+        if old_target.doc_type != DocType.PO.value:
+            raise ValueError("the current link target is not a purchase order")
+        if action == "confirm" and (
+            source_row.effective_vendor_id is None
+            or old_target.effective_vendor_id is None
+            or source_row.effective_vendor_id != old_target.effective_vendor_id
+        ):
+            raise ValueError(
+                "a link cannot be confirmed until source and PO have the same resolved vendor"
+            )
+
+        affected_ids = {source_id, old_target_id}
+        audit_action: str
+        if action == "confirm" and bool(current["ai_suggested"]):
+            # An accepted AI suggestion becomes the operator's own selection: the
+            # same manual header link the resolver re-proposes on every later run.
+            proposal = ProposedLink(
+                from_document_id=source_id,
+                to_document_id=old_target_id,
+                link_type=LinkType(str(current["link_type"])),
+                level=LinkLevel.HEADER,
+                method=LinkMethod.MANUAL,
+                confidence=Decimal("1.00"),
+                state=LinkState.CONFIRMED,
+                evidence=MANUAL_SELECTION_EVIDENCE,
+            )
+            created_id = self._append_link(
                 connection,
                 workspace_id=actor.workspace_id,
-                document_ids=affected_ids,
+                proposal=proposal,
+                old=current,
+                detail_code=cast(str | None, current["detail_code"]),
+                actor_id=actor.actor_id,
+                ai_suggested=True,
             )
-            write_audit_event(
+            audit_action = "link.confirm"
+        elif action == "confirm":
+            proposal = ProposedLink(
+                from_document_id=source_id,
+                to_document_id=old_target_id,
+                link_type=LinkType(str(current["link_type"])),
+                level=LinkLevel(str(current["level"])),
+                method=LinkMethod(str(current["method"])),
+                confidence=cast(Decimal, current["confidence"]),
+                state=LinkState.CONFIRMED,
+                evidence=str(current["evidence_snippet"] or "Confirmed by an operator."),
+                line_no=cast(int | None, current["from_line_no"]),
+            )
+            created_id = self._append_link(
                 connection,
-                actor,
-                action=cast(Any, audit_action),
-                target_type="link",
-                target_id=created_id,
-                before_state={"link_id": str(link_id), "state": current["state"]},
-                after_state={"link_id": str(created_id), "action": action},
+                workspace_id=actor.workspace_id,
+                proposal=proposal,
+                old=current,
+                detail_code=cast(str | None, current["detail_code"]),
+                actor_id=actor.actor_id,
             )
-            return dict(
-                connection.execute(sa.select(*link.c).where(link.c.id == created_id))
+            audit_action = "link.confirm"
+        elif action == "unlink":
+            proposal = ProposedLink(
+                from_document_id=source_id,
+                to_document_id=old_target_id,
+                link_type=LinkType(str(current["link_type"])),
+                level=LinkLevel(str(current["level"])),
+                method=LinkMethod.MANUAL,
+                confidence=Decimal("1.00"),
+                state=LinkState.REJECTED,
+                evidence="Unlinked by an operator; this decision persists on re-run.",
+                line_no=cast(int | None, current["from_line_no"]),
+            )
+            created_id = self._append_link(
+                connection,
+                workspace_id=actor.workspace_id,
+                proposal=proposal,
+                old=current,
+                detail_code="manual_unlink",
+                actor_id=actor.actor_id,
+            )
+            audit_action = "link.reject"
+        else:
+            if to_document_id is None:
+                raise ValueError("a replacement purchase order is required")
+            target_row = connection.execute(
+                sa.select(
+                    document.c.doc_type,
+                    sa.func.coalesce(vendor.c.merged_into, document.c.vendor_id).label(
+                        "effective_vendor_id"
+                    ),
+                )
+                .select_from(
+                    document.outerjoin(
+                        vendor,
+                        sa.and_(
+                            vendor.c.workspace_id == document.c.workspace_id,
+                            vendor.c.id == document.c.vendor_id,
+                        ),
+                    )
+                )
+                .where(
+                    document.c.workspace_id == actor.workspace_id,
+                    document.c.id == to_document_id,
+                    document.c.withdrawn_at.is_(None),
+                )
+                .with_for_update(of=document)
+            ).one_or_none()
+            if target_row is None or target_row.doc_type != DocType.PO.value:
+                raise ValueError("the replacement target must be a current workspace PO")
+            if (
+                source_row.effective_vendor_id is None
+                or target_row.effective_vendor_id is None
+                or source_row.effective_vendor_id != target_row.effective_vendor_id
+            ):
+                raise ValueError("a link can only point to a PO in the same resolved vendor group")
+            rejected_old = ProposedLink(
+                from_document_id=source_id,
+                to_document_id=old_target_id,
+                link_type=LinkType(str(current["link_type"])),
+                level=LinkLevel(str(current["level"])),
+                method=LinkMethod.MANUAL,
+                confidence=Decimal("1.00"),
+                state=LinkState.REJECTED,
+                evidence="Replaced by an operator-selected PO.",
+                line_no=cast(int | None, current["from_line_no"]),
+            )
+            self._append_link(
+                connection,
+                workspace_id=actor.workspace_id,
+                proposal=rejected_old,
+                old=current,
+                detail_code="manual_link_change",
+                actor_id=actor.actor_id,
+            )
+            new_link_type = (
+                LinkType.INV_PO if source_row.doc_type == DocType.INVOICE.value else LinkType.GRN_PO
+            )
+            proposal = ProposedLink(
+                from_document_id=source_id,
+                to_document_id=to_document_id,
+                link_type=new_link_type,
+                level=LinkLevel(str(current["level"])),
+                method=LinkMethod.MANUAL,
+                confidence=Decimal("1.00"),
+                state=LinkState.CONFIRMED,
+                evidence="Manually selected by an operator.",
+                line_no=cast(int | None, current["from_line_no"]),
+            )
+            target_pointer = (
+                connection.execute(
+                    sa.select(link)
+                    .select_from(
+                        pointer.join(
+                            link,
+                            sa.and_(
+                                pointer.c.workspace_id == link.c.workspace_id,
+                                pointer.c.current_link_id == link.c.id,
+                            ),
+                        )
+                    )
+                    .where(
+                        pointer.c.workspace_id == actor.workspace_id,
+                        pointer.c.link_type == new_link_type.value,
+                        pointer.c.from_document_id == source_id,
+                        pointer.c.from_line_no.is_not_distinct_from(current["from_line_no"]),
+                        pointer.c.to_document_id == to_document_id,
+                    )
+                    .with_for_update(of=link)
+                )
                 .mappings()
-                .one()
+                .one_or_none()
             )
+            created_id = self._append_link(
+                connection,
+                workspace_id=actor.workspace_id,
+                proposal=proposal,
+                old=target_pointer,
+                detail_code="manual_link_change",
+                actor_id=actor.actor_id,
+            )
+            affected_ids.add(to_document_id)
+            audit_action = "link.create"
+
+        self._mark_affected_scopes(
+            connection,
+            workspace_id=actor.workspace_id,
+            document_ids=affected_ids,
+        )
+        write_audit_event(
+            connection,
+            actor,
+            action=cast(Any, audit_action),
+            target_type="link",
+            target_id=created_id,
+            before_state={"link_id": str(link_id), "state": current["state"]},
+            after_state={"link_id": str(created_id), "action": action},
+        )
+        return dict(
+            connection.execute(sa.select(*link.c).where(link.c.id == created_id)).mappings().one()
+        )
 
     @staticmethod
     def _load_current(
@@ -2763,7 +2864,7 @@ class MappingService:
             key: row for key, row in current.items() if key[0] == source.document_id
         }
         if old_hash == input_hash and all(
-            key in existing_for_source and self._matches(existing_for_source[key], link)
+            key in existing_for_source and self._keeps(existing_for_source[key], link)
             for key, link in desired.items()
         ):
             return 0, set()
@@ -2797,7 +2898,7 @@ class MappingService:
 
         for key, proposal in desired.items():
             prior_desired_link = existing_for_source.get(key)
-            if prior_desired_link is not None and self._matches(prior_desired_link, proposal):
+            if prior_desired_link is not None and self._keeps(prior_desired_link, proposal):
                 continue
             new_id_value = self._append_link(
                 connection,
@@ -2858,6 +2959,26 @@ class MappingService:
             and current["confidence"] == proposed.confidence
             and current["evidence_snippet"] == proposed.evidence
             and current["from_line_no"] == proposed.line_no
+        )
+
+    @classmethod
+    def _keeps(cls, current: RowMapping, proposed: ProposedLink) -> bool:
+        """Whether the current link already stands for this proposal.
+
+        A person's confirmation of the same pairing (document, line, PO, link type) stays
+        while the resolver still proposes that pairing; a re-run must not turn it back into
+        a suggestion. A pairing the resolver no longer proposes is superseded as before.
+        """
+
+        if cls._matches(current, proposed):
+            return True
+        return bool(
+            current["state"] == LinkState.CONFIRMED.value
+            and proposed.state is not LinkState.REJECTED
+            and current["link_type"] == proposed.link_type.value
+            and current["level"] == proposed.level.value
+            and current["from_line_no"] == proposed.line_no
+            and current["to_document_id"] == proposed.to_document_id
         )
 
     @staticmethod

@@ -83,6 +83,20 @@ class BulkConfirmBody(BaseModel):
     threshold: Decimal = Field(default=Decimal("0.95"), ge=0, le=1)
 
 
+class LinkVersionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    version_no: int = Field(ge=1)
+
+
+class DocumentLinksConfirmBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    to_document_id: UUID
+    links: list[LinkVersionBody] = Field(min_length=1, max_length=500)
+
+
 def _actor(request: Request) -> ActorContext:
     actor = getattr(request.state, "actor_context", None)
     if not isinstance(actor, ActorContext):
@@ -370,6 +384,46 @@ def assign_vendor(document_id: UUID, body: AssignVendorBody, request: Request) -
     if result is None:
         return _error(request, status=404, detail="The document was not found.", code="not_found")
     return DecimalJSONResponse(content=to_jsonable(result))
+
+
+@router.post("/documents/{document_id}/links/confirm", tags=["Mapping"])
+@requires("links.edit")
+def confirm_document_links(
+    document_id: UUID,
+    body: DocumentLinksConfirmBody,
+    request: Request,
+) -> Response:
+    """Confirm the listed current links of one document to one PO in a single transaction."""
+
+    try:
+        result = _service(request).confirm_document_links(
+            _actor(request),
+            document_id,
+            to_document_id=body.to_document_id,
+            links=[(item.id, item.version_no) for item in body.links],
+        )
+    except VersionConflict as exc:
+        return problem_response(
+            status=409,
+            title="Resource changed",
+            detail=(
+                "A link changed after it was loaded. Reload the current version; "
+                "nothing was confirmed."
+            ),
+            instance=request.url.path,
+            code="version_conflict",
+            extensions={"current": to_jsonable(exc.current)},
+        )
+    except LookupError:
+        return _error(
+            request,
+            status=404,
+            detail="A link was not found or is no longer current; nothing was confirmed.",
+            code="not_found",
+        )
+    except ValueError as exc:
+        return _error(request, status=422, detail=str(exc), code="invalid_link_edit")
+    return DecimalJSONResponse(content=to_jsonable({"confirmed": len(result), "items": result}))
 
 
 @router.patch("/links/{link_id}", tags=["Mapping"])

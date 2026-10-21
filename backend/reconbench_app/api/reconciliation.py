@@ -262,6 +262,7 @@ def list_cases(
     cursor: str | None = Query(default=None, max_length=4096),
     limit: int = Query(default=50, ge=1, le=200),
     count: bool = False,
+    run_id: UUID | None = None,
 ) -> Response:
     if from_date and to_date and from_date > to_date:
         return _problem(
@@ -337,6 +338,9 @@ def list_cases(
     )
     if vendor_id is not None:
         statement = statement.where(current.c.vendor_id == vendor_id)
+    # A run's own cases: the invoices it evaluated, whatever their dates.
+    if run_id is not None:
+        statement = statement.where(current.c.run_id == run_id)
     if status:
         allowed = {
             "duplicate",
@@ -367,6 +371,7 @@ def list_cases(
     context = {
         "workspace_id": workspace_id,
         "vendor_id": vendor_id,
+        "run_id": run_id,
         "status": sorted(status or []),
         "from": from_date,
         "to": to_date,

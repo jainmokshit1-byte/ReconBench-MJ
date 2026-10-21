@@ -47,6 +47,9 @@ from reconbench_app.worker_control import run_controlled_worker
 # The "ai" queue is consumed only by the dedicated AI worker process.
 GENERAL_WORKER_QUEUES = ("ingest", "parse", "mapping", "reconcile", "exports")
 MAX_INFRASTRUCTURE_ATTEMPTS = 4  # One initial attempt plus three infrastructure retries.
+# A user-started reconciliation run is fetched before waiting ledger and mapping jobs on
+# the shared worker (Procrastinate fetches the highest priority first, then oldest).
+RECONCILIATION_JOB_PRIORITY = 10
 _RETRYABLE_ERRORS = (BotoCoreError, OSError, sa.exc.DBAPIError, ObjectStoreUnavailable)
 _INFRASTRUCTURE_RETRY = RetryStrategy(
     max_attempts=MAX_INFRASTRUCTURE_ATTEMPTS,
@@ -74,6 +77,7 @@ class ProcrastinateJobQueue(QueuePort):
         connection: Connection,
         task_kwargs: dict[str, str],
         queueing_lock: str | None = None,
+        priority: int | None = None,
     ) -> int:
         task = self.tasks.get(task_name)
         if task is None:
@@ -91,10 +95,12 @@ class ProcrastinateJobQueue(QueuePort):
             if waiting is not None:
                 return int(waiting)
         psycopg_connection = connection.connection.driver_connection
-        if queueing_lock is None:
-            deferrer = task.configure(connection=psycopg_connection)
-        else:
-            deferrer = task.configure(connection=psycopg_connection, queueing_lock=queueing_lock)
+        options: dict[str, Any] = {"connection": psycopg_connection}
+        if queueing_lock is not None:
+            options["queueing_lock"] = queueing_lock
+        if priority is not None:
+            options["priority"] = priority
+        deferrer = task.configure(**options)
         if self.sync_job_manager is not None:
             # Worker tasks run on Procrastinate's async connector, but their
             # services use synchronous SQLAlchemy transactions. Use the
@@ -147,6 +153,7 @@ class ProcrastinateJobQueue(QueuePort):
             "evaluate_cases",
             connection=connection,
             task_kwargs={"run_id": str(run_id)},
+            priority=RECONCILIATION_JOB_PRIORITY,
         )
 
     def enqueue_export(self, *, export_id: UUID, connection: Connection) -> int:
@@ -522,6 +529,7 @@ def worker_main(
 __all__ = [
     "GENERAL_WORKER_QUEUES",
     "MAX_INFRASTRUCTURE_ATTEMPTS",
+    "RECONCILIATION_JOB_PRIORITY",
     "ProcrastinateJobQueue",
     "make_s3_client",
     "register_ingestion_tasks",

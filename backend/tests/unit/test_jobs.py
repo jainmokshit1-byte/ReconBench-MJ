@@ -170,3 +170,37 @@ def test_a_concurrent_duplicate_rolls_back_only_the_savepoint() -> None:
 
     assert queue.enqueue_dirty_scopes(workspace_id=WS, connection=cast(Any, connection)) == 0
     assert connection.log == ["savepoint", "rollback"]
+
+
+class _PriorityTask:
+    def __init__(self, deferrer: _Deferrer) -> None:
+        self.deferrer = deferrer
+        self.options: dict[str, Any] = {}
+
+    def configure(self, **options: Any) -> _Deferrer:
+        self.options = options
+        return self.deferrer
+
+
+def test_a_reconciliation_run_is_queued_ahead_of_ledger_and_mapping_jobs() -> None:
+    from reconbench_app.jobs import RECONCILIATION_JOB_PRIORITY
+
+    deferrer = _Deferrer(object())
+    task = _PriorityTask(deferrer)
+    sqlalchemy_connection = SimpleNamespace(connection=SimpleNamespace(driver_connection=object()))
+    queue = ProcrastinateJobQueue({"evaluate_cases": task, "parse_file": task})
+
+    run_id = UUID("00000000-0000-0000-0000-0000000000cc")
+    assert (
+        queue.enqueue_reconciliation(run_id=run_id, connection=cast(Any, sqlalchemy_connection))
+        == 42
+    )
+    assert task.options["priority"] == RECONCILIATION_JOB_PRIORITY > 0
+    assert deferrer.arguments == {"run_id": str(run_id)}
+    # Other jobs keep Procrastinate's default priority (no option passed).
+    queue.enqueue(
+        "parse_file",
+        file_id=UUID("00000000-0000-0000-0000-000000000003"),
+        connection=cast(Any, sqlalchemy_connection),
+    )
+    assert "priority" not in task.options

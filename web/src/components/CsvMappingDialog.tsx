@@ -131,7 +131,11 @@ export function CsvMappingDialog({
                       <select
                         aria-label={`Map ${label}`}
                         value={mappedFields[index] ?? ""}
-                        onChange={(event) => setMappedFields((previous) => ({ ...previous, [index]: event.target.value }))}
+                        onChange={(event) => {
+                          // Read the value now: the updater runs later, after React has reset the event.
+                          const value = event.currentTarget.value;
+                          setMappedFields((previous) => ({ ...previous, [index]: value }));
+                        }}
                       >
                         <option value="">Ignore this column</option>
                         {CANONICAL_FIELDS.map(([value, title]) => <option key={value} value={value}>{title}</option>)}

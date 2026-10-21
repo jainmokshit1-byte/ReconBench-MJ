@@ -54,6 +54,8 @@ export interface MappingDocument {
   vendor_id: string | null;
   needs_verification: boolean;
   links: CurrentMappingLink[];
+  /** Line numbers of the current version (older API responses may omit it). */
+  line_nos?: number[];
   resolution: {
     outcome: string;
     resolved_step: number | null;
@@ -222,5 +224,18 @@ export function bulkConfirmMappingLinks(vendorId: string | null, csrfToken: stri
     method: "POST",
     headers: { "Idempotency-Key": `mapping-bulk-${crypto.randomUUID()}` },
     body: JSON.stringify({ vendor_id: vendorId, threshold: "0.95" }),
+  });
+}
+
+/** Confirm the listed links of one document to one PO in a single all-or-nothing request. */
+export function confirmDocumentLinks(
+  documentId: string,
+  toDocumentId: string,
+  links: Array<Pick<CurrentMappingLink, "id" | "version_no">>,
+  csrfToken: string,
+): Promise<{ confirmed: number; items: unknown[] }> {
+  return requestJson(`/documents/${encodeURIComponent(documentId)}/links/confirm`, csrfToken, {
+    method: "POST",
+    body: JSON.stringify({ to_document_id: toDocumentId, links: links.map((link) => ({ id: link.id, version_no: link.version_no })) }),
   });
 }

@@ -1711,15 +1711,81 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
             for row in ordered_first_links.json()
             if row["state"] == "suggested" and row["method"] == "content"
         )
-        ordered_first_confirmed = client.patch(
-            f"/api/v1/links/{ordered_first_suggestion['id']}",
-            json={"action": "confirm"},
-            headers={
-                "If-Match": f'"{ordered_first_suggestion["version_no"]}"',
-                "X-CSRF-Token": "synthetic-csrf",
+        # One-click invoice confirm: every listed link of this invoice to its PO in one
+        # transaction. A stale version, a foreign PO or a repeated link confirms nothing.
+        batch_url = f"/api/v1/documents/{ordered_first_invoice_id}/links/confirm"
+        batch_links = [
+            {"id": row["id"], "version_no": row["version_no"]}
+            for row in ordered_first_links.json()
+            if row["state"] in {"auto", "suggested"}
+            and not row["ai_suggested"]
+            and row["to_document_id"] == ordered_first_suggestion["to_document_id"]
+        ]
+        csrf_headers = {"X-CSRF-Token": "synthetic-csrf"}
+        stale_batch = client.post(
+            batch_url,
+            json={
+                "to_document_id": ordered_first_suggestion["to_document_id"],
+                "links": [{**item, "version_no": item["version_no"] + 1} for item in batch_links],
             },
+            headers=csrf_headers,
+        )
+        assert stale_batch.status_code == 409, stale_batch.text
+        wrong_po_batch = client.post(
+            batch_url,
+            json={"to_document_id": str(no_ref_invoice_id), "links": batch_links},
+            headers=csrf_headers,
+        )
+        assert wrong_po_batch.status_code == 422, wrong_po_batch.text
+        repeated_batch = client.post(
+            batch_url,
+            json={
+                "to_document_id": ordered_first_suggestion["to_document_id"],
+                "links": [*batch_links, batch_links[0]],
+            },
+            headers=csrf_headers,
+        )
+        assert repeated_batch.status_code == 422, repeated_batch.text
+        unchanged = client.get(f"/api/v1/links?source_document_id={ordered_first_invoice_id}")
+        assert {row["id"]: row["state"] for row in unchanged.json()} == {
+            row["id"]: row["state"] for row in ordered_first_links.json()
+        }
+        ordered_first_confirmed = client.post(
+            batch_url,
+            json={
+                "to_document_id": ordered_first_suggestion["to_document_id"],
+                "links": batch_links,
+            },
+            headers=csrf_headers,
         )
         assert ordered_first_confirmed.status_code == 200, ordered_first_confirmed.text
+        assert ordered_first_confirmed.json()["confirmed"] == len(batch_links)
+        assert all(item["state"] == "confirmed" for item in ordered_first_confirmed.json()["items"])
+        with ingestion_engine.connect() as connection:
+            batch_audits = connection.scalar(
+                sa.select(sa.func.count())
+                .select_from(metadata.tables["audit_log"])
+                .where(
+                    metadata.tables["audit_log"].c.workspace_id == workspace_id,
+                    metadata.tables["audit_log"].c.action == "link.confirm",
+                    metadata.tables["audit_log"].c.target_id.in_(
+                        [UUID(item["id"]) for item in ordered_first_confirmed.json()["items"]]
+                    ),
+                )
+            )
+        assert batch_audits == len(batch_links)
+        # A later mapping pass (e.g. after another upload) keeps the person's confirmation
+        # while the resolver still proposes the same pairing.
+        mapping_service.resolve_workspace(workspace_id)
+        after_rerun = {
+            row["id"]: row
+            for row in client.get(
+                f"/api/v1/links?source_document_id={ordered_first_invoice_id}"
+            ).json()
+        }
+        confirmed_ids = {item["id"] for item in ordered_first_confirmed.json()["items"]}
+        assert confirmed_ids <= set(after_rerun)
+        assert all(after_rerun[link_id]["state"] == "confirmed" for link_id in confirmed_ids)
         order_check_run_response = client.post(
             "/api/v1/runs",
             json={"run_date": "2026-04-30"},
@@ -1731,6 +1797,15 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         assert order_check_run_response.status_code == 202, order_check_run_response.text
         order_check_run_id = UUID(order_check_run_response.json()["id"])
         app.state.reconciliation_service.evaluate_run(order_check_run_id)
+        # The run view lists only the cases that run evaluated, whatever their dates.
+        run_cases = client.get(f"/api/v1/cases?run_id={order_check_run_id}&limit=200")
+        assert run_cases.status_code == 200, run_cases.text
+        assert run_cases.json()["items"]
+        assert {item["run_id"] for item in run_cases.json()["items"]} == {str(order_check_run_id)}
+        all_cases = client.get("/api/v1/cases?limit=200").json()["items"]
+        assert {item["case_id"] for item in run_cases.json()["items"]} == {
+            item["case_id"] for item in all_cases if item["run_id"] == str(order_check_run_id)
+        }
         with ingestion_engine.connect() as connection:
             order_results = (
                 connection.execute(

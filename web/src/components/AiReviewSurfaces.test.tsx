@@ -238,7 +238,20 @@ describe("AI external-sharing banner", () => {
   it("says nothing leaves the deployment when external calls are disabled", async () => {
     stubSettings(settings({ external_calls: "disabled" }));
     render(<AiSharingBanner />);
-    expect(await screen.findByRole("note")).toHaveTextContent("no document data leaves ReconBench");
+    expect(await screen.findByRole("note")).toHaveTextContent("external calls are disabled on this deployment, so no document text is sent");
+  });
+
+  it("names the page reader and the text-assist provider separately", async () => {
+    stubSettings(settings({
+      reader_strategy: "single",
+      primary_reader: "vllm",
+      vllm_calls: "enabled",
+      providers: [{ provider: "vllm", model: "synthetic-qwen" }, { provider: "gemini", model: "synthetic-model" }],
+    }));
+    render(<AiSharingBanner />);
+    const banner = await screen.findByRole("note", { name: "AI external sharing notice" });
+    expect(banner).toHaveTextContent("Page reading: masked page images are read by Qwen (synthetic-qwen) on the company vLLM server");
+    expect(banner).toHaveTextContent("Text assist: eligible document text is redacted and sent to Google Gemini (synthetic-model)");
   });
 
   it("is absent in rules-only mode", async () => {
