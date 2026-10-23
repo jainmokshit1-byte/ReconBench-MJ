@@ -232,6 +232,33 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  pipeline-log:
+    # Read-only pipeline watcher (WI-TRC2). Toggle in .env: RB_PIPELINE_LOG=on|off
+    image: reconbench-worker:latest
+    pull_policy: never
+    init: true
+    restart: unless-stopped
+    command: ["/app/backend/.venv/bin/python", "-m", "reconbench_tools.pipeline_log"]
+    environment:
+      RB_PIPELINE_LOG: ${RB_PIPELINE_LOG:-off}
+      RB_PIPELINE_LOG_VALUES: ${RB_PIPELINE_LOG_VALUES:-masked}
+      RB_PIPELINE_LOG_INTERVAL: ${RB_PIPELINE_LOG_INTERVAL:-3}
+      RB_PIPELINE_LOG_ASCII: ${RB_PIPELINE_LOG_ASCII:-0}
+      PYTHONUNBUFFERED: "1"
+      RB_DATABASE_URL: postgresql+psycopg://reconbench_logreader:${RB_LOGREADER_PASSWORD}@postgres:5432/${POSTGRES_DB:-reconbench}
+    volumes:
+      - ./backend/reconbench_tools:/app/backend/reconbench_tools:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 256m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
 volumes:
   postgres_data:
     name: reconbench_phase1_postgres_data

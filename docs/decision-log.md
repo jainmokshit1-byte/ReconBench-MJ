@@ -1982,3 +1982,83 @@ Last task of the owner's queue (D93); disposable databases only (`rb-q3-pool2` 1
 **Queue summary (D93–D98).** Adopted: v4 full pages + header band for the Qwen reader (D93); native Tally import (D95); no self-support and header-level handwritten suggestions (D96); matcher/ledger speed-up (D98). Rejected: full-page `v4.q2` prompt (D93), WI-BE8 crops as the default (D97). Skipped: Gemini side by side (key file empty). Qwen requests 84 of 300 (BE8 only); Gemini 0 of 150. Invoice links in the v2 pool rose from 1/13 to **11/13 (all suggestions)** with the Qwen readings and 4/13 with rules + OCR; false links 0 throughout. **PH2 gate (unique documents, same-day Qwen v4 read):** headers 101/136 (gate ≥ 126), line amount 28/47 (≥ 40), quantity 24/44 (≥ 36), rate 26/45 (≥ 36), documents lost to the cap 1 (gate 0), accepted-wrong 0 (met) — **not met**. Handwritten references 12/16 (v4 + band, D92 measurement; not re-measured).
 
 Plan changed (CRLF kept): §0 (date row; task 7 paragraph; next), §7.7 WI-PERF1 (status, profile, as built, result). Next (owner decides): WI-BE7a with MG-11, then WI-R1/WI-R2; open decisions listed in the session report.
+
+## D99 — Live deploy for the 22 Oct demo (AC-INT1 expedited); queue fan-out fix; app rehearsal on a disposable stack (21 Oct 2026)
+
+Owner decision, 21 Oct: no separate demo stack; all built work goes to the **live** app tonight from `phase2-hosted-ci` because it is demoed on 22 Oct; the live app is not used for business decisions, so short downtime is acceptable. Safety first: full backup, tested restore, dry-run migration on a copy and a ready rollback before any live change. This **expedites AC-INT1a/b for the demo** and waives the D83/D84 deployment gate (WI-PV5 not built) on two conditions: nothing from an LLM is auto-accepted on live, and the workspace auto-verify list is cleared before any upload. The login file was not present, so no one signed in to live in this session: the AI settings steps and the live smoke test are an owner checklist (`work/demo/setup-checklist.md`), rehearsed on a disposable stack.
+
+| Item | Result |
+|---|---|
+| Backup (21 Oct 14:39 UTC, live at 0024, 40 documents, all already withdrawn) | `C:\Users\jainm\reconbench-archive\`: `live-db-20261022.dump` (pg_dump -Fc, 676,319 B, SHA-256 `de7ad0c4daf6…`), `live-globals-20261022.sql` (`a4bde2a4b010…`), `live-minio-20261022.tar` (85,207,040 B, `67e59b9a70d8…`), `.env` copy (`601c4f011c33…`), `deploy/secrets` copy; images `reconbench-{api,worker,ai-worker,setup,web,minio}:pre-20261022`; rollback runbook in `work/handoff-20261022-live.md` §2 |
+| Restore test (disposable `rb-live-copy-pg`) | all 54 tables' row counts identical to live |
+| Dry-run migration on the copy (setup script verbatim, candidate image) | 0024 → 0030 in 7 s; Alembic autogenerate no drift; catalog contract differs only in 31 extension-routine owner names (environment); phase-2 catalog, index, table-count checks pass; Gemini key moved to its card and still unseals; Excel export builds (5 sheets, 6 cases) |
+| Consent after migration | not current under the new code (old code: current) — **by design**: the fingerprint covers the vision prompt version/variant, changed since the 15 Oct consent. Effect: no document AI request and no auto-verification until an admin re-saves AI settings with consent |
+| Re-processing on start | none (0 waiting jobs; no periodic re-parse) |
+| Code (commit `8b972df`, tag `live-20261022`, local) | snapshot of all work since `8fd9c3c` (192 files; scan: 0 keys/tokens; test keys all synthetic; no new truth GSTIN or party string); `compose.yaml` forwards `RB_AI_VLLM_CALLS`/`RB_AI_VLLM_ENDPOINTS` (api, worker, ai-worker) and `RB_AI_VLLM_BASE_URL` (ai-worker); an empty base URL counts as unset; `.env` gains the three vLLM entries (Qwen server of §3.5); Gemini settings untouched. Offline 1178 passed (+1) |
+| Live deploy (≈ 14:58 UTC) | `docker compose up -d --build`; setup 0024 → 0030; api healthy/ready; web 200; rules hash `5fa08179…` in all containers; data row counts unchanged; the Gemini card became Connected through the app's hourly synthetic health check (2 requests tonight) |
+| **Found: ledger job fan-out** | importing the August PO export queued **31,196** `recompute_po` jobs (every mapping step re-queued one per dirty PO; ≈ 0.8 jobs/s on the single worker ≈ 11 h, blocking every other queue). Fix (commit `15ab05a`, tag `live-20261022-fix1`): per-PO and per-workspace queueing locks on `recompute_po` / `drain_dirty_scopes` (indexed check for a waiting job; insert inside a savepoint). Same results; ≈ 500 jobs, ≈ 10 min. Offline 1182 passed (3 new); integration `test_ingestion` + `test_phase4_task_411_413` 7 passed. Redeployed to live (setup no-op, data unchanged) |
+| Owner scripts (tested on the disposable stack) | `work/demo/live_setup.py setup`: clears the auto-verify list + re-consents (Gemini settings), tests Gemini, connects Qwen (Connected), sets the page reader to Qwen; `reader gemini|vllm` switches; no new wiring was needed (`primary_reader` exists since D65) |
+| App rehearsal (disposable stack, same code and files, fresh DB) | S07 Qwen reading **reaches the document page**: 42 suggestions (9 header fields, 33 line values, all with page boxes; 30 equal the parsed value), provider vllm / qwen3.5:9b; both truth handwritten references typed correctly (+1 extra PO-typed note). PO.xml 251, GRN.xml 250 imported natively; Qwen read 7/8 invoices (S06: `invalid_output`, rules + OCR kept); GRN→PO header **217 auto + 9 suggested** (= D96); invoice links **4/13, all suggested, 0 false** (= bench rules arm); reconciliation 8 cases (4 needs review, 4 unlinked; = D95/D96 arm A); S05 needs review (`GRN_OVER_PO`, `TOTAL_MISMATCH`, `MATH_ERROR`, …; WI-R1/WI-R2) |
+| **Difference from the bench** | the bench's 11/13 used Qwen values and typed references inside the matcher (harness substitution); in the app a reading in suggest mode never enters the document, so the matcher sees rules + OCR values only. Not wired tonight (it would put LLM output into matching without review); needs WI-BE7 (merge with guards) or reviewer-accepted values |
+| Requests | Qwen 27 (all HTTP 200; 1 answer invalid; 0 retries) of 150; Gemini 2 (live health checks) of 150; Gemini bench (step H) not run |
+| Hard zeros | false links 0; values auto-accepted 0; nothing from an LLM applied as a value on live (live has no new document) |
+
+Provisional decisions (owner to confirm): no SQL change to live settings (the list is cleared by the owner's first step; until then consent is not current, so nothing is sent or auto-verified); the hourly Gemini health check is accepted on live; the queue fix was deployed to live; the linking gap is reported, not wired; plan and decision-log records left uncommitted.
+
+Next: owner runs `work/demo/setup-checklist.md` (E then F, ≥ 1 h before the demo); then WI-BE7a with MG-11 (the path from 4/13 to the bench's 11/13 in the app), WI-PV5, WI-FE1a/b.
+
+## D100 — Demo workflow on live (fix2): one-click confirm, confirmations kept, engine 0.1.10, run view, AI providers screen (22 Oct 2026)
+
+Owner brief, night of 21–22 Oct: make the target workflow (Settings → upload → Mapping one-click confirm → Reconciliation) work on live by clicking, for the 22 Oct demo; fixes general only, each with a test; no rule, tolerance or threshold loosened; 0 false Matched, 0 false links, 0 LLM values accepted without a person; all testing on throwaway copies of live (fresh read-only dump, copy-only test user, Qwen on, Gemini gate off); web changes developed outside `web/` and applied in one step after the gate. Commit `1f821c8`, tag `live-20261022-fix2` (local, no push); live rebuilt (api, worker, ai-worker) and `web/src` patched at ≈ 01:10 IST.
+
+| Fix | What changed | Test |
+|---|---|---|
+| F1 Mapping crash | PO dropdown read `event.currentTarget` inside a state updater (TypeError → blank page); same pattern in the CSV dialog; error boundary around routed pages (message + Reload) | web test chooses a PO and the row stays |
+| F2 One-click invoice confirm | `POST /documents/{id}/links/confirm` (listed link id + version, one PO, one transaction, each link through the per-link confirm path and audited; stale version 409, foreign PO / repeated link / AI-suggested link 422, nothing confirmed); document listing returns `line_nos`; row shows the PO, "n of m lines linked", lines needing attention, line links | integration (409/422 confirm nothing; audit rows = links); web tests |
+| F7 Confirmations kept | `_persist_resolution` kept only *manual* confirmed links: any later mapping pass for that document turned a person's confirmed content link back into a suggestion (seen on the copy: the owner's confirm reverted after other uploads). A confirmed link now stays while the resolver proposes the same pairing (document, line, PO, link type); a changed pairing is superseded as before | integration re-run assertion fails on the old code, passes now |
+| F6 Engine: confirmed link | a person-confirmed link below 0.95 was still flagged LINK_INFERRED and low confidence (spec: confirming resolves LINK_INFERRED); suggested/auto links unchanged | 3 unit tests |
+| F8 Engine: GRN double count | a GRN with a header link and line links to the same PO was added to the PO ledger once per link → false GRN_OVER_PO on every linked demo case; each GRN line now counts once per PO (line link first, else header) | 2 unit tests (fails on old code; a real over-receipt is still flagged) |
+| F3 Run UX | reconciliation jobs queued with priority 10 (ledger/mapping/ingest default 0); run view lists that run's cases (`GET /cases?run_id=`) for all dates; progress panel as before | unit (priority), integration (run filter) |
+| F5 Settings | AI providers panel: Qwen and Gemini cards (state, model, server, Test connection), page-reader switch with the consent text for the new destination, text-assist line; banner names page reader and text assist separately; Home card consent preview uses the saved reader (it asked for consent and would fail while the reader is Qwen) | web tests |
+| F4 Accept a suggestion | already present (Use suggested → draft → save; `document.correct` audit with `ai_call_id`; mapping re-queued); no change | rehearsal |
+
+ENGINE_VERSION 0.1.9 → 0.1.10; rules hash `ffa8e9cb2b87…`; OpenAPI + web types regenerated (additive).
+
+| Rehearsal 2 = gate (fresh copy of live, final code, clicks) | Result |
+|---|---|
+| Matched | 2 invoices (Phoenyx; Om Shakti after the reviewer took the suggested invoice number); both = truth PO and GRN, expected = invoice taxable, variance 0 |
+| Needs review | Ingram partial delivery (ITEM_UNSURE, LOW_CONFIDENCE_DATA, MATH_ERROR taxable misread, TOTAL_MISMATCH freight in line amounts; PO lines 2–3 stay open); Vijayshree (TOTAL_MISMATCH = exactly the lump-sum line 7, LOW_CONFIDENCE_DATA two lines at 0.65 OCR) |
+| Unlinked | Prime (handwritten PO only), Amazon (0 lines parsed); blind S08 (July PO not in the app): extraction correct, Unlinked NO_PO_LINK |
+| Hard zeros | wrong links 0, false Matched 0, AI values accepted without a person 0, consensus runs 0, Gemini calls 0 |
+| Timing | run 4–6 s, including one while 99 ledger jobs waited |
+| Literal scan (non-test diff) | 0 truth literals, 0 GSTIN-shaped strings |
+| Requests | Qwen ≈ 40 HTTP calls across both copies (19 counted in rehearsal 2; rehearsal 1 logs lost on container restarts) of 120; Gemini 0 |
+
+Checks: offline suite 1188 passed; integration `test_ingestion` + `test_phase4_task_411_413` 7 passed (disposable PG); web tsc, eslint, money-math, vitest 40/40; ruff/format/mypy --strict on touched files; rules hash, engine version, core purity. Live after apply: healthz ok, readyz ready, rules hash in all three containers, Alembic 0030, reader vllm/single, auto-verify list empty, apply mode suggest, queue empty, login page renders (0 page errors). Not run: Gemini anything; live login.
+
+Provisional decisions (owner to confirm): F7 and F8 counted as real bugs (not loosening); uploads right after a correction wait behind ≈ 100 ledger jobs (≈ 10 min) because ingest keeps default priority (mapping reads ledger support, so reordering was not safe tonight); an accidental `git stash` on `mapping_service.py` was popped immediately (nothing lost).
+
+Open items (proposals, not built): P1 lump-sum line rule (amount-based payable when invoice and PO line both have no quantity); P2 "Save and mark reviewed" marks only PO/GRN refs user-verified, so LOW_CONFIDENCE_DATA stays after a person's review; P3 `consensus_enqueue_failed TypeError` in the AI worker (advisory, auto-verify empty); P4 ingest/parse priority over ledger jobs; deferred by the owner: handwritten-reference link hints, WI-BE7, bundle-PDF OCR artefacts, "PO document is not current" job failures, hourly Gemini health check. The branch exists on origin (`origin/phase2-hosted-ci`, HEAD now 6 commits ahead; no push tonight).
+
+## D101 — Read-only terminal trace tool (22 Oct 2026)
+
+Built `reconbench_tools.trace` (`doc`, `run`, and `follow` modes) directly from the trace tool plan.
+1. **Security & Read-Only Guarantees:** Connects with `default_transaction_read_only=on`, `statement_timeout=3000ms`, `lock_timeout=500ms`, `application_name=reconbench_trace`. Verifies `SHOW default_transaction_read_only` returns `on` on connect, else exits code 2. Every query runs inside `SET TRANSACTION READ ONLY`. Pure `SELECT` queries bounded with `LIMIT` and scoped by `workspace_id`.
+2. **Features:**
+   - `doc <invoice number | document id>`: traces document ingestion status, AI reader metadata/suggestions/typed handwritten refs, header field comparisons against stored extraction, line items, active links, current PO ledger, and 3-way reconciliation match.
+   - `run <latest | run id>`: shows run summary and per-invoice case statuses and reason codes.
+   - `follow [--interval 3]`: polls queue counts (`procrastinate_jobs`) and recent ingestion/parsing/linking/recon events.
+   - Common flags: `--mask` (redacts GSTINs, vendor names, monetary amounts), `--no-color`, `--workspace-id`, `--db-url`.
+3. **Validation & Isolation:** Unit tests (`test_trace_format.py`, 16 tests) and integration tests (`test_trace_readonly.py`, 3 tests) passed against disposable PostgreSQL (port 15499) with zero writes permitted. Verified live against read-only session on port 15432. No existing application, worker, or configuration files were modified.
+
+## D102 — WI-TRC2 pipeline log watcher and read-only login (23 Oct 2026)
+- Added idle, read-only pipeline-log watcher container (WI-TRC2) for live terminal visibility.
+- Configured 4 environment toggles: RB_PIPELINE_LOG (default off), RB_PIPELINE_LOG_VALUES (masked), RB_PIPELINE_LOG_INTERVAL (3s), RB_PIPELINE_LOG_ASCII (0).
+- Owner decision departs from main plan Phase 7.6: show mode displays vendor names and amounts in terminal logs; GSTIN is masked to last 4 in both modes; log rotation set to 10 MB x 3.
+- Created dedicated PostgreSQL login reconbench_logreader (NOSUPERUSER, default_transaction_read_only=on, statement_timeout=3s, idle timeout 30s).
+- Granted SELECT on 26 tables plus app_user(id, display_name); blocked from secret, session, rate_limit_event, idempotency_key, and password columns.
+- Both pipeline_log watcher and trace tool now wire to reconbench_logreader instead of superuser.
+- Pre-deployment binary database backup saved to C:\Users\jainm\reconbench-archive\live-db-20261023-1538.dump (3.49 MB, 705 items).
+- Pre-pilot findings flagged: api/worker/ai-worker run as superuser reconbench (main plan 2.7), and backend image runs as root (main plan 7.1).
+- Fixed trace.py AttributeError on unversioned documents (line 196/224) and verified with automated unit tests.
+- Zero AI requests made during implementation and deployment verification.
