@@ -77,7 +77,7 @@ def migrated() -> Iterator[tuple[Engine, dict[str, UUID], UUID]]:
     try:
         with engine.begin() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-            assert heads == {"0030"}, heads
+            assert heads == {"0031"}, heads
             for statement in _REWIND:
                 connection.exec_driver_sql(statement)
             user_id = connection.scalar(sa.text("SELECT id FROM app_user LIMIT 1"))

@@ -16,6 +16,7 @@ This is the single authoritative accuracy plan. The other authoritative plan is 
 | Consolidation | done 20 Oct (D79): snapshot commit tagged `pre-plan-merge-20261020`, then the five retired documents removed (§14) |
 | Change of requirement | 20 Oct (D80): both providers supported, connected from the frontend, selected by users; Gemini is not turned off (§4.15) |
 | Session rules (D83, 20 Oct) | **Gemini runs on the free tier** (`gemini-3.5-flash-lite`, no billing): cost is ₹0, the O-24 cap is dormant, **rate limits and data use are the constraints** (§4.15.9, WI-PV7, O-25). **Unit of evidence = unique document** (§2.5, §3.2a, O-26). **No deploy before WI-PV5** (AC-INT1b). |
+| Post-demo changes (D103, 26 Oct) | owner decisions on the post-demo audit: digital invoices always rules + text layer; one Settings switch for scanned invoices (default rules); AI reading only for scanned invoices with the switch on AI; handwritten values count only after a person's click; one active provider; mapping and reconciliation make 0 AI calls; no duplicate ingestion. Plan in §15; batch PD-B1 (PD-0b-1 … PD-0b-4, PD-4a, PD-4b) first |
 
 **Where we are.** The rules + OCR path, QR, page split, vendor hygiene, vision reader, consensus (D42), verify screen, identity and matching v2 are built (AC-0 … AC-9a, D32–D58). The provider layer, the Qwen reader, settings, shadow store and the evaluation harness are built **in the working tree only** (D62–D67; offline suites 1090 passed per D77, not re-run for this plan). Qwen3.5-9B on the company vLLM server has been benchmarked offline in six server reads (D68–D77). With prompt `vision.prompt.v4.qwen` and the D77 cross-page conflict rule it reads **275/313 headers (87.9%)** on the 39 dev PDFs, against **242/313 (77.3%)** for Tesseract + rules on the same documents (`ev2-e5-v4-ctl.json`, repeat 0 = the 16 Oct read, D74 answers rescored under D77). Lines are weaker: amount 90/123, quantity 79/114, rate 85/118, description 47/108 (40 wrong), HSN 46/75. **No accuracy target is met.** All hard-zero metrics are 0 in every stored report, and the simulated critical false-accept count is 0.
 
@@ -1555,3 +1556,160 @@ Removed on 20 Oct 2026 (D79) with the owner's approval. Each is archived byte fo
 | `docs/audit-llm-extraction.md` | untracked | §4.13, §12, §13.6 |
 
 The previous version of `docs/accuracy-plan.md` (this file before the rewrite) is archived in the same folder. Recovery: `git show pre-plan-merge-20261020:docs/<file>`, or copy back from `work/plan-archive-20261020/` or the tarball. The **previous version of this file** (before the Qwen-first rewrite) exists only in the archive folder and the tarball: the snapshot commit holds the rewritten version. Kept: `ReconBench_*.md`, `decision-log.md`, `gates/*`, `diagnosis-scan-extraction.md`, `schema-errata.md`, `ai-gemini-protocol.md`, `database-roles-and-seeding.md`, `dependency-review.md`, `engine-cli.md`, `index-review.md`, `schema-drift-check.md`, `schemas/*`.
+
+---
+
+## 15. Post-demo changes (PD)
+
+Decided by the owner on 26 Oct 2026 (**D103**), from the post-demo audit `work/postdemo-audit-20261026.md` (PD-AUDIT, its §5 draft revised to the owner's decisions). Findings F1 … F14 and facts K1 … K15 are the audit's. Where this section and an earlier section differ, this section wins for the PD work; every departure is listed in D103.
+
+### 15.0 Principles
+1. **Digital invoices are always read by rules + text layer**; never an LLM call, whatever any setting says.
+2. **Scanned invoices: one Settings switch** ("Scanned invoices: read with rules / read with AI"), **default rules**; no per-upload choice. Digital vs scanned stays automatic per page; a PDF with any scanned page counts as scanned.
+3. **AI reading only** on scanned invoices with the switch on AI; never on digital invoices, PO files or GRN files.
+4. **One active provider** (Gemini or vLLM) for every AI call; the inactive one gets 0 requests; no shadow, no per-upload override, no fallback, no re-run with the other provider on live. AI reading uses vLLM; Gemini reads only after the owner re-confirms O-25.
+5. **Mapping and reconciliation make 0 AI calls** (H2, H3, H4 off, code kept).
+6. **Hard zeros unchanged:** 0 false Matched, 0 false links, 0 AI values accepted without a person's click. For AI values this is enforced by **origin + verification**, not by a confidence number (F1, F2).
+7. **Handwritten values** read by AI count in mapping and 3-way matching only after one click by a person (references → link suggestions; other values → suggested field values).
+8. **No duplicate ingestion** (D103 decision 9).
+9. Nothing claims one method is more accurate until PD-5c measures both on the same unique documents.
+
+### 15.1 Order
+1. **Batch PD-B1:** PD-0b-1, PD-0b-2, PD-0b-3, PD-0b-4, PD-4a, PD-4b.
+2. **PD-1a + PD-1d + PD-3a** (they change the consent fingerprint: deploy on a day without a demo, then the owner re-consents).
+3. **PD-2a + PD-2b + PD-4d.**
+4. **PD-1b + PD-1c.**
+5. **PD-2c + PD-2d.**
+6. **PD-2e + PD-2f + PD-2h.**
+7. **PD-5** (5a, 5b, 5c).
+
+PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c with step 5). PD-3c (P1 lump-sum rule) is pending the owner's decision.
+
+### 15.2 Cards
+
+#### PD-0 — Audit and plan
+- **Description:** the post-demo audit and this section. **Status:** done (D103).
+
+#### PD-0b-1 — Withdrawn POs stuck in `dirty_scope` (batch PD-B1)
+- **Description:** `rebuild_po_connection` raises for a withdrawn or non-current PO and `drain_dirty_scopes` rolls back its batch. Such a scope is processed without error, its obsolete ledger rows are handled the way the app shows withdrawn POs, the scope is marked processed, and one bad scope never rolls back the others. Old failed job rows are kept (history).
+- **Reason:** 1,105 failed `recompute_po` + 121 failed `drain_dirty_scopes` (F14).
+- **Files:** `backend/reconbench_app/ledger_service.py`, `backend/reconbench_app/jobs.py`.
+- **Acceptance:** unit test (withdrawn PO in a dirty scope → processed, nothing raises); on a fresh copy of live, a drain gives 0 new failed jobs, the 10 stuck scopes processed, active PO ledger rows identical before and after (diff 0). **Status:** pending (batch PD-B1).
+
+#### PD-0b-2 — Trace `find_document` prefers the current document (batch PD-B1)
+- **Description:** order by current first (not withdrawn, with a current version), then the most recently updated. **Files:** `backend/reconbench_tools/trace_queries.py`.
+- **Acceptance:** unit test: a newer withdrawn copy and an older active one → the active one. **Status:** pending (batch PD-B1).
+
+#### PD-0b-3 — Task C: links appear fast (batch PD-B1)
+- **Description:** every upload, correction or link action queues ≈ 255–261 `recompute_po` jobs (≈ every PO); re-mapped links waited ≈ 4 min behind them (23 Oct). Scope the ledger recompute to the POs whose inputs changed (linked now and before the change, the vendor's candidate POs, POs whose GRN or link inputs changed), preferably identical by construction (skip a PO whose input fingerprint is unchanged). No queue-jumping (owner P4, 22 Oct). Stale-ledger guard: nothing may use a `po_line_ledger` row older than the latest change to its inputs; if that cannot be guaranteed the card is parked. A full-recompute command stays as the safety net.
+- **Files:** `backend/reconbench_app/ledger_service.py`, `backend/reconbench_app/jobs.py`, `backend/reconbench_app/mapping_service.py` (enqueue points).
+- **Acceptance:** identical-results replay on fresh copies (old vs new code; uploads, Use suggested, Confirm link, a moved link, a removed link, a GRN upload, a PO re-import, a document delete): links, ledger rows and reconciliation outcomes 0 differences; after each scoped run a full recompute diffs to 0; recompute jobs per event before vs after; time until links are visible after an upload and after a correction (≥ 5 each), target ≤ about 60 s. O-5 if core changes. **Status:** pending (batch PD-B1).
+
+#### PD-0b-4 — No duplicate ingestion (D103 decision 9; extends AC-8b; batch PD-B1)
+- **Description:** (1) **exact file:** a hash of the bytes is compared with active (not withdrawn) uploads in the workspace before parsing; a match makes no document, no version and no job, and the upload result says "Already uploaded" with a link to the original. (2) **PO/GRN:** identity = document type + canonical number; unchanged content → skipped (no new version, no ledger job); changed → a new version of the existing document (amendment); the import result counts per voucher new / unchanged / amended. (3) **Invoices:** identity = resolved vendor + canonical invoice number + financial year of the invoice date; an active match is never a second active document and is never mapped or reconciled; the person sees "Duplicate of INV …" with **Discard** (default) or **Replace with this file** (a new version, audited). (4) **Uncertain matches** (vendor not resolved, number read at low confidence, or the AC-8b re-scan signals) are held as "Possible duplicate of …", not mapped or reconciled until a person chooses Discard or Keep as new (audited). (5) Within one upload (a ZIP or batch with the same file twice, one PDF holding the same invoice twice) → one document. (6) A database guard against two simultaneous uploads of the same file (additive migration only). Existing data is not changed; the count of existing active documents that would be duplicates under the rule is reported for the owner. Withdrawn documents never count; the same number from a different vendor is not a duplicate; nothing is dropped silently (reason + link to the original + audit row).
+- **Reuse:** the existing file-hash checks, canonical numbers, version-on-re-import and the AC-8b guard; no new fuzzy matching.
+- **Files:** `backend/reconbench_app/ingestion.py`, `backend/reconbench_app/api/ingestion.py`, `backend/reconbench_app/db/metadata.py` + migration, the upload screens in `web/src`.
+- **Acceptance:** unit and integration tests for every case (plus: a withdrawn document re-uploaded → ingested; the same number from another vendor → ingested; an amended PO → a new version); re-upload of PO.xml and GRN.xml → 0 new documents, 0 new versions, no ledger fan-out; re-upload of a rehearsal invoice → "Already uploaded"; the re-scans 1–7 after their originals (copies only) → each held or blocked, count reported (bench 5/7); **0 false duplicates** among distinct real documents. O-5 if core identity code changes. **Status:** pending (batch PD-B1).
+
+#### PD-1a — One active provider for every AI call (D103 decision 6; replaces Task B)
+- **Description:** one workspace setting for the active provider (Gemini, vLLM or none); `SettingsSnapshot.target()` returns it for **every** hook (today text hooks are hard-wired to Gemini, `ai/runtime_checks.py`); remove `gemini_required` and the Gemini-only `provider` literal; refuse `reader_strategy = shadow`; ignore `shadow_provider`, `allow_provider_fallback`, `batch.provider_override` (F6, F13; columns kept, unused); Gemini hourly health only while Gemini is active (K9); switching is an `ai.manage` action, audited, needs fresh consent and never alters existing readings. A failure returns a stated error code and never re-routes.
+- **Files:** `ai/runtime_checks.py`, `ai/settings_service.py`, `ai/consent.py`, `ai/enqueue.py`, `ai/worker/sweeps.py`, `api/ai.py`; one additive migration if a new column is needed.
+- **Tests:** unit on `target()` for every hook × active provider; scenario "inactive provider 0 requests" with the stub transport; scenario "switch provider → existing readings unchanged". **Status:** pending (step 2).
+
+#### PD-1b — vLLM capability checks
+- **Description:** on Connect/Test: `GET /models` + a synthetic structured-output probe + a synthetic image probe; store `supports_vision`, `supports_json_schema`, `context_window` per card; AI reading can be switched on only when the active provider supports vision and JSON schema. Probes use synthetic fixtures only; one request each, logged.
+- **Files:** `ai/worker/openai_compat.py`, `ai/settings_service.py`, `ai/fixtures.py`, `ai_provider_config` (additive migration), `ai/worker/tasks.py`. **Status:** pending (step 4).
+
+#### PD-1c — One provider component on Home and Settings (D103 decision 5)
+- **Description:** one shared component replaces the Gemini-only `AiAssistCard` and the Settings provider cards: choose Gemini (key) or vLLM (URL from the allowlist + model); Connected only after the server-side test (PD-1b); admin only (`ai.manage`); a key is never shown; the vLLM URL is shown to admins only, others see "Company server" (Q9, F5).
+- **Files:** `web/src/components/AiAssistCard.tsx`, `web/src/components/AiProvidersPanel.tsx`, `web/src/pages/HomePage.tsx`, `web/src/pages/SettingsPage.tsx`, `web/src/api/ai.ts`. **Tests:** vitest: same view model on both pages; key field write-only; non-admin read-only. **Status:** pending (step 4).
+
+#### PD-1d — Provider safety suite (folds WI-PV8 and part of WI-G3)
+- **Description:** scenario tests: gates disabled ⇒ 0 requests; a non-allowlisted URL is never called; the secret never appears in responses, logs, exports or audit; non-admin refused; disconnect mid-run safe; no cross-provider fallback on 401/429/5xx/timeout; `web/src` holds no model URL. **Files:** `backend/tests/scenarios/test_hard_zero_guards.py`, new `backend/tests/scenarios/test_provider_isolation.py`. **Status:** pending (step 2).
+
+#### PD-3a — H2, H3, H4 off (D103 decision 7)
+- **Description:** remove H2–H4 from `HOOKS_BY_MODE` (`ai/consent.py`); the enqueue calls in `mapping_service.py`, `reconciliation_service.py` and `vendor_resolution.py` stay inert; code kept. Consent text updated (fingerprint changes ⇒ re-consent).
+- **Tests:** integration "mapping pass + reconciliation run with AI configured and consent current ⇒ `ai_request` count unchanged"; unit on `hooks_for_mode`. **Status:** pending (step 2).
+
+#### PD-3b — Determinism properties per method
+- **Description:** everything read by rules keeps SCN-20 / property #8. AI-read scanned invoices get a new property: with a stub reader returning arbitrary valid, invalid or hostile output, **no case is Matched and no link is auto without a person's click**. **Tests:** hypothesis test in `backend/tests/property/`. **Deps:** PD-2a, PD-2b, PD-2e. **Status:** pending (step 6).
+
+#### PD-3c — P1 lump-sum line rule
+- **Description:** amount-based payable when the invoice line and the PO line both have no quantity; engine version and rules hash bump; no tolerance loosened. **Status:** pending the owner's decision.
+
+#### PD-2a — AI origin and provenance (fixes F1; folds MG-1) — blocks any AI value becoming current
+- **Description:** add `FieldOrigin.AI`; `origin_for` maps `ai_first`/`ai_fallback` to it (today → `ocr`); the reference system check keeps accepting only `ocr`/`erp_import`, so an AI value is never system-checked; per-field provenance (provider, model, prompt, `ai_request_id`, page, box).
+- **Files:** `reconbench_core/schema/__init__.py`, `backend/reconbench_app/ingestion.py`, `reconbench_core/mapping/links.py`.
+- **Acceptance:** scenario "AI-origin PO ref, confidence 1.0, same-vendor open PO, matching amount ⇒ suggested, never auto"; property: no AI-origin field is ever `system_check`. **Status:** pending (step 3).
+
+#### PD-2b — Verification-aware data gate (fixes F2; is P2)
+- **Description:** (1) the gate treats a `user`-verified field as confidence 1.0 and a corrected field as verified, so the F2 "0" case disappears; (2) any critical field with origin AI and verification ≠ `user` makes the case Needs review with a new reason (`AI_VALUE_UNVERIFIED`), whatever its confidence; (3) "Save and mark reviewed" marks every displayed critical field `user`-verified (P2), audited.
+- **Files:** `reconbench_core/schema/__init__.py` or `recon/engine.py`, `ReasonCode`, `backend/reconbench_app/ingestion.py`, the review surfaces. Engine version + rules hash bump.
+- **Acceptance:** an AI-read invoice reaches Matched only after a person verifies its critical fields and its links are confirmed (or auto from person-verified refs); rules-read verdicts unchanged except the F2 cases, listed in the change note. **Status:** pending (step 3).
+
+#### PD-2c — Settings switch for scanned invoices (D103 decision 2; replaces the per-upload method choice)
+- **Description:** one workspace setting "Scanned invoices: read with rules / read with AI", default rules, admin only, audited. Digital vs scanned stays automatic per page; a PDF with any scanned page counts as scanned. The **method actually used is stored per version** in its own column (it survives a person's save, F9) and is shown on the document page and in the Excel export (Q13). PO/GRN files and XML/CSV are always rules (Q5). The switch can be set to AI only when the active provider passed PD-1b.
+- **Files:** `ai/settings_service.py`, `ingestion.py`, `db/metadata.py` + additive migration, `export_service.py`, the Settings screen and the document page. **Tests:** integration (each switch position → stored method per version; a person's save keeps it); export column. **Status:** pending (step 5).
+
+#### PD-2d — 0 LLM calls outside AI reading (D103 decisions 1 and 3; replaces Task A)
+- **Description:** 0 LLM calls for **digital invoices, PO/GRN files, and scanned invoices with the switch on rules**: `_queue_extraction_suggestions` and `vision_targets` skip them; no H1 either.
+- **Acceptance:** uploads of a digital invoice, a PO PDF, a GRN PDF and a scanned invoice (switch on rules) ⇒ 0 `ai_request` rows; extraction output identical to today's rules path. **Status:** pending (step 5).
+
+#### PD-2e — AI reading for scanned invoices (D103 decision 3; = WI-BE7a/b/c rescoped)
+- **Description:** only **scanned invoices with the switch on AI** (a mixed PDF counts as scanned) are read by the active provider. The general worker turns the validated answer into a new current version (`extraction_method = ai_first`, origin AI from PD-2a) through a pure `merge_readings` with an `arb.llm` policy: the LLM leads; OCR runs as a visible cross-check (disagreement flagged `LLM_DISAGREEMENT` with the OCR value side by side, never substituted). Guards kept: MG-1 (PD-2a), MG-2, MG-3, MG-4, MG-5, MG-6, MG-7 (a manual or verified field is never replaced), MG-8, MG-10 (auto-verify stays empty), MG-11; MG-9 as changed by D103 (PD-2h). WI-V1 validators run on AI values. P3 (`consensus_enqueue_failed TypeError`) fixed here.
+- **Unsafe until** PD-2a and PD-2b are done. **Deps:** PD-1a, PD-1b, PD-2a, PD-2b, PD-2c, WI-V1. **Status:** pending (step 6).
+
+#### PD-2f — AI reading failed: "Waiting for reading" (D103 Q3)
+- **Description:** after the provider's own retries the document shows "AI reading failed: <reason in plain words>" and is **"Waiting for reading"**: nothing becomes current until a person picks **Retry** or **Read with rules** (both audited); mapping and reconciliation skip it, so a run never blocks; 0 requests to the other provider. **Status:** pending (step 6).
+
+#### PD-2g — Digital PDF input form for AI reading
+- **Status:** **retired** (D103: digital invoices are never read by AI; Q4 dropped).
+
+#### PD-2h — Handwritten values from the AI reading (D103 decision 4; changes MG-9)
+- **Description:** the AI version keeps `typed_refs` / `annotation_refs` in `extras`. **Handwritten references → link suggestions** through the existing WI-D4 rule plus the self-support guard (the grand total used must be person-verified or agree with the OCR cross-check within ₹1). **Other handwritten values → suggested field values** (accepted by a person with "Use suggested"). Both count in mapping and 3-way matching **only after a person's click**; never automatic.
+- **Tests:** `tests/unit/test_q2_typed_links.py` extended (self-support case); hint links 100 % `suggested`; 0 false suggestions on the v2 pool. **Status:** pending (step 6).
+
+#### PD-4a — Reconciliation screen, like for like (batch PD-B1)
+- **Description:** table: **Invoice taxable | Expected taxable | Variance** (taxable basis), with the grand total in its own labelled column (K15, F3, Q10). Case panel "Why this status": per check the invoice value (actual), the reference value (expected), the difference (variance and %), the rule or tolerance, the result and a one-line plain reason (reason-code catalogue or a plain sentence per code). The data is already stored (F4). UI only: `RULES_HASH` and `ENGINE_VERSION` unchanged.
+- **Files:** `web/src/pages/ReconciliationPage.tsx`, a reason-text map in `web/src`. **Acceptance:** vitest with fixtures: invoice − reference = the difference shown; statuses equal the backend `effective_status`; every reason code has a text. **Status:** pending (batch PD-B1).
+
+#### PD-4b — Link / Unlink clarity (D103 Q12; batch PD-B1)
+- **Description:** plain labels ("Confirm link to PO …", "Remove this link"); Unlink asks for confirmation, then offers a **timed Undo**; a removed line shows "Removed by <person> · **Link again**" (permanent), which opens the line's candidates with the previous PO line preselected and creates a confirmed link by that person; each row shows its saved state ("Saved · time"); every action audited; the 409/422 duplicate and stale guards stay. Backend: one new `edit_link` action (restore / link again).
+- **Files:** `web/src/pages/MappingPage.tsx`, `backend/reconbench_app/mapping_service.py`, `backend/reconbench_app/api/mapping.py`. **Acceptance:** unlink → undo restores the same pairing; link again on a rejected line → a confirmed link (audited); a duplicate attempt is refused; after a mapping re-run and a reload the state equals the screen; web tests. **Status:** pending (batch PD-B1).
+
+#### PD-4c — Method and provenance on screens and exports
+- **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** pending (step 5).
+
+#### PD-4d — Verify AI-read fields (UI part of PD-2b)
+- **Description:** side by side AI value / OCR cross-check / page box; "Verify" per field and "Verify all" only where the AI and OCR values agree (Q8), with a count. **Deps:** PD-2b. **Status:** pending (step 3).
+
+#### PD-5a — End to end on a throwaway copy of live
+- **Description:** every scenario of the audit's §8 by clicking on a throwaway copy; web changes applied in one step after the gate. **Acceptance:** hard zeros 0; 0 `ai_request` for rules-read documents and from mapping/reconciliation; requests only to the active provider. **Status:** pending (step 7).
+
+#### PD-5b — Regression
+- **Description:** offline suite, integration suites, rules-path golden/bench hash identical, export parity, secret-leak tests, background jobs (PD-0b-1). **Status:** pending (step 7).
+
+#### PD-5c — Comparative measurement (folds the WI-D5 truth set)
+- **Description:** the same unique scanned invoices through both switch positions in the app; per-field counts with n (D83); no accuracy claim before this; the switch stays on rules by default until this measures. **Approval:** vLLM budget set by Claude (one go, logged); Gemini only after O-25 is re-confirmed. **Status:** pending (step 7).
+
+### 15.3 Existing cards: where they go
+
+| Card | Disposition |
+|---|---|
+| Task A (22 Oct) | D103 decision 1 + PD-2d |
+| Task B (22 Oct) | D103 decision 6 + PD-1a |
+| Task C (22 Oct) | "links appear fast" = PD-0b-3 |
+| P1 lump-sum | PD-3c (pending decision) |
+| P2 review verifies displayed fields | PD-2b + PD-4d |
+| P3 consensus TypeError | PD-2e |
+| P4 ingest priority | no queue-jumping; the cause is fixed by PD-0b-3 |
+| AC-8b re-scan guard | extended by PD-0b-4 |
+| WI-V1 | dependency of PD-2e |
+| WI-BE7a/b/c + MG-1 … MG-11 | rescoped into PD-2a / PD-2e; MG-9 changed by PD-2h |
+| WI-D4 hint rule | used by PD-2h with the self-support guard |
+| WI-D5 truth set | PD-5c |
+| dirty_scope fix | PD-0b-1 |
+| trace `find_document` fix | PD-0b-2 |
+| WI-PV5 (registry, per-upload override, live + shadow), WI-PV6 (re-run with the other provider), O-21 fallback, AC-LIVE-S/M, WI-BE9a/b/c (provider-agnostic and Qwen text hooks), WI-FE1b fallback UI | **retired** (D103 decisions 6, 7) |
+| WI-PV7 (Gemini quota/cost), WI-PV8, WI-G3, WI-FE3 | kept; WI-PV8 → PD-1d |
+| Photo uploads (JPG/PNG) | open, not in scope |

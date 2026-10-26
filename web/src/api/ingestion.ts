@@ -205,9 +205,17 @@ export function displayError(error: unknown): string {
   return error instanceof Error ? error.message : "The request could not be completed.";
 }
 
-export async function uploadFile(batchId: string, zone: UploadZone, file: File, csrfToken: string): Promise<void> {
+export interface UploadResult {
+  file_id: string;
+  /** The same bytes are already an active upload: nothing was stored or queued (PD-0b-4). */
+  duplicate: boolean;
+  original_display_name?: string | null;
+  original_batch_id?: string | null;
+}
+
+export async function uploadFile(batchId: string, zone: UploadZone, file: File, csrfToken: string): Promise<UploadResult> {
   const safeName = file.name.replace(/[^\x20-\x7E]/g, "_").replace(/[\r\n]/g, "_");
-  await request(`/files?batch_id=${encodeURIComponent(batchId)}&zone=${zone}`, csrfToken, {
+  const response = await request(`/files?batch_id=${encodeURIComponent(batchId)}&zone=${zone}`, csrfToken, {
     method: "POST",
     headers: {
       "Content-Type": "application/octet-stream",
@@ -215,7 +223,54 @@ export async function uploadFile(batchId: string, zone: UploadZone, file: File, 
     },
     body: file,
   });
+  try {
+    return (await response.json()) as UploadResult;
+  } catch {
+    return { file_id: "", duplicate: false };
+  }
 }
+
+export interface DuplicateHold {
+  id: string;
+  source_file_id: string;
+  file_name: string;
+  kind: "duplicate" | "possible";
+  reason: string;
+  doc_no: string | null;
+  state: "open" | "discarded" | "replaced" | "kept";
+  version: number;
+  duplicate_of_document_id: string;
+  original_doc_no: string | null;
+  original_file_name: string | null;
+  original_batch_id: string | null;
+}
+
+export async function listDuplicateHolds(state = "open"): Promise<DuplicateHold[]> {
+  const response = await request(`/duplicate-holds?state=${encodeURIComponent(state)}`, null);
+  return (await response.json()) as DuplicateHold[];
+}
+
+export async function decideDuplicateHold(
+  hold: DuplicateHold,
+  decision: "discard" | "replace" | "keep",
+  csrfToken: string,
+): Promise<void> {
+  await request(`/duplicate-holds/${encodeURIComponent(hold.id)}/decision`, csrfToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "If-Match": `"${hold.version}"` },
+    body: JSON.stringify({ decision }),
+  });
+}
+
+export const DUPLICATE_REASON_TEXT: Record<string, string> = {
+  same_vendor_number_year: "Same supplier GSTIN, invoice number and financial year.",
+  number_low_confidence: "Same supplier and number, but the number was read with low confidence.",
+  same_supplier_other_registration: "Same number from the same supplier under another GSTIN.",
+  vendor_not_resolved: "Same number and year; the supplier could not be identified.",
+  date_not_read: "Same supplier and number; the invoice date could not be read.",
+  number_read_differently: "Same supplier and year; the number differs only by look-alike characters.",
+  rescan_match: "The pages look like a scan of an invoice already in the app.",
+};
 
 export async function processBatch(batchId: string, csrfToken: string): Promise<void> {
   await request(`/batches/${encodeURIComponent(batchId)}/process`, csrfToken, { method: "POST" });

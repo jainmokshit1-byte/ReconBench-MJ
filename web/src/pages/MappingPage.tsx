@@ -15,7 +15,7 @@ import {
   MappingApiError,
   renameMappingVendor,
 } from "../api/mapping";
-import type { CurrentMappingLink, MappingDocument, MappingVendor, MergeSuggestion } from "../api/mapping";
+import type { CurrentMappingLink, LinkAction, MappingDocument, MappingVendor, MergeSuggestion } from "../api/mapping";
 import { getFile } from "../api/ingestion";
 import type { IngestionFile } from "../api/ingestion";
 import { IngestionPreview } from "../components/IngestionPreview";
@@ -32,6 +32,17 @@ const tabs: Array<{ id: DocType; label: string }> = [
   { id: "grn", label: "GRN" },
   { id: "invoice", label: "Invoice" },
 ];
+
+const savedTimeFormatter = new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+
+function displayDateTime(value: string | null | undefined): string {
+  if (!value) return "time unknown";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : savedTimeFormatter.format(parsed);
+}
+
+// A removed link can be undone for this long; "Link again" stays available afterwards.
+export const UNDO_SECONDS = 10;
 
 function displayDate(value: string | null): string {
   if (!value) return "—";
@@ -240,7 +251,7 @@ function MappingDocumentRow({
   editable: boolean;
   busy: boolean;
   onAssign: (documentId: string, vendorId: string) => void;
-  onLinkAction: (linkId: string, action: "confirm" | "change" | "unlink", version: number, targetId?: string) => void;
+  onLinkAction: (linkId: string, action: LinkAction, version: number, targetId?: string) => void;
   onConfirmLinks: (documentId: string, poId: string, links: CurrentMappingLink[]) => void;
   onPreview: (fileId: string, documentId: string) => void;
   onCopyLink: (row: MappingDocument) => void;
@@ -248,7 +259,16 @@ function MappingDocumentRow({
 }) {
   const [assignTo, setAssignTo] = useState("");
   const [targetByLink, setTargetByLink] = useState<Record<string, string>>({});
+  const [relinkOpen, setRelinkOpen] = useState<Record<string, boolean>>({});
   const linkSet = summarizeLinks(row);
+  const removedLinks = row.links.filter((item) => item.state === "rejected" && item.detail_code === "manual_unlink");
+  const savedLink = [...row.links].filter((item) => item.saved_by_name).sort((a, b) => String(b.saved_at ?? "").localeCompare(String(a.saved_at ?? "")))[0];
+  const removeLink = (item: CurrentMappingLink) => {
+    const where = item.line_no === null ? "" : ` (line ${item.line_no})`;
+    if (window.confirm(`Remove the link of ${row.doc_no ?? "this document"}${where} to PO ${item.po_no ?? "without number"}? You can link it again afterwards.`)) {
+      onLinkAction(item.id, "unlink", item.version_no);
+    }
+  };
   const link = linkSet?.lead ?? row.links[0];
   const resolution = row.resolution;
   const activeVendor = vendors.find((vendor) => vendor.id === selectedVendor);
@@ -290,6 +310,23 @@ function MappingDocumentRow({
         {aiProposal ? <small className="ai-opinion-note">Not used in reconciliation until a person confirms it.</small> : null}
         {resolution?.detail_code === "PO_NOT_IN_POOL" ? <small className="mapping-not-in-pool">PO not in pool — upload the earlier PO file.</small> : null}
         {link?.evidence ? <details className="mapping-evidence"><summary>Evidence</summary><p>{link.evidence}</p></details> : null}
+        {savedLink ? <small className="mapping-saved-state" title={`Saved by ${savedLink.saved_by_name}`}>Saved · {displayDateTime(savedLink.saved_at)}</small> : null}
+        {removedLinks.map((item) => (
+          <div className="mapping-removed-line" key={item.id}>
+            <small>{item.line_no === null ? "Link" : `Line ${item.line_no}`} to PO {item.po_no ?? "without number"} · Removed by {item.saved_by_name ?? "a person"}</small>
+            {editable ? (
+              relinkOpen[item.id] ? (
+                <span className="mapping-link-actions">
+                  <select aria-label={`Purchase order for ${item.line_no === null ? "the document" : `line ${item.line_no}`}`} value={targetByLink[item.id] ?? item.po_document_id} disabled={busy} onChange={(event) => { const value = event.currentTarget.value; setTargetByLink((previous) => ({ ...previous, [item.id]: value })); }}>
+                    {purchaseOrders.some((po) => po.id === item.po_document_id) ? null : <option value={item.po_document_id}>{item.po_no ?? "PO without number"} (previous)</option>}
+                    {purchaseOrders.map((po) => <option value={po.id} key={po.id}>{po.doc_no ?? "PO without number"}{po.id === item.po_document_id ? " (previous)" : ""}</option>)}
+                  </select>
+                  <button className="table-action" type="button" disabled={busy} onClick={() => { const target = targetByLink[item.id] ?? item.po_document_id; onLinkAction(item.id, target === item.po_document_id ? "restore" : "change", item.version_no, target === item.po_document_id ? undefined : target); }}><Check size={13} /> Confirm link</button>
+                </span>
+              ) : <button className="table-action" type="button" disabled={busy} onClick={() => setRelinkOpen((previous) => ({ ...previous, [item.id]: true }))}>Link again</button>
+            ) : null}
+          </div>
+        ))}
         {candidateRows.length ? <details className="mapping-evidence"><summary>Top candidates</summary><ol>{candidateRows.slice(0, 3).map((candidate, index) => <li key={`${String(candidate["po_document_id"] ?? index)}-${index}`}>{String(candidate["po_no"] ?? candidate["po_number"] ?? "Candidate PO")} · {String(candidate["score"] ?? "score unavailable")}</li>)}</ol></details> : null}
       </td>
       <td>
@@ -297,16 +334,21 @@ function MappingDocumentRow({
           <div className="mapping-link-actions"><select aria-label={`Assign ${row.doc_no ?? row.doc_type} to vendor`} value={assignTo} disabled={busy} onChange={(event) => setAssignTo(event.currentTarget.value)}><option value="">Choose vendor…</option>{vendors.filter((vendor) => vendor.id).map((vendor) => <option key={vendor.id ?? ""} value={vendor.id ?? ""}>{vendorDisplayName(vendor)}</option>)}</select><button className="table-action" type="button" disabled={busy || !assignTo} onClick={() => onAssign(row.id, assignTo)}>Assign</button></div>
         ) : row.doc_type !== "po" && link && link.state !== "rejected" && editable ? (
           <div className="mapping-link-actions">
-            {linkSet && linkSet.confirmable.length ? <button className="table-action" type="button" disabled={busy} title={`Confirms ${linkSet.confirmable.length} suggested ${linkSet.confirmable.length === 1 ? "link" : "links"} to this PO in one step`} onClick={() => onConfirmLinks(row.id, linkSet.poId, linkSet.confirmable)}><Check size={13} /> Confirm link{linkSet.confirmable.length > 1 ? ` (${linkSet.confirmable.length} lines)` : ""}</button> : (link.state === "auto" || link.state === "suggested") ? <button className="table-action" type="button" disabled={busy} onClick={() => onLinkAction(link.id, "confirm", link.version_no)}><Check size={13} /> Confirm</button> : null}
+            {linkSet && linkSet.confirmable.length ? <button className="table-action" type="button" disabled={busy} title={`Confirms ${linkSet.confirmable.length} suggested ${linkSet.confirmable.length === 1 ? "link" : "links"} to this PO in one step`} onClick={() => onConfirmLinks(row.id, linkSet.poId, linkSet.confirmable)}><Check size={13} /> Confirm link to PO {linkSet.poNo ?? "without number"}{linkSet.confirmable.length > 1 ? ` (${linkSet.confirmable.length} lines)` : ""}</button> : (link.state === "auto" || link.state === "suggested") ? <button className="table-action" type="button" disabled={busy} onClick={() => onLinkAction(link.id, "confirm", link.version_no)}><Check size={13} /> Confirm link to PO {link.po_no ?? "without number"}</button> : null}
             <label className="mapping-change-picker"><span className="sr-only">Replacement purchase order</span><select value={targetByLink[link.id] ?? ""} disabled={busy} onChange={(event) => { const value = event.currentTarget.value; setTargetByLink((previous) => ({ ...previous, [link.id]: value })); }}><option value="">Choose PO…</option>{purchaseOrders.map((po) => <option value={po.id} key={po.id}>{po.doc_no ?? "PO without number"} · {po.vendor_name?.trim() || "Supplier name unavailable"} · {po.vendor_gstin ?? "GSTIN unavailable"}</option>)}</select></label>
             <button className="table-action" type="button" disabled={busy || !targetByLink[link.id] || targetByLink[link.id] === link.po_document_id} onClick={() => onLinkAction(link.id, "change", link.version_no, targetByLink[link.id])}>Change</button>
-            <button className="table-action table-action-danger" type="button" disabled={busy} onClick={() => onLinkAction(link.id, "unlink", link.version_no)}><Unlink size={13} /> {aiProposal ? "Reject" : "Unlink"}</button>
+            <button className="table-action table-action-danger" type="button" disabled={busy} onClick={() => (aiProposal ? onLinkAction(link.id, "unlink", link.version_no) : removeLink(link))}><Unlink size={13} /> {aiProposal ? "Reject" : "Remove this link"}</button>
           </div>
         ) : row.doc_type !== "po" ? <span className="mapping-muted">No current link</span> : <span className="mapping-muted">Governing PO</span>}
       </td>
       <td><button className="table-action" type="button" onClick={() => onPreview(row.source_file_id, row.id)} aria-label={`Preview ${row.doc_no ?? row.doc_type}`}><FileSearch size={14} /> Preview</button><button className="table-action" type="button" onClick={() => onCopyLink(row)} aria-label={`Copy link to ${row.doc_no ?? row.doc_type}`}><Clipboard size={14} /> Copy link</button></td>
     </tr>
   );
+}
+
+function linkMessage(action: LinkAction): string {
+  const done = { confirm: "Link confirmed", change: "Link changed", unlink: "Link removed", restore: "Link saved again" }[action];
+  return `${done}. Affected reconciliation results are stale until re-run.`;
 }
 
 export function MappingPage() {
@@ -326,6 +368,12 @@ export function MappingPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [undo, setUndo] = useState<{ link: CurrentMappingLink; label: string } | null>(null);
+  useEffect(() => {
+    if (!undo) return undefined;
+    const timer = window.setTimeout(() => setUndo(null), UNDO_SECONDS * 1000);
+    return () => window.clearTimeout(timer);
+  }, [undo]);
   const [preview, setPreview] = useState<{ file: IngestionFile; documentId: string } | null>(null);
   const editable = hasCapability("links.edit");
   const csrfToken = user?.csrf_token ?? "";
@@ -492,6 +540,7 @@ export function MappingPage() {
       <AiSharingBanner />
       {error ? <div className="inline-error" role="alert">{error}</div> : null}
       {info ? <div className="mapping-info" role="status">{info}</div> : null}
+      {undo ? <div className="mapping-info mapping-undo" role="status">{undo.label} <button className="table-action" type="button" disabled={busy} onClick={() => { const removed = undo.link; setUndo(null); void runAction(() => editMappingLink(removed.id, "restore", removed.version_no, csrfToken), "The link was restored."); }}>Undo</button></div> : null}
       <SuggestionBanner
         suggestions={suggestions}
         disabled={busy || !editable}
@@ -542,7 +591,7 @@ export function MappingPage() {
                 <table className="mapping-documents-table">
                   <thead><tr><th>Document</th><th>Extracted supplier identity</th><th>Date</th><th>Amount</th><th>Link and evidence</th><th>Actions</th><th>Source</th></tr></thead>
                   <tbody>
-                    {documents.map((row) => <MappingDocumentRow key={row.id} row={row} vendors={vendors} purchaseOrders={purchaseOrders} selectedVendor={selectedVendor} editable={editable} busy={busy} isDeepLinked={documentId === row.id} onAssign={(documentId, vendorId) => void runAction(() => assignMappingVendor(documentId, vendorId, csrfToken), "Vendor assignment saved and protected from automatic reassignment.")} onLinkAction={(linkId, action, version, targetId) => void runAction(() => editMappingLink(linkId, action, version, csrfToken, targetId), `Link ${action} was saved. Affected reconciliation results are stale until re-run.`)} onConfirmLinks={(sourceId, poId, links) => void runAction(() => confirmDocumentLinks(sourceId, poId, links, csrfToken), `${links.length} ${links.length === 1 ? "link was" : "links were"} confirmed. Affected reconciliation results are stale until re-run.`)} onPreview={(fileId, documentId) => void openPreview(fileId, documentId)} onCopyLink={(documentRow) => void copyDocumentLink(documentRow)} />)}
+                    {documents.map((row) => <MappingDocumentRow key={row.id} row={row} vendors={vendors} purchaseOrders={purchaseOrders} selectedVendor={selectedVendor} editable={editable} busy={busy} isDeepLinked={documentId === row.id} onAssign={(documentId, vendorId) => void runAction(() => assignMappingVendor(documentId, vendorId, csrfToken), "Vendor assignment saved and protected from automatic reassignment.")} onLinkAction={(linkId, action, version, targetId) => void runAction(async () => { const saved = await editMappingLink(linkId, action, version, csrfToken, targetId); if (action === "unlink" && saved.state === "rejected") setUndo({ link: saved, label: `Link to PO ${saved.po_no ?? ""} removed.` }); return saved; }, linkMessage(action))} onConfirmLinks={(sourceId, poId, links) => void runAction(() => confirmDocumentLinks(sourceId, poId, links, csrfToken), `${links.length} ${links.length === 1 ? "link was" : "links were"} confirmed. Affected reconciliation results are stale until re-run.`)} onPreview={(fileId, documentId) => void openPreview(fileId, documentId)} onCopyLink={(documentRow) => void copyDocumentLink(documentRow)} />)}
                     {!loading && !documents.length ? <tr><td className="mapping-table-empty" colSpan={7}>No {docType.toUpperCase()} records for this vendor.</td></tr> : null}
                   </tbody>
                 </table>

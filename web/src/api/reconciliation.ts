@@ -204,6 +204,16 @@ export async function getReconciliationCase(caseId: string): Promise<{
   return { value: await parseJson(response), etag: response.headers.get("ETag") ?? '"1"' };
 }
 
+export interface ReasonCodeItem {
+  code: string;
+  title: string;
+  message: string;
+}
+
+export async function getReasonCodes(): Promise<{ items: ReasonCodeItem[] }> {
+  return parseJson(await request("/reason-codes"));
+}
+
 export async function getReconciliationKpis(from: string, to: string): Promise<Record<string, unknown>> {
   const params = new URLSearchParams({ from, to });
   return parseJson(await request(`/kpis?${params.toString()}`));

@@ -76,6 +76,12 @@ from reconbench_app.document_identity import (
     rescan_identity_payload,
     verified_field_confidence,
 )
+from reconbench_app.duplicates import (
+    active_structured_by_number,
+    doc_no_text,
+    find_invoice_duplicate,
+    hold_for,
+)
 from reconbench_app.extraction.engine import DEFAULT_ENGINE
 from reconbench_app.extraction.vision_pages import vision_pages_isolated
 from reconbench_app.pdf_sandbox import parse_pdf_isolated
@@ -351,6 +357,9 @@ class UploadReceipt:
     status: str
     duplicate: bool = False
     reactivated: bool = False
+    # For a duplicate: the original upload a person can open (PD-0b-4).
+    original_display_name: str | None = None
+    original_batch_id: UUID | None = None
 
 
 def safe_display_name(value: str) -> str:
@@ -612,19 +621,7 @@ class IngestionService:
                 .one_or_none()
             )
             if existing is not None and existing["status"] != "removed":
-                connection.execute(
-                    sa.update(table)
-                    .where(table.c.id == existing["id"])
-                    .values(reupload_skips=table.c.reupload_skips + 1, version=table.c.version + 1)
-                )
-                return UploadReceipt(
-                    file_id=existing["id"],
-                    sha256=sha256,
-                    size_bytes=int(existing["size_bytes"]),
-                    format=str(existing["format"]),
-                    status=str(existing["status"]),
-                    duplicate=True,
-                )
+                return self._duplicate_receipt(connection, actor, existing, display_name)
 
             oversized = size_bytes > limits.max_file_bytes
             if not oversized:
@@ -672,31 +669,35 @@ class IngestionService:
                 reactivated = True
             else:
                 file_id = new_id()
-                connection.execute(
-                    sa.insert(table).values(
-                        id=file_id,
-                        workspace_id=actor.workspace_id,
-                        batch_id=batch_id,
-                        parent_file_id=None,
-                        sha256=sha256,
-                        display_name=safe_display_name(display_name),
-                        archive_path=None,
-                        zone=zone.value,
-                        zone_uploaded=zone.value,
-                        format=file_format.value,
-                        sniffed_type=None,
-                        mismatch_state="none",
-                        status="failed" if oversized else "staged",
-                        error_code="FILE_TOO_LARGE" if oversized else None,
-                        error_message="The file exceeds the configured upload limit."
-                        if oversized
-                        else None,
-                        attempt_count=0,
-                        size_bytes=size_bytes,
-                        object_key=key,
-                        uploaded_by=actor.actor_id,
+                try:
+                    # The unique (workspace, sha256) index is the guard against two
+                    # simultaneous uploads of the same bytes: the later one is a duplicate.
+                    with connection.begin_nested():
+                        self._insert_received_file(
+                            connection,
+                            actor,
+                            file_id=file_id,
+                            batch_id=batch_id,
+                            sha256=sha256,
+                            display_name=display_name,
+                            zone=zone,
+                            file_format=file_format,
+                            oversized=oversized,
+                            size_bytes=size_bytes,
+                            key=key,
+                        )
+                except sa.exc.IntegrityError:
+                    raced = (
+                        connection.execute(
+                            sa.select(table).where(
+                                table.c.workspace_id == actor.workspace_id,
+                                table.c.sha256 == sha256,
+                            )
+                        )
+                        .mappings()
+                        .one()
                     )
-                )
+                    return self._duplicate_receipt(connection, actor, raced, display_name)
                 reactivated = False
 
             _event(
@@ -728,6 +729,85 @@ class IngestionService:
             format=file_format.value,
             status="failed" if oversized else "staged",
             reactivated=reactivated,
+        )
+
+    def _duplicate_receipt(
+        self,
+        connection: Connection,
+        actor: ActorContext,
+        existing: Mapping[str, Any],
+        display_name: str,
+    ) -> UploadReceipt:
+        """The same bytes are already an active upload: nothing is stored or queued."""
+
+        table = metadata.tables["source_file"]
+        connection.execute(
+            sa.update(table)
+            .where(table.c.id == existing["id"])
+            .values(reupload_skips=table.c.reupload_skips + 1, version=table.c.version + 1)
+        )
+        write_audit_event(
+            connection,
+            actor,
+            action="file.duplicate_skipped",
+            target_type="file",
+            target_id=cast(UUID, existing["id"]),
+            after_state={
+                "reason": "already_uploaded",
+                "uploaded_as": safe_display_name(display_name),
+            },
+        )
+        return UploadReceipt(
+            file_id=cast(UUID, existing["id"]),
+            sha256=str(existing["sha256"]),
+            size_bytes=int(existing["size_bytes"]),
+            format=str(existing["format"]),
+            status=str(existing["status"]),
+            duplicate=True,
+            original_display_name=str(existing["display_name"]),
+            original_batch_id=cast(UUID | None, existing["batch_id"]),
+        )
+
+    @staticmethod
+    def _insert_received_file(
+        connection: Connection,
+        actor: ActorContext,
+        *,
+        file_id: UUID,
+        batch_id: UUID,
+        sha256: str,
+        display_name: str,
+        zone: UploadZone,
+        file_format: FileFormat,
+        oversized: bool,
+        size_bytes: int,
+        key: str,
+    ) -> None:
+        table = metadata.tables["source_file"]
+        connection.execute(
+            sa.insert(table).values(
+                id=file_id,
+                workspace_id=actor.workspace_id,
+                batch_id=batch_id,
+                parent_file_id=None,
+                sha256=sha256,
+                display_name=safe_display_name(display_name),
+                archive_path=None,
+                zone=zone.value,
+                zone_uploaded=zone.value,
+                format=file_format.value,
+                sniffed_type=None,
+                mismatch_state="none",
+                status="failed" if oversized else "staged",
+                error_code="FILE_TOO_LARGE" if oversized else None,
+                error_message="The file exceeds the configured upload limit."
+                if oversized
+                else None,
+                attempt_count=0,
+                size_bytes=size_bytes,
+                object_key=key,
+                uploaded_by=actor.actor_id,
+            )
         )
 
     @requires("files.upload")
@@ -839,6 +919,150 @@ class IngestionService:
                 detail={"manual_retry": True, "parser_refresh": parser_refresh_required},
             )
         return {"file_id": file_id, "job_id": job_id, "status": "queued"}
+
+    @requires("data.view")
+    def list_duplicate_holds(
+        self,
+        workspace_id: UUID,
+        *,
+        file_id: UUID | None = None,
+        state: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Uploads not ingested because they match an active invoice (PD-0b-4)."""
+
+        hold = metadata.tables["duplicate_hold"]
+        document = metadata.tables["document"]
+        version = metadata.tables["document_version"]
+        source = metadata.tables["source_file"]
+        original_file = source.alias("original_file")
+        query = (
+            sa.select(
+                hold.c.id,
+                hold.c.source_file_id,
+                source.c.display_name.label("file_name"),
+                hold.c.kind,
+                hold.c.reason,
+                hold.c.doc_no,
+                hold.c.state,
+                hold.c.created_at,
+                hold.c.decided_at,
+                hold.c.version,
+                hold.c.duplicate_of_document_id,
+                document.c.doc_no.label("original_doc_no"),
+                document.c.withdrawn_at.is_not(None).label("original_withdrawn"),
+                original_file.c.id.label("original_file_id"),
+                original_file.c.display_name.label("original_file_name"),
+                original_file.c.batch_id.label("original_batch_id"),
+            )
+            .select_from(
+                hold.join(source, source.c.id == hold.c.source_file_id)
+                .join(document, document.c.id == hold.c.duplicate_of_document_id)
+                .outerjoin(version, version.c.id == document.c.current_version_id)
+                .outerjoin(original_file, original_file.c.id == version.c.source_file_id)
+            )
+            .where(hold.c.workspace_id == workspace_id)
+            .order_by(hold.c.created_at.desc(), hold.c.id)
+        )
+        if file_id is not None:
+            query = query.where(hold.c.source_file_id == file_id)
+        if state is not None:
+            query = query.where(hold.c.state == state)
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(query.limit(500)).mappings()]
+
+    @requires("files.upload")
+    def decide_duplicate_hold(
+        self,
+        actor: ActorContext,
+        hold_id: UUID,
+        *,
+        expected_version: int,
+        decision: str,
+    ) -> dict[str, Any] | None:
+        """Discard, Replace with this file (duplicate) or Keep as new (possible), audited."""
+
+        hold = metadata.tables["duplicate_hold"]
+        source = metadata.tables["source_file"]
+        states = {"discard": "discarded", "replace": "replaced", "keep": "kept"}
+        if decision not in states:
+            raise IngestionFailure("DUPLICATE_DECISION_INVALID", "Choose discard, replace or keep.")
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    sa.select(hold)
+                    .where(hold.c.workspace_id == actor.workspace_id, hold.c.id == hold_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            if int(row["version"]) != expected_version:
+                raise BatchVersionConflict("The duplicate decision changed after it was loaded.")
+            if row["state"] != "open":
+                raise IngestionFailure(
+                    "DUPLICATE_ALREADY_DECIDED", "This duplicate was already decided."
+                )
+            if decision == "replace" and row["kind"] != "duplicate":
+                raise IngestionFailure(
+                    "DUPLICATE_DECISION_INVALID",
+                    "A possible duplicate can be discarded or kept as new, "
+                    "not replace the original.",
+                )
+            if decision == "keep" and row["kind"] != "possible":
+                raise IngestionFailure(
+                    "DUPLICATE_DECISION_INVALID",
+                    "A duplicate can be discarded or replace the original, "
+                    "not be kept as a second one.",
+                )
+            connection.execute(
+                sa.update(hold)
+                .where(hold.c.id == hold_id)
+                .values(
+                    state=states[decision],
+                    decided_by=actor.actor_id,
+                    decided_at=sa.func.now(),
+                    version=hold.c.version + 1,
+                )
+            )
+            write_audit_event(
+                connection,
+                actor,
+                action="document.duplicate_decide",
+                target_type="file",
+                target_id=cast(UUID, row["source_file_id"]),
+                before_state={"state": "open", "kind": row["kind"], "reason": row["reason"]},
+                after_state={
+                    "state": states[decision],
+                    "hold_id": str(hold_id),
+                    "duplicate_of_document_id": str(row["duplicate_of_document_id"]),
+                },
+            )
+            if decision != "discard":
+                # Read the file again: the decided document is ingested as a new version of
+                # the original (replace) or as a new document (keep); the rest is unchanged.
+                connection.execute(
+                    sa.update(source)
+                    .where(
+                        source.c.workspace_id == actor.workspace_id,
+                        source.c.id == row["source_file_id"],
+                        source.c.removed_at.is_(None),
+                    )
+                    .values(
+                        status="queued",
+                        error_code=None,
+                        error_message=None,
+                        queued_at=sa.func.now(),
+                        parse_finished_at=None,
+                        version=source.c.version + 1,
+                    )
+                )
+                self.queue.enqueue(
+                    "ingest_file", file_id=cast(UUID, row["source_file_id"]), connection=connection
+                )
+        holds = self.list_duplicate_holds(actor.workspace_id, file_id=row["source_file_id"])
+        return next(item for item in holds if item["id"] == hold_id)
 
     @requires("files.upload")
     def save_csv_mapping(
@@ -1970,6 +2194,10 @@ class IngestionService:
                         uom_aliases=hints.uom_aliases,
                         charge_keywords=hints.charge_keywords,
                     )
+                    if outcome == "held":
+                        # Not ingested: shown on the file as a (possible) duplicate (PD-0b-4).
+                        documents_skipped += 1
+                        continue
                     document_ids.append(document_id)
                     if outcome == "new":
                         documents_new += 1
@@ -2416,6 +2644,120 @@ class IngestionService:
             .values(label=label, updated_at=sa.func.now(), version=batch.c.version + 1)
         )
 
+    def _invoice_duplicate_gate(
+        self,
+        connection: Connection,
+        *,
+        workspace_id: UUID,
+        file_id: UUID,
+        actor_id: UUID | None,
+        document: Document,
+        existing: Mapping[str, Any] | None,
+        job_id: int | None,
+        structured: bool,
+    ) -> tuple[UUID | None, Mapping[str, Any] | None]:
+        """Hold an invoice that matches an active one; apply a person's decision (PD-0b-4).
+
+        Returns the original's id when the document is not ingested (an open or discarded
+        hold, or a new hold), else the document to update (``None`` for a new one).
+        """
+
+        document_table = metadata.tables["document"]
+        version_table = metadata.tables["document_version"]
+        locator = document.source_locator or ""
+        hold = hold_for(connection, workspace_id=workspace_id, file_id=file_id, locator=locator)
+        active = (
+            existing
+            if existing is not None
+            and existing["withdrawn_at"] is None
+            and existing["current_version_id"] is not None
+            else None
+        )
+        if active is not None:
+            source_of_current = connection.scalar(
+                sa.select(version_table.c.source_file_id).where(
+                    version_table.c.id == active["current_version_id"]
+                )
+            )
+            if source_of_current == file_id:
+                return None, existing  # the same file read again (parser refresh, decision)
+        if hold is not None:
+            original_id = cast(UUID, hold["duplicate_of_document_id"])
+            if hold["state"] == "replaced":
+                replaced = (
+                    connection.execute(
+                        sa.select(document_table)
+                        .where(
+                            document_table.c.workspace_id == workspace_id,
+                            document_table.c.id == original_id,
+                        )
+                        .with_for_update()
+                    )
+                    .mappings()
+                    .one()
+                )
+                return None, replaced
+            if hold["state"] == "kept":
+                return None, (None if active is not None else existing)
+            return original_id, existing
+        match = find_invoice_duplicate(
+            connection,
+            workspace_id=workspace_id,
+            document=document,
+            rescan_match=active,
+            structured=structured,
+        )
+        if match is None:
+            return None, existing
+        hold_table = metadata.tables["duplicate_hold"]
+        hold_id = new_id()
+        connection.execute(
+            pg_insert(hold_table)
+            .values(
+                id=hold_id,
+                workspace_id=workspace_id,
+                source_file_id=file_id,
+                source_locator=locator,
+                kind=match.kind,
+                reason=match.reason,
+                duplicate_of_document_id=match.original_id,
+                doc_no=doc_no_text(document),
+            )
+            .on_conflict_do_nothing(constraint="duplicate_hold_document_key")
+        )
+        _event(
+            connection,
+            workspace_id=workspace_id,
+            file_id=file_id,
+            stage="upserted",
+            outcome="warn",
+            job_id=job_id,
+            detail={
+                "outcome": "held",
+                "kind": match.kind,
+                "reason": match.reason,
+                "duplicate_of_document_id": str(match.original_id),
+            },
+        )
+        if actor_id is not None:
+            user = metadata.tables["app_user"]
+            role = connection.scalar(sa.select(user.c.role).where(user.c.id == actor_id))
+            if role is not None:
+                write_audit_event(
+                    connection,
+                    ActorContext(workspace_id, actor_id, cast(Any, role)),
+                    action="document.duplicate_held",
+                    target_type="file",
+                    target_id=file_id,
+                    after_state={
+                        "kind": match.kind,
+                        "reason": match.reason,
+                        "duplicate_of_document_id": str(match.original_id),
+                        "hold_id": str(hold_id),
+                    },
+                )
+        return match.original_id, existing
+
     def _upsert_document(
         self,
         connection: Connection,
@@ -2538,6 +2880,34 @@ class IngestionService:
                 .mappings()
                 .one_or_none()
             )
+        if (
+            existing is None
+            and structured
+            and canonical_doc_no
+            and header.doc_type in {DocType.PO, DocType.GRN}
+        ):
+            # PO/GRN identity is the type and canonical number (PD-0b-4): a changed
+            # re-export is an amendment of the active document, never a second one.
+            existing = active_structured_by_number(
+                connection,
+                workspace_id=workspace_id,
+                doc_type=header.doc_type,
+                canonical_doc_no=canonical_doc_no,
+                vendor_identity=vendor_identity,
+            )
+        if header.doc_type is DocType.INVOICE:
+            held_as, existing = self._invoice_duplicate_gate(
+                connection,
+                workspace_id=workspace_id,
+                file_id=file_id,
+                actor_id=actor_id,
+                document=document,
+                existing=existing,
+                job_id=job_id,
+                structured=structured,
+            )
+            if held_as is not None:
+                return "held", held_as, None
         if existing is None:
             natural_key_owner = connection.scalar(
                 sa.select(document_table.c.id)
@@ -2645,6 +3015,32 @@ class IngestionService:
                     detail={"outcome": "skipped", "reason": "structured_version_preserved"},
                 )
                 return "skipped", document_id, current_version_id
+        if (
+            structured
+            and existing is not None
+            and existing["withdrawn_at"] is None
+            and current_hash == content_hash
+            and current_source_file_id != file_id
+        ):
+            # The same PO/GRN, unchanged, in another export: no new version and no ledger
+            # work (PD-0b-4). The event keeps it alive if its first file is removed later.
+            _event(
+                connection,
+                workspace_id=workspace_id,
+                file_id=file_id,
+                document_id=document_id,
+                document_version_id=current_version_id,
+                stage="upserted",
+                outcome="skipped",
+                parser_version=parser_version,
+                job_id=job_id,
+                detail={
+                    "outcome": "skipped",
+                    "reason": "unchanged_in_other_file",
+                    "current_source_file_id": str(current_source_file_id),
+                },
+            )
+            return "skipped", document_id, current_version_id
         if current_hash == content_hash and current_source_file_id == file_id:
             if existing is not None and existing["withdrawn_at"] is not None:
                 connection.execute(

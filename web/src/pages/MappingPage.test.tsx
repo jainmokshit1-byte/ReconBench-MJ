@@ -76,6 +76,88 @@ describe("Mapping workflow", () => {
     vi.restoreAllMocks();
   });
 
+  it("removes a link only after confirming, offers Undo, and links a removed line again (PD-4b)", async () => {
+    let state: "confirmed" | "rejected" = "confirmed";
+    let version = 1;
+    const patches: Array<{ action: string; ifMatch: string | null }> = [];
+    const currentLink = () => ({
+      id: linkId,
+      version_no: version,
+      po_document_id: poId,
+      po_no: "PO-2026-001",
+      method: "manual",
+      confidence: "1.00",
+      state,
+      evidence: null,
+      level: "line",
+      line_no: 1,
+      detail_code: state === "rejected" ? "manual_unlink" : null,
+      saved_at: "2026-10-26T10:15:00+05:30",
+      saved_by_name: "Synthetic Manager",
+    });
+    const invoice = () => ({
+      id: invoiceId,
+      doc_type: "invoice",
+      doc_no: "INV-2026-009",
+      vendor_name: "Acme Components",
+      vendor_gstin: "27AAPFU0939F1ZV",
+      doc_date: "2026-04-02",
+      grand_total: "236.00",
+      currency: "INR",
+      source_file_id: "file-synthetic-1",
+      vendor_id: vendorId,
+      needs_verification: false,
+      links: [currentLink()],
+      line_nos: [1],
+      resolution: { outcome: "linked", resolved_step: 1, detail_code: null, cited_refs: [], candidates: [] },
+    });
+    installFetch((url, init) => {
+      const method = init.method ?? "GET";
+      if (url.pathname === "/api/v1/vendors" && method === "GET") return response(200, [vendor]);
+      if (url.pathname === "/api/v1/vendor-merge-suggestions" && method === "GET") return response(200, []);
+      if (url.pathname === `/api/v1/vendors/${vendorId}/documents` && method === "GET") {
+        return url.searchParams.get("doc_type") === "po"
+          ? response(200, [{ ...invoice(), id: poId, doc_type: "po", doc_no: "PO-2026-001", links: [] }])
+          : response(200, [invoice()]);
+      }
+      if (url.pathname === `/api/v1/links/${linkId}` && method === "PATCH") {
+        const action = String(JSON.parse(String(init.body)).action);
+        patches.push({ action, ifMatch: new Headers(init.headers).get("If-Match") });
+        state = action === "unlink" ? "rejected" : "confirmed";
+        version += 1;
+        return response(200, currentLink());
+      }
+      throw new Error(`Unexpected request: ${method} ${url.pathname}${url.search}`);
+    });
+    const confirmSpy = vi.spyOn(window, "confirm");
+
+    renderMapping();
+    let row = await screen.findByRole("row", { name: /INV-2026-009/ });
+    expect(within(row).getByText(/Saved · /)).toBeInTheDocument();
+    confirmSpy.mockReturnValueOnce(false);
+    fireEvent.click(within(row).getByRole("button", { name: /Remove this link/ }));
+    expect(patches).toHaveLength(0);
+
+    confirmSpy.mockReturnValueOnce(true);
+    fireEvent.click(within(row).getByRole("button", { name: /Remove this link/ }));
+    const undo = await screen.findByRole("button", { name: "Undo" });
+    expect(patches).toEqual([{ action: "unlink", ifMatch: '"1"' }]);
+    fireEvent.click(undo);
+    await waitFor(() => expect(patches.at(-1)).toEqual({ action: "restore", ifMatch: '"2"' }));
+
+    // Removed again: the line shows who removed it and a permanent "Link again".
+    confirmSpy.mockReturnValueOnce(true);
+    row = await screen.findByRole("row", { name: /INV-2026-009/ });
+    fireEvent.click(within(row).getByRole("button", { name: /Remove this link/ }));
+    await waitFor(() => expect(patches.at(-1)?.action).toBe("unlink"));
+    row = await screen.findByRole("row", { name: /INV-2026-009/ });
+    expect(await within(row).findByText(/Removed by Synthetic Manager/)).toBeInTheDocument();
+    fireEvent.click(within(row).getByRole("button", { name: "Link again" }));
+    expect(within(row).getByRole("combobox", { name: /Purchase order for line 1/ })).toHaveValue(poId);
+    fireEvent.click(within(row).getByRole("button", { name: "Confirm link" }));
+    await waitFor(() => expect(patches.at(-1)).toEqual({ action: "restore", ifMatch: '"4"' }));
+  });
+
   it("shows link evidence and confirms a link with optimistic concurrency headers", async () => {
     let currentState = "auto";
     const currentLink = () => ({
@@ -202,7 +284,7 @@ describe("Mapping workflow", () => {
     // Choosing a replacement PO used to blank the page (the event was read inside a state updater).
     fireEvent.change(within(row).getByRole("combobox"), { target: { value: poId } });
     expect(within(row).getByRole("button", { name: "Change" })).toBeInTheDocument();
-    fireEvent.click(within(row).getByRole("button", { name: /Confirm link \(2 lines\)/ }));
+    fireEvent.click(within(row).getByRole("button", { name: /Confirm link to PO .* \(2 lines\)/ }));
     await waitFor(() => expect(request).toHaveBeenCalledWith(
       expect.stringContaining(`/api/v1/documents/${invoiceId}/links/confirm`),
       expect.objectContaining({ method: "POST" }),

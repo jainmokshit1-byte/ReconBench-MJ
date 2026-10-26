@@ -145,6 +145,57 @@ describe("Ingestion workflow screen", () => {
     expect(await screen.findByRole("heading", { name: "Mapping workspace" })).toBeInTheDocument();
   });
 
+  it("says when a file was already uploaded and lets a person decide a held duplicate (PD-0b-4)", async () => {
+    let decided: { decision: string; ifMatch: string | null } | null = null;
+    const hold = {
+      id: "hold-synthetic-1",
+      source_file_id: "file-copy-1",
+      file_name: "copy-of-invoice.pdf",
+      kind: "duplicate",
+      reason: "same_vendor_number_year",
+      doc_no: "INV-SYN-7",
+      state: "open",
+      version: 1,
+      duplicate_of_document_id: "document-original-1",
+      original_doc_no: "INV-SYN-7",
+      original_file_name: "invoice.pdf",
+      original_batch_id: "batch-original-1",
+    };
+    installFetch((url, init) => {
+      const method = init.method ?? "GET";
+      if (url.pathname === "/api/v1/config") return jsonResponse(200, configResponse);
+      if (url.pathname === "/api/v1/batches" && method === "GET") return jsonResponse(200, [{ id: batchId, label: "April synthetic close", version: 1 }]);
+      if (url.pathname === "/api/v1/batches" && method === "POST") return jsonResponse(201, { id: batchId, label: "April synthetic close", version: 1 });
+      if (url.pathname === "/api/v1/files" && method === "POST") {
+        return jsonResponse(200, { file_id: "file-original-1", batch_id: batchId, format: "pdf", status: "parsed", duplicate: true, original_display_name: "invoice.pdf", original_batch_id: "batch-original-1" });
+      }
+      if (url.pathname === "/api/v1/files" && method === "GET") return jsonResponse(200, [], { ETag: '"synthetic-files-1"' });
+      if (url.pathname === `/api/v1/batches/${batchId}/summary`) return jsonResponse(200, { file_count: 0, documents_found: 0, file_status_counts: {} });
+      if (url.pathname === "/api/v1/documents") return jsonResponse(200, []);
+      if (url.pathname === "/api/v1/duplicate-holds" && method === "GET") return jsonResponse(200, decided ? [] : [hold]);
+      if (url.pathname === `/api/v1/duplicate-holds/${hold.id}/decision` && method === "POST") {
+        decided = { decision: String(JSON.parse(String(init.body)).decision), ifMatch: new Headers(init.headers).get("If-Match") };
+        return jsonResponse(200, { ...hold, state: "replaced", version: 2 });
+      }
+      throw new Error(`Unexpected request ${method} ${url.pathname}`);
+    });
+
+    renderPage();
+    const panel = await screen.findByRole("region", { name: "Uploads not ingested" });
+    expect(within(panel).getByText(/Duplicate of INV INV-SYN-7/)).toBeInTheDocument();
+    expect(within(panel).getByText("Same supplier GSTIN, invoice number and financial year.")).toBeInTheDocument();
+    expect(within(panel).queryByRole("button", { name: "Keep as new" })).not.toBeInTheDocument();
+
+    const invoiceInput = await screen.findByLabelText("Choose invoices files");
+    fireEvent.change(invoiceInput, { target: { files: [new File(["same bytes"], "invoice-again.pdf", { type: "application/pdf" })] } });
+    fireEvent.click(screen.getByRole("button", { name: "Process files" }));
+    expect(await screen.findByText(/Already uploaded: invoice-again.pdf is the same file as invoice.pdf/)).toBeInTheDocument();
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Replace with this file" }));
+    await waitFor(() => expect(decided).toEqual({ decision: "replace", ifMatch: '"1"' }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Uploads not ingested" })).not.toBeInTheDocument());
+  });
+
   it("saves a CSV column map from the file row and refreshes the queued status", async () => {
     let mappingSaved = false;
     const csvFile = makeFile("file-csv-map", {

@@ -38,7 +38,7 @@ class AssignVendorBody(BaseModel):
 class LinkEditBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: str = Field(pattern=r"^(confirm|change|unlink)$")
+    action: str = Field(pattern=r"^(confirm|change|unlink|restore)$")
     to_document_id: UUID | None = None
 
 

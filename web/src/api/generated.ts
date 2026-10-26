@@ -639,6 +639,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/duplicate-holds": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Duplicate Holds
+         * @description Uploads not ingested because they match an active invoice (PD-0b-4).
+         */
+        get: operations["get_duplicate_holds_api_v1_duplicate_holds_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/duplicate-holds/{hold_id}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Decide Duplicate Hold */
+        post: operations["decide_duplicate_hold_api_v1_duplicate_holds__hold_id__decision_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/exports": {
         parameters: {
             query?: never;
@@ -1786,6 +1823,11 @@ export interface components {
              * Format: uuid
              */
             to_document_id: string;
+        };
+        /** DuplicateDecisionBody */
+        DuplicateDecisionBody: {
+            /** Decision */
+            decision: string;
         };
         /** DuplicatePolicyBody */
         DuplicatePolicyBody: {
@@ -3473,6 +3515,7 @@ export interface operations {
                 cursor?: string | null;
                 limit?: number;
                 count?: boolean;
+                run_id?: string | null;
             };
             header?: never;
             path?: never;
@@ -3923,6 +3966,73 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_duplicate_holds_api_v1_duplicate_holds_get: {
+        parameters: {
+            query?: {
+                file_id?: string | null;
+                state?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    decide_duplicate_hold_api_v1_duplicate_holds__hold_id__decision_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                hold_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DuplicateDecisionBody"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

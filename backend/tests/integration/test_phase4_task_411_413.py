@@ -130,11 +130,12 @@ def scratch_engine() -> Iterator[Engine]:
                 "0028",
                 "0029",
                 "0030",
+                "0031",
             }:
                 raise RuntimeError(
-                    "Phase 4.11/4.13 source database must be at Alembic revision 0015 to 0030"
+                    "Phase 4.11/4.13 source database must be at Alembic revision 0015 to 0031"
                 )
-            if revision != "0030":
+            if revision != "0031":
                 previous_migrator_url = os.environ.get("RB_MIGRATOR_DATABASE_URL")
                 os.environ["RB_MIGRATOR_DATABASE_URL"] = scratch_url.render_as_string(
                     hide_password=False

@@ -1465,6 +1465,81 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         persisted_unlink = client.get(f"/api/v1/links?source_document_id={linked_invoice_id}")
         assert persisted_unlink.json()[0]["state"] == "rejected"
 
+        # PD-4b: Undo / "Link again" restores the same pairing as a person's confirmed link.
+        removed = persisted_unlink.json()[0]
+        restored = client.patch(
+            f"/api/v1/links/{removed['id']}",
+            json={"action": "restore"},
+            headers={"If-Match": f'"{removed["version_no"]}"', "X-CSRF-Token": "synthetic-csrf"},
+        )
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["state"] == "confirmed"
+        assert restored.json()["to_document_id"] == removed["to_document_id"]
+        assert restored.json()["from_line_no"] == removed["from_line_no"]
+        with ingestion_engine.connect() as connection:
+            link_count_before = connection.scalar(
+                sa.select(sa.func.count())
+                .select_from(metadata.tables["link"])
+                .where(metadata.tables["link"].c.workspace_id == workspace_id)
+            )
+        # A second restore of the same line is refused: the removed version is no longer
+        # current (404), and the confirmed link is not a removed one (422).
+        assert (
+            client.patch(
+                f"/api/v1/links/{removed['id']}",
+                json={"action": "restore"},
+                headers={
+                    "If-Match": f'"{removed["version_no"]}"',
+                    "X-CSRF-Token": "synthetic-csrf",
+                },
+            ).status_code
+            == 404
+        )
+        relinked = restored.json()
+        duplicate = client.patch(
+            f"/api/v1/links/{relinked['id']}",
+            json={"action": "restore"},
+            headers={
+                "If-Match": f'"{relinked["version_no"]}"',
+                "X-CSRF-Token": "synthetic-csrf",
+            },
+        )
+        assert duplicate.status_code == 422, duplicate.text
+        with ingestion_engine.connect() as connection:
+            link_count_after = connection.scalar(
+                sa.select(sa.func.count())
+                .select_from(metadata.tables["link"])
+                .where(metadata.tables["link"].c.workspace_id == workspace_id)
+            )
+        assert link_count_after == link_count_before
+        mapping_service.resolve_workspace(workspace_id)
+        after_rerun = client.get(f"/api/v1/links?source_document_id={linked_invoice_id}").json()
+        assert [(row["state"], row["to_document_id"]) for row in after_rerun] == [
+            ("confirmed", removed["to_document_id"])
+        ]
+        with ingestion_engine.connect() as connection:
+            assert (
+                connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(metadata.tables["audit_log"])
+                    .where(
+                        metadata.tables["audit_log"].c.workspace_id == workspace_id,
+                        metadata.tables["audit_log"].c.action == "link.restore",
+                    )
+                )
+                == 1
+            )
+        # Unlink again so the rest of this flow sees the line removed, as before.
+        unlinked_again = client.patch(
+            f"/api/v1/links/{relinked['id']}",
+            json={"action": "unlink"},
+            headers={
+                "If-Match": f'"{relinked["version_no"]}"',
+                "X-CSRF-Token": "synthetic-csrf",
+            },
+        )
+        assert unlinked_again.status_code == 200, unlinked_again.text
+
         # Model an unresolved document and exercise the user-controlled assignment path.
         with ingestion_engine.begin() as connection:
             connection.execute(
@@ -2787,6 +2862,44 @@ def test_rescan_fingerprint_creates_version_and_lower_confidence_stays_alternati
             )
 
     first = _upsert(1, manual=False)
+    # PD-0b-4 (D103 decision 9): another file of an active invoice is held, not ingested,
+    # until a person decides. The person's decision then runs the AC-8b identity path:
+    # Replace -> a version (or an alternative) of the original; Keep -> a new document.
+    held = _upsert(
+        2,
+        manual=False,
+        page_hashes_override=(PageImageHash(page=1, value="0123456789abcdee"),),
+    )
+    assert held[0] == "held" and held[1] == first[1]
+    hold_table = metadata.tables["duplicate_hold"]
+    for index, state in (
+        (2, "replaced"),
+        (3, "replaced"),
+        (4, "replaced"),
+        (8, "replaced"),
+        (5, "kept"),
+        (6, "kept"),
+        (7, "kept"),
+    ):
+        hold_file_id, _sha = _source_file(index)
+        with ingestion_engine.begin() as connection:
+            connection.execute(
+                sa.delete(hold_table).where(hold_table.c.source_file_id == hold_file_id)
+            )
+            connection.execute(
+                sa.insert(hold_table).values(
+                    id=new_id(),
+                    workspace_id=workspace_id,
+                    source_file_id=hold_file_id,
+                    source_locator="pdf:synthetic-ac8b:pages:1",
+                    kind="duplicate" if state == "replaced" else "possible",
+                    reason="test_decision",
+                    duplicate_of_document_id=first[1],
+                    state=state,
+                    decided_by=user_id,
+                    decided_at=sa.func.now(),
+                )
+            )
     second = _upsert(
         2,
         manual=False,

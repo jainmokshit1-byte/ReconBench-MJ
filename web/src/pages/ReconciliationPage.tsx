@@ -11,6 +11,7 @@ import {
   downloadReconciliationExport,
   getReconciliationExport,
   getReconciliationCase,
+  getReasonCodes,
   getReconciliationKpis,
   getReconciliationRun,
   listRecentReconciliationRuns,
@@ -23,6 +24,7 @@ import type { CaseDetailResponse, CaseSummary, ExportSummary, RunSummary } from 
 import { AiLineOpinion } from "../components/AiLineOpinion";
 import { AiSharingBanner } from "../components/AiSharingBanner";
 import { PageHeader } from "../components/PageHeader";
+import { checkRows, REASON_TEXT, type CheckRow, type ReasonText } from "../utils/reconChecks";
 import { useAuth } from "../auth/useAuth";
 import { usePeriod } from "../contexts/usePeriod";
 
@@ -74,7 +76,7 @@ interface CaseTableRowProps {
   onToggleSelected: (caseId: string, selected: boolean) => void;
 }
 
-const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isSelected, isActive, onSelect, onToggleSelected }: CaseTableRowProps) {
+export const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isSelected, isActive, onSelect, onToggleSelected }: CaseTableRowProps) {
   return (
     <tr
       data-index={virtualIndex}
@@ -104,9 +106,10 @@ const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isSelected
       <td title={item.invoice_date ?? "Date unavailable"}>{displayDate(item.invoice_date)}</td>
       <td title={item.po_nos.join(", ")}>{item.po_nos.length ? item.po_nos.join(", ") : "—"}</td>
       <td title={item.grn_nos.join(", ")}>{item.grn_nos.length ? item.grn_nos.join(", ") : "—"}</td>
-      <td title={String(item.invoice_total ?? item.invoice_taxable ?? "—")}>{amount(item.invoice_total ?? item.invoice_taxable)}</td>
-      <td title={String(item.expected_taxable ?? "—")}>{amount(item.expected_taxable)}</td>
-      <td title={String(item.variance ?? "—")}>{amount(item.variance)}</td>
+      <td title="Invoice taxable value">{amount(item.invoice_taxable)}</td>
+      <td title="Expected taxable value (billed quantity × PO rate)">{amount(item.expected_taxable)}</td>
+      <td title="Invoice taxable − expected taxable">{amount(item.variance)}</td>
+      <td title="Grand total (tax included)">{amount(item.invoice_total)}</td>
       <td title={item.overlay ? `Computed: ${label(item.computed_status)}` : label(item.effective_status)}>
         <span className={`recon-status recon-status-${item.effective_status}`}>
           <span>{item.overlay ? `${label(item.effective_status)} / ${label(item.computed_status)}` : label(item.effective_status)}{item.is_stale ? " · stale" : ""}</span>
@@ -119,6 +122,32 @@ const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isSelected
 
 function checks(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null) : [];
+}
+
+export function CheckTable({ rows }: { rows: CheckRow[] }) {
+  if (!rows.length) return <p>No rule checks were stored for this case.</p>;
+  return (
+    <div className="case-lines-wrap">
+      <table className="case-lines-table case-checks-table">
+        <thead>
+          <tr><th>Check</th><th>Invoice value</th><th>Reference value</th><th>Difference</th><th>Rule</th><th>Result</th><th>Why</th></tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.key}>
+              <td>{row.name}</td>
+              <td>{row.invoiceValue}</td>
+              <td>{row.referenceValue}</td>
+              <td>{row.difference}{row.differencePct !== "—" ? <small> ({row.differencePct})</small> : null}</td>
+              <td>{row.rule}</td>
+              <td>{row.result}</td>
+              <td>{row.reason}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 function documentLabel(document: DocumentRow): string {
@@ -140,6 +169,22 @@ export function ReconciliationPage() {
   const [activeRun, setActiveRun] = useState<RunSummary | null>(null);
   const [exportJob, setExportJob] = useState<ExportSummary | null>(null);
   const [detail, setDetail] = useState<CaseDetailResponse | null>(null);
+  const [reasonCatalogue, setReasonCatalogue] = useState<Record<string, ReasonText>>(REASON_TEXT);
+  useEffect(() => {
+    let active = true;
+    getReasonCodes()
+      .then((catalogue) => {
+        if (!active) return;
+        setReasonCatalogue((previous) => ({
+          ...previous,
+          ...Object.fromEntries(catalogue.items.map((item) => [item.code, { title: item.title, message: item.message }])),
+        }));
+      })
+      .catch(() => undefined); // the built-in sentences stay
+    return () => {
+      active = false;
+    };
+  }, []);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailEtag, setDetailEtag] = useState('"1"');
   const selectedCaseId = searchParams.get("case_id");
@@ -560,17 +605,17 @@ export function ReconciliationPage() {
         {selectedCases.size ? <div className="bulk-action-bar"><strong>{selectedCases.size} selected</strong><select aria-label="Bulk action" value={bulkAction} onChange={(event) => setBulkAction(event.currentTarget.value as "approve" | "hold" | "reject")}><option value="approve">Approve</option><option value="hold">Hold</option><option value="reject">Reject</option></select><input aria-label="Bulk decision reason" placeholder="Required reason" value={bulkReason} onChange={(event) => setBulkReason(event.currentTarget.value)} /><button className="button button-primary" type="button" disabled={busy || !bulkReason.trim()} onClick={() => void runBulkAction()}>Apply to selected</button><button className="button button-subtle" type="button" onClick={() => setSelectedCases(new Set())}>Clear selection</button></div> : null}
         <div className="recon-table-wrap" ref={tableWrapRef} onScroll={loadNextPageNearEnd}>
           <table className="recon-table">
-            <thead><tr><th>Select</th><th>Invoice</th><th>Date</th><th>PO(s)</th><th>GRN(s)</th><th>Invoice amount</th><th>Expected</th><th>Variance</th><th>Status</th><th>Issues</th></tr></thead>
+            <thead><tr><th>Select</th><th>Invoice</th><th>Date</th><th>PO(s)</th><th>GRN(s)</th><th>Invoice taxable</th><th>Expected taxable</th><th>Variance (taxable)</th><th>Grand total</th><th>Status</th><th>Issues</th></tr></thead>
             <tbody>
-              {firstVirtualRow && firstVirtualRow.start > 0 ? <tr aria-hidden="true" className="recon-virtual-spacer"><td colSpan={10} style={{ height: firstVirtualRow.start }} /></tr> : null}
+              {firstVirtualRow && firstVirtualRow.start > 0 ? <tr aria-hidden="true" className="recon-virtual-spacer"><td colSpan={11} style={{ height: firstVirtualRow.start }} /></tr> : null}
               {virtualRows.map((virtualRow) => {
                 const item = items[virtualRow.index];
                 if (!item) return null;
                 return <CaseTableRow key={item.case_id} item={item} virtualIndex={virtualRow.index} isSelected={selectedCases.has(item.case_id)} isActive={selectedCaseId === item.case_id} onSelect={selectCaseFromRow} onToggleSelected={toggleCaseSelection} />;
               })}
-              {lastVirtualRow && lastVirtualRow.end < rowVirtualizer.getTotalSize() ? <tr aria-hidden="true" className="recon-virtual-spacer"><td colSpan={10} style={{ height: rowVirtualizer.getTotalSize() - lastVirtualRow.end }} /></tr> : null}
-              {!loading && items.length === 0 ? <tr><td className="recon-table-empty" colSpan={10}>No cases for these filters yet. Run reconciliation after documents are mapped.</td></tr> : null}
-              {loading && items.length === 0 ? <tr><td className="recon-table-empty" colSpan={10}>Loading invoice cases…</td></tr> : null}
+              {lastVirtualRow && lastVirtualRow.end < rowVirtualizer.getTotalSize() ? <tr aria-hidden="true" className="recon-virtual-spacer"><td colSpan={11} style={{ height: rowVirtualizer.getTotalSize() - lastVirtualRow.end }} /></tr> : null}
+              {!loading && items.length === 0 ? <tr><td className="recon-table-empty" colSpan={11}>No cases for these filters yet. Run reconciliation after documents are mapped.</td></tr> : null}
+              {loading && items.length === 0 ? <tr><td className="recon-table-empty" colSpan={11}>Loading invoice cases…</td></tr> : null}
             </tbody>
           </table>
         </div>
@@ -595,12 +640,13 @@ export function ReconciliationPage() {
             <div className="case-panel-status"><span className={`recon-status recon-status-${String(detail.case["effective_status"] ?? "pending")}`}>{label(detail.case["effective_status"])}</span>{detail.case["overlay"] ? <small>Computed result: {label(detail.case["status"])}</small> : null}</div>
             {detail.case["is_stale"] ? <div className="recon-stale-banner"><AlertTriangle size={15} /> Mapping or settings changed; run again before export.</div> : null}
             <section className="case-summary-grid" aria-label="Financial summary">
-              <div><span>Invoice total</span><strong>{amount(detail.case["invoice_total"])}</strong></div>
+              <div><span>Invoice taxable</span><strong>{amount(detail.case["invoice_taxable"])}</strong></div>
               <div><span>Expected taxable</span><strong>{amount(detail.case["expected_taxable"])}</strong></div>
-              <div><span>Variance</span><strong>{amount(detail.case["variance"])}</strong></div>
+              <div><span>Variance (taxable)</span><strong>{amount(detail.case["variance"])}</strong></div>
+              <div><span>Grand total</span><strong>{amount(detail.case["invoice_total"])}</strong></div>
               <div><span>At risk</span><strong>{amount(detail.case["at_risk"])}</strong></div>
             </section>
-            <section className="case-panel-section"><h3>Why this status</h3><ul className="case-reason-list">{checks(detail.case["checks"]).map((check, index) => <li key={`${String(check["check_id"])}-${index}`}><span>{label(check["check_id"])}</span><strong>{label(check["result"])}</strong>{check["code"] ? <small>{label(check["code"])}</small> : null}</li>)}{!checks(detail.case["checks"]).length ? <li>No rule checks were stored for this case.</li> : null}</ul></section>
+            <section className="case-panel-section"><h3>Why this status</h3><CheckTable rows={checkRows(checks(detail.case["checks"]), reasonCatalogue)} /></section>
             <section className="case-panel-section" aria-label="Cumulative PO and GRN ledger"><h3>Cumulative PO / GRN ledger</h3><div className="case-ledger-list">{detail.lines.map((line, index) => <div className="case-ledger-row" key={`ledger-${String(line["line_no"])}-${index}`}><strong>Line {String(line["line_no"] ?? index + 1)}</strong><span>PO ordered <b>{String(line["po_qty"] ?? "—")}</b></span><span>Billed before <b>{String(line["billed_before"] ?? "—")}</b></span><span>This invoice <b>{String(line["billed_qty"] ?? "—")}</b></span><span>GRN accepted <b>{String(line["grn_accepted_cum"] ?? "—")}</b></span><span>Balance after <b>{String(line["balance_after"] ?? "—")}</b></span></div>)}{!detail.lines.length ? <p>No linked line ledger is available for this case.</p> : null}</div></section>
             <section className="case-panel-section"><h3>Invoice | PO | GRN lines</h3><div className="case-lines-wrap"><table className="case-lines-table"><thead><tr><th>Line</th><th>Item result</th><th>Invoice qty</th><th>PO qty</th><th>GRN accepted</th><th>Billed before</th><th>Balance after</th><th>Status</th></tr></thead><tbody>{detail.lines.map((line, index) => <tr key={`${String(line["line_no"])}-${index}`}><td>{String(line["line_no"] ?? index + 1)}</td><td>{label(line["alignment_state"])}<AiLineOpinion value={line["ai_opinion"]} /></td><td>{String(line["billed_qty"] ?? "—")}</td><td>{String(line["po_qty"] ?? "—")}</td><td>{String(line["grn_accepted_cum"] ?? "—")}</td><td>{String(line["billed_before"] ?? "—")}</td><td>{String(line["balance_after"] ?? "—")}</td><td>{label(line["status"])}</td></tr>)}</tbody></table></div></section>
             <section className="case-panel-section"><h3>Source evidence</h3>{detail.documents.map((document, index) => <details className="case-evidence-document" key={`${String(document["document_id"])}-${index}`}><summary>{label(document["doc_type"])} · {String(document["doc_no"] ?? "No document number")} · {displayDate(document["doc_date"])}</summary><div className="case-evidence-fields">{Array.isArray(document["fields"]) ? document["fields"].map((field, fieldIndex) => isEvidenceField(field) ? <EvidenceField key={`${field.field}-${fieldIndex}`} field={field} /> : null) : null}<small>Source file: {String(document["display_name"] ?? "unavailable")}</small></div></details>)}</section>

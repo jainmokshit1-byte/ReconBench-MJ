@@ -559,6 +559,7 @@ class MappingService:
         link = metadata.tables["link"]
         target_document = document.alias("target_document")
         target_version = version.alias("target_version")
+        saved_by = metadata.tables["app_user"].alias("link_saved_by")
         selection = [
             document.c.id,
             document.c.doc_type,
@@ -622,6 +623,9 @@ class MappingService:
                         link.c.evidence_snippet,
                         link.c.level,
                         link.c.from_line_no,
+                        link.c.detail_code,
+                        link.c.created_at,
+                        saved_by.c.display_name.label("saved_by_name"),
                         target_version.c.doc_no.label("po_no"),
                     )
                     .select_from(
@@ -631,7 +635,7 @@ class MappingService:
                                 pointer.c.workspace_id == link.c.workspace_id,
                                 pointer.c.current_link_id == link.c.id,
                             ),
-                        )
+                        ).outerjoin(saved_by, saved_by.c.id == link.c.created_by)
                     )
                     .join(
                         target_document,
@@ -703,6 +707,11 @@ class MappingService:
                     "evidence": link_row.evidence_snippet,
                     "level": link_row.level,
                     "line_no": link_row.from_line_no,
+                    # Who saved this state and when, for "Saved · time" and "Removed by"
+                    # (PD-4b); no name for the system's own links.
+                    "detail_code": link_row.detail_code,
+                    "saved_at": link_row.created_at,
+                    "saved_by_name": link_row.saved_by_name,
                 }
             )
         line_nos_by_version: dict[UUID, list[int]] = defaultdict(list)
@@ -2215,8 +2224,14 @@ class MappingService:
             return None
         if int(current["version_no"]) != expected_version:
             raise VersionConflict(dict(current))
-        if action not in {"confirm", "change", "unlink"}:
-            raise ValueError("link action must be confirm, change, or unlink")
+        if action not in {"confirm", "change", "unlink", "restore"}:
+            raise ValueError("link action must be confirm, change, unlink, or restore")
+        if action == "restore" and (
+            current["state"] != LinkState.REJECTED.value
+            or current["detail_code"] != "manual_unlink"
+        ):
+            # Undo and "Link again" apply only to a line a person removed (PD-4b).
+            raise ValueError("only a link a person removed can be linked again")
         source_id = cast(UUID, current["from_document_id"])
         old_target_id = cast(UUID, current["to_document_id"])
         source_row = connection.execute(
@@ -2267,7 +2282,7 @@ class MappingService:
             raise ValueError("only invoice or GRN links can be edited")
         if old_target.doc_type != DocType.PO.value:
             raise ValueError("the current link target is not a purchase order")
-        if action == "confirm" and (
+        if action in {"confirm", "restore"} and (
             source_row.effective_vendor_id is None
             or old_target.effective_vendor_id is None
             or source_row.effective_vendor_id != old_target.effective_vendor_id
@@ -2322,6 +2337,28 @@ class MappingService:
                 actor_id=actor.actor_id,
             )
             audit_action = "link.confirm"
+        elif action == "restore":
+            # The same pairing a person removed, now confirmed by the person who restores it.
+            proposal = ProposedLink(
+                from_document_id=source_id,
+                to_document_id=old_target_id,
+                link_type=LinkType(str(current["link_type"])),
+                level=LinkLevel(str(current["level"])),
+                method=LinkMethod.MANUAL,
+                confidence=Decimal("1.00"),
+                state=LinkState.CONFIRMED,
+                evidence="Linked again by an operator.",
+                line_no=cast(int | None, current["from_line_no"]),
+            )
+            created_id = self._append_link(
+                connection,
+                workspace_id=actor.workspace_id,
+                proposal=proposal,
+                old=current,
+                detail_code="manual_link_again",
+                actor_id=actor.actor_id,
+            )
+            audit_action = "link.restore"
         elif action == "unlink":
             proposal = ProposedLink(
                 from_document_id=source_id,

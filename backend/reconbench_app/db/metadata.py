@@ -461,6 +461,60 @@ _tables["reader_comparison"] = sa.Table(
     sa.CheckConstraint("jsonb_typeof(counts) = 'object'::text", name="reader_comparison_counts_ck"),
     sa.CheckConstraint("jsonb_typeof(labels) = 'array'::text", name="reader_comparison_labels_ck"),
 )
+_tables["duplicate_hold"] = sa.Table(
+    "duplicate_hold",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("source_file_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("source_locator", sa.Text(), server_default=sa.text("''::text"), nullable=False),
+    sa.Column("kind", sa.Text(), nullable=False),
+    sa.Column("reason", sa.Text(), nullable=False),
+    sa.Column("duplicate_of_document_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("doc_no", sa.Text()),
+    sa.Column("state", sa.Text(), server_default=sa.text("'open'::text"), nullable=False),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
+    ),
+    sa.Column("decided_by", postgresql.UUID(as_uuid=True)),
+    sa.Column("decided_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
+    sa.PrimaryKeyConstraint("id", name="duplicate_hold_pkey"),
+    sa.UniqueConstraint(
+        "workspace_id", "source_file_id", "source_locator", name="duplicate_hold_document_key"
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id"], ["workspace.id"], name="duplicate_hold_workspace_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["source_file_id"], ["source_file.id"], name="duplicate_hold_source_file_id_fkey"
+    ),
+    sa.ForeignKeyConstraint(
+        ["duplicate_of_document_id"],
+        ["document.id"],
+        name="duplicate_hold_duplicate_of_document_id_fkey",
+    ),
+    sa.ForeignKeyConstraint(["decided_by"], ["app_user.id"], name="duplicate_hold_decided_by_fkey"),
+    sa.CheckConstraint(
+        "kind = ANY (ARRAY['duplicate'::text, 'possible'::text])", name="duplicate_hold_kind_ck"
+    ),
+    sa.CheckConstraint(
+        "state = ANY (ARRAY['open'::text, 'discarded'::text, 'replaced'::text, 'kept'::text])",
+        name="duplicate_hold_state_ck",
+    ),
+    sa.CheckConstraint(
+        "((state = 'open'::text) = (decided_at IS NULL)) "
+        "AND ((state <> 'replaced'::text) OR (kind = 'duplicate'::text)) "
+        "AND ((state <> 'kept'::text) OR (kind = 'possible'::text))",
+        name="duplicate_hold_decision_ck",
+    ),
+    sa.CheckConstraint(
+        "length(reason) >= 1 AND length(reason) <= 64 AND length(source_locator) <= 512 "
+        "AND (doc_no IS NULL OR length(doc_no) <= 256)",
+        name="duplicate_hold_text_len_ck",
+    ),
+    sa.CheckConstraint("version >= 1", name="duplicate_hold_version_ck"),
+)
 _tables["consensus_decision"] = sa.Table(
     "consensus_decision",
     metadata,
@@ -2866,6 +2920,17 @@ sa.Index(
     _tables["consensus_run"].c["workspace_id"],
     _tables["consensus_run"].c["document_version_id"],
     _tables["consensus_run"].c["created_at"].desc(),
+)
+sa.Index(
+    "duplicate_hold_open_ix",
+    _tables["duplicate_hold"].c["workspace_id"],
+    _tables["duplicate_hold"].c["state"],
+    _tables["duplicate_hold"].c["created_at"],
+)
+sa.Index(
+    "duplicate_hold_original_ix",
+    _tables["duplicate_hold"].c["workspace_id"],
+    _tables["duplicate_hold"].c["duplicate_of_document_id"],
 )
 sa.Index(
     "reader_comparison_created_ix",

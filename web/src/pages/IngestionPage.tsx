@@ -20,12 +20,15 @@ import {
 
 import {
   createBatch,
+  decideDuplicateHold,
   displayError,
+  DUPLICATE_REASON_TEXT,
   getBatchSummary,
   getDocuments,
   getFileErrors,
   getIngestionClientConfig,
   listBatches,
+  listDuplicateHolds,
   listFiles,
   processBatch,
   removeFile,
@@ -34,7 +37,7 @@ import {
   retryFile,
   uploadFile,
 } from "../api/ingestion";
-import type { BatchSummary, IngestionFile, UploadZone } from "../api/ingestion";
+import type { BatchSummary, DuplicateHold, IngestionFile, UploadZone } from "../api/ingestion";
 import { AiSharingBanner } from "../components/AiSharingBanner";
 import { PageHeader } from "../components/PageHeader";
 import { CsvMappingDialog } from "../components/CsvMappingDialog";
@@ -396,10 +399,46 @@ export function IngestionPage() {
   const [uploadProgress, setUploadProgress] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  // PD-0b-4: files not stored again, and documents held as (possible) duplicates.
+  const [alreadyUploaded, setAlreadyUploaded] = useState<Array<{ name: string; original: string; batchId: string | null }>>([]);
+  const [holds, setHolds] = useState<DuplicateHold[]>([]);
+  const refreshHolds = useCallback(async () => {
+    try {
+      setHolds(await listDuplicateHolds("open"));
+    } catch {
+      setHolds([]);
+    }
+  }, []);
+  useEffect(() => {
+    void refreshHolds();
+  }, [refreshHolds]);
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [mappingFile, setMappingFile] = useState<IngestionFile | null>(null);
   const fileEtag = useRef<string | null>(null);
   const canUpload = hasCapability("files.upload");
+  const decideHold = async (hold: DuplicateHold, decision: "discard" | "replace" | "keep") => {
+    if (!csrfToken) {
+      setError("Your session security token is missing. Sign in again and retry.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await decideDuplicateHold(hold, decision, csrfToken);
+      setInfo(
+        decision === "discard"
+          ? "The copy was discarded; the original stays as it is."
+          : decision === "replace"
+            ? "The original gets a new version from this file; the file is read again now."
+            : "Kept as a new document; the file is read again now.",
+      );
+    } catch (cause) {
+      setError(displayError(cause));
+    } finally {
+      setBusy(false);
+      void refreshHolds();
+    }
+  };
   const csrfToken = user?.csrf_token ?? "";
 
   const refreshFiles = useCallback(async (selectedBatchId: string, force = false) => {
@@ -516,11 +555,16 @@ export function IngestionPage() {
       }
       let uploaded = 0;
       const failedIds = new Set<string>();
+      const skipped: Array<{ name: string; original: string; batchId: string | null }> = [];
       for (const [index, item] of validPending.entries()) {
         setUploadProgress(`Uploading ${index + 1} of ${validPending.length}: ${item.file.name}`);
         try {
-          await uploadFile(activeBatchId, item.zone, item.file, csrfToken);
-          uploaded += 1;
+          const result = await uploadFile(activeBatchId, item.zone, item.file, csrfToken);
+          if (result.duplicate) {
+            skipped.push({ name: item.file.name, original: result.original_display_name ?? "an earlier upload", batchId: result.original_batch_id ?? null });
+          } else {
+            uploaded += 1;
+          }
           setPending((current) => current.filter((pendingFile) => pendingFile.id !== item.id));
         } catch (cause) {
           failedIds.add(item.id);
@@ -536,8 +580,10 @@ export function IngestionPage() {
       } else if (failedIds.size > 0) {
         setError("No files uploaded successfully. Fix the highlighted upload errors and retry.");
       }
+      setAlreadyUploaded(skipped);
       fileEtag.current = null;
       await refreshFiles(activeBatchId, true);
+      void refreshHolds();
     } catch (cause) {
       setError(displayError(cause));
     } finally {
@@ -601,6 +647,45 @@ export function IngestionPage() {
       <AiSharingBanner />
       {error ? <div className="banner-error ingestion-message" role="alert"><AlertCircle size={17} /><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError(null)}><X size={15} /></button></div> : null}
       {info ? <div className="banner-info ingestion-message" role="status"><CheckCircle2 size={17} /><span>{info}</span><button type="button" aria-label="Dismiss message" onClick={() => setInfo(null)}><X size={15} /></button></div> : null}
+
+      {alreadyUploaded.length ? (
+        <div className="banner-info ingestion-message" role="status">
+          <CheckCircle2 size={17} />
+          <span>
+            {alreadyUploaded.map((item) => (
+              <span key={item.name} className="ingestion-duplicate-line">
+                Already uploaded: {item.name} is the same file as {item.original}; it was not stored or processed again.{" "}
+                {item.batchId ? <button className="text-button" type="button" onClick={() => setBatchId(item.batchId)}>Open the original</button> : null}
+              </span>
+            ))}
+          </span>
+          <button type="button" aria-label="Dismiss message" onClick={() => setAlreadyUploaded([])}><X size={15} /></button>
+        </div>
+      ) : null}
+      {holds.length ? (
+        <section className="panel ingestion-duplicates" aria-label="Uploads not ingested">
+          <div className="panel-heading"><div><div className="panel-kicker">NOT INGESTED</div><h2>Duplicates waiting for a decision</h2></div></div>
+          <p>These documents match an invoice already in the app. They are not mapped or reconciled until you decide.</p>
+          <ul>
+            {holds.map((hold) => (
+              <li key={hold.id} className="ingestion-duplicate-hold">
+                <strong>{hold.file_name}{hold.doc_no ? ` · ${hold.doc_no}` : ""}</strong>
+                <span>{hold.kind === "duplicate" ? "Duplicate of" : "Possible duplicate of"} INV {hold.original_doc_no ?? "without number"}{hold.original_file_name ? ` (from ${hold.original_file_name})` : ""}</span>
+                <small>{DUPLICATE_REASON_TEXT[hold.reason] ?? hold.reason.replaceAll("_", " ")}</small>
+                {hold.original_batch_id ? <button className="text-button" type="button" onClick={() => setBatchId(hold.original_batch_id)}>Open the original</button> : null}
+                {canUpload ? (
+                  <span className="ingestion-duplicate-actions">
+                    <button className="button button-primary" type="button" disabled={busy} onClick={() => void decideHold(hold, "discard")}>Discard</button>
+                    {hold.kind === "duplicate"
+                      ? <button className="button" type="button" disabled={busy} onClick={() => void decideHold(hold, "replace")}>Replace with this file</button>
+                      : <button className="button" type="button" disabled={busy} onClick={() => void decideHold(hold, "keep")}>Keep as new</button>}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       <section className="panel batch-control-panel" aria-label="Ingestion batch">
         <div>

@@ -1915,6 +1915,21 @@
         "title": "DocumentLinksConfirmBody",
         "type": "object"
       },
+      "DuplicateDecisionBody": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "pattern": "^(discard|replace|keep)$",
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "DuplicateDecisionBody",
+        "type": "object"
+      },
       "DuplicatePolicyBody": {
         "additionalProperties": false,
         "properties": {
@@ -3051,7 +3066,7 @@
         "additionalProperties": false,
         "properties": {
           "action": {
-            "pattern": "^(confirm|change|unlink)$",
+            "pattern": "^(confirm|change|unlink|restore)$",
             "title": "Action",
             "type": "string"
           },
@@ -5968,6 +5983,23 @@
               "title": "Count",
               "type": "boolean"
             }
+          },
+          {
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
           }
         ],
         "responses": {
@@ -6683,6 +6715,125 @@
         "tags": [
           "API v1",
           "Documents"
+        ]
+      }
+    },
+    "/api/v1/duplicate-holds": {
+      "get": {
+        "description": "Uploads not ingested because they match an active invoice (PD-0b-4).",
+        "operationId": "get_duplicate_holds_api_v1_duplicate_holds_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "file_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "File Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(open|discarded|replaced|kept)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Duplicate Holds",
+        "tags": [
+          "API v1",
+          "Ingestion"
+        ]
+      }
+    },
+    "/api/v1/duplicate-holds/{hold_id}/decision": {
+      "post": {
+        "operationId": "decide_duplicate_hold_api_v1_duplicate_holds__hold_id__decision_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "hold_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Hold Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DuplicateDecisionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Decide Duplicate Hold",
+        "tags": [
+          "API v1",
+          "Ingestion"
         ]
       }
     },

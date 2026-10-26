@@ -67,6 +67,12 @@ class PageSplitDecision(BaseModel):
     decision: str = Field(pattern=r"^(accept_split|keep_one)$")
 
 
+class DuplicateDecisionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(pattern=r"^(discard|replace|keep)$")
+
+
 class ColumnMappingBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -488,6 +494,9 @@ async def upload_file(
         "status": receipt.status,
         "duplicate": receipt.duplicate,
         "reactivated": receipt.reactivated,
+        # A duplicate is not stored again; the UI links to the original upload (PD-0b-4).
+        "original_display_name": receipt.original_display_name,
+        "original_batch_id": receipt.original_batch_id,
     }
     status = 200 if receipt.duplicate else 201
     return DecimalJSONResponse(status_code=status, content=payload)
@@ -599,6 +608,51 @@ def resolve_page_split(
         status_code=202,
         content=_public_file(row),
         headers={"ETag": etag_for_version(int(row["version"]))},
+    )
+
+
+@router.get("/duplicate-holds", tags=["Ingestion"])
+@requires("data.view")
+def get_duplicate_holds(
+    request: Request,
+    file_id: UUID | None = Query(default=None),  # noqa: B008 - FastAPI query metadata.
+    state: str | None = Query(default=None, pattern=r"^(open|discarded|replaced|kept)$"),  # noqa: B008
+) -> Response:
+    """Uploads not ingested because they match an active invoice (PD-0b-4)."""
+
+    rows = _service(request).list_duplicate_holds(
+        _actor(request).workspace_id, file_id=file_id, state=state
+    )
+    return DecimalJSONResponse(content=to_jsonable(rows))
+
+
+@router.post("/duplicate-holds/{hold_id}/decision", tags=["Ingestion"])
+@requires("files.upload")
+def decide_duplicate_hold(
+    hold_id: UUID,
+    body: DuplicateDecisionBody,
+    request: Request,
+) -> Response:
+    expected_version = require_if_match(request.headers.get("if-match"))
+    try:
+        result = _service(request).decide_duplicate_hold(
+            _actor(request),
+            hold_id,
+            expected_version=expected_version,
+            decision=body.decision,
+        )
+    except (BatchVersionConflict, IngestionFailure, ObjectStoreUnavailable) as exc:
+        return _handle_ingestion_error(exc, request)
+    if result is None:
+        return _problem(
+            request,
+            status=404,
+            title="Not found",
+            detail="The duplicate was not found.",
+            code="not_found",
+        )
+    return DecimalJSONResponse(
+        content=to_jsonable(result), headers={"ETag": etag_for_version(int(result["version"]))}
     )
 
 

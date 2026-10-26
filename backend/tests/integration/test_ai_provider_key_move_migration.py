@@ -182,7 +182,7 @@ def _clone_at_0028(public_key: SealingPublicKey, *, conflict: bool = False) -> I
         clone = Clone(engine, clone_url)
         with engine.begin() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-            assert heads == {"0030"}, heads
+            assert heads == {"0031"}, heads
             for statement in _REWIND_0029:
                 connection.exec_driver_sql(statement)
             # Cards of the source database keep no key from other tests.

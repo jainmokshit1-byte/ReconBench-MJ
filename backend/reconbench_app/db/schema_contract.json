@@ -649,6 +649,11 @@
       "is_partition": false,
       "owner": "reconbench_migrator"
     },
+    "duplicate_hold": {
+      "is_partition": false,
+      "kind": "r",
+      "owner": "reconbench_migrator"
+    },
     "export_file": {
       "kind": "r",
       "is_partition": false,
@@ -2486,6 +2491,58 @@
     {
       "table": "document_warning",
       "name": "document_warning_workspace_id_fkey",
+      "columns": [
+        "workspace_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "workspace",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "duplicate_hold",
+      "name": "duplicate_hold_decided_by_fkey",
+      "columns": [
+        "decided_by"
+      ],
+      "referred_schema": "public",
+      "referred_table": "app_user",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "duplicate_hold",
+      "name": "duplicate_hold_duplicate_of_document_id_fkey",
+      "columns": [
+        "duplicate_of_document_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "document",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "duplicate_hold",
+      "name": "duplicate_hold_source_file_id_fkey",
+      "columns": [
+        "source_file_id"
+      ],
+      "referred_schema": "public",
+      "referred_table": "source_file",
+      "referred_columns": [
+        "id"
+      ],
+      "options": {}
+    },
+    {
+      "table": "duplicate_hold",
+      "name": "duplicate_hold_workspace_id_fkey",
       "columns": [
         "workspace_id"
       ],
@@ -4597,6 +4654,34 @@
     },
     {
       "kind": "table",
+      "object": "duplicate_hold",
+      "grantee": "reconbench_app",
+      "privilege_type": "INSERT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "duplicate_hold",
+      "grantee": "reconbench_app",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "duplicate_hold",
+      "grantee": "reconbench_app",
+      "privilege_type": "UPDATE",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
+      "object": "duplicate_hold",
+      "grantee": "reconbench_report",
+      "privilege_type": "SELECT",
+      "is_grantable": false
+    },
+    {
+      "kind": "table",
       "object": "export_file",
       "grantee": "reconbench_app",
       "privilege_type": "DELETE",
@@ -5649,7 +5734,7 @@
     }
   ],
   "object_counts": {
-    "application_tables": 53,
+    "application_tables": 54,
     "extensions": 2,
     "views": 4,
     "materialized_views": 0,
@@ -5658,8 +5743,8 @@
     "enums": 40,
     "domains": 5,
     "sequences": 1,
-    "foreign_keys": 176,
-    "explicit_acls": 268,
+    "foreign_keys": 180,
+    "explicit_acls": 272,
     "default_privileges": 7
   }
 }

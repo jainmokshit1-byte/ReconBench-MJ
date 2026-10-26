@@ -39,7 +39,14 @@ export interface CurrentMappingLink {
   evidence: string | null;
   level: string;
   line_no: number | null;
+  /** Why this version exists, e.g. manual_unlink for a line a person removed. */
+  detail_code?: string | null;
+  /** When and by whom this state was saved; no name for the system's own links. */
+  saved_at?: string | null;
+  saved_by_name?: string | null;
 }
+
+export type LinkAction = "confirm" | "change" | "unlink" | "restore";
 
 export interface MappingDocument {
   id: string;
@@ -207,7 +214,7 @@ export function decideMergeSuggestion(
 
 export function editMappingLink(
   linkId: string,
-  action: "confirm" | "change" | "unlink",
+  action: LinkAction,
   version: number,
   csrfToken: string,
   targetDocumentId?: string,
