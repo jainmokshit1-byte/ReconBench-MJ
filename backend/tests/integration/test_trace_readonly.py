@@ -292,3 +292,98 @@ def test_cli_handlers_on_disposable_db(disposable_engine: Engine) -> None:
         assert code_run == 1
     finally:
         trace_engine.dispose()
+
+
+def test_find_document_prefers_the_current_copy(disposable_engine: Engine) -> None:
+    """PD-0b-2: a newer withdrawn copy never hides the older current document."""
+    import hashlib
+
+    ws = uuid4()
+    active_id, withdrawn_id, active_version = uuid4(), uuid4(), uuid4()
+    source_file_id = uuid4()
+    with disposable_engine.begin() as priv_conn:
+        priv_conn.execute(
+            sa.text("INSERT INTO workspace (id, name) VALUES (:id, 'Workspace Current Copy')"),
+            {"id": ws},
+        )
+        priv_conn.execute(
+            sa.text(
+                """
+                INSERT INTO source_file (id, workspace_id, sha256, display_name, zone, zone_uploaded,
+                                         format, mismatch_state, status, attempt_count, size_bytes,
+                                         object_key, docs_found, docs_new, docs_updated, docs_skipped,
+                                         reupload_skips, uploaded_at, version)
+                VALUES (:sfid, :wid, :sha, 'current.pdf', 'invoice', 'invoice',
+                        'pdf', 'none', 'parsed', 1, 1024, 'test/current', 1, 1, 0, 0, 0, now(), 1)
+                """
+            ),
+            {"sfid": source_file_id, "wid": ws, "sha": hashlib.sha256(b"current").hexdigest()},
+        )
+        insert_document = sa.text(
+            """
+            INSERT INTO document (id, workspace_id, doc_type, natural_key, doc_no, canonical_doc_no,
+                                  doc_date, grand_total, current_version_id, withdrawn_at,
+                                  first_seen_at, updated_at)
+            VALUES (:did, :wid, 'invoice', :nkey, 'INV-COPY-7', 'INVCOPY7', :dt, 100.00,
+                    :cvid, :withdrawn, :seen, :updated)
+            """
+        )
+        priv_conn.execute(
+            insert_document,
+            {
+                "did": active_id,
+                "wid": ws,
+                "nkey": hashlib.sha256(b"active").hexdigest(),
+                "dt": date(2026, 10, 6),
+                "cvid": active_version,
+                "withdrawn": None,
+                "seen": datetime(2026, 10, 6, tzinfo=UTC),
+                "updated": datetime(2026, 10, 7, tzinfo=UTC),
+            },
+        )
+        priv_conn.execute(
+            insert_document,
+            {
+                "did": withdrawn_id,
+                "wid": ws,
+                "nkey": hashlib.sha256(b"withdrawn").hexdigest(),
+                "dt": date(2026, 10, 6),
+                "cvid": None,
+                "withdrawn": datetime(2026, 10, 22, tzinfo=UTC),
+                "seen": datetime(2026, 10, 21, tzinfo=UTC),
+                "updated": datetime(2026, 10, 22, tzinfo=UTC),
+            },
+        )
+        priv_conn.execute(
+            sa.text(
+                """
+                INSERT INTO document_version (id, workspace_id, document_id, seq, revision_rank, content_hash, doc_no,
+                                              doc_date, currency, grand_total, taxable_total, extraction_method,
+                                              needs_verification, verification_reasons, po_refs, canonical_po_refs,
+                                              grn_refs, canonical_grn_refs, extras, source_file_id, parser_version)
+                VALUES (:vid, :wid, :did, 1, 0, :chash, 'INV-COPY-7', :dt, 'INR', 100.00, 90.00,
+                        'pdf_text', false, '{}', '{}', '{}', '{}', '{}', '{}', :sfid, 'v1')
+                """
+            ),
+            {
+                "vid": active_version,
+                "wid": ws,
+                "did": active_id,
+                "chash": hashlib.sha256(b"active-v1").hexdigest(),
+                "dt": date(2026, 10, 6),
+                "sfid": source_file_id,
+            },
+        )
+
+    trace_engine = create_trace_engine()
+    try:
+        with trace_engine.connect() as conn:
+            found = find_document(conn, ws, "INV-COPY-7")
+            assert found is not None
+            assert found["id"] == active_id
+            # A document id still finds that exact document, withdrawn or not.
+            by_id = find_document(conn, ws, str(withdrawn_id))
+            assert by_id is not None
+            assert by_id["id"] == withdrawn_id
+    finally:
+        trace_engine.dispose()

@@ -204,3 +204,17 @@ def test_a_reconciliation_run_is_queued_ahead_of_ledger_and_mapping_jobs() -> No
         connection=cast(Any, sqlalchemy_connection),
     )
     assert "priority" not in task.options
+
+
+def test_pending_recomputes_queue_one_drain_job_and_no_per_po_jobs() -> None:
+    """PD-0b-3: an event queues one drain job per workspace, never one job per PO."""
+
+    per_po = _LockedTask(_LockedDeferrer(object()))
+    drain = _LockedTask(_LockedDeferrer(object()))
+    connection = _LockConnection(waiting=None)
+    queue = ProcrastinateJobQueue({"recompute_po": per_po, "drain_dirty_scopes": drain})
+
+    assert queue.enqueue_pending_recomputes(workspace_id=WS, connection=cast(Any, connection)) == 42
+    assert per_po.deferrer.arguments is None
+    assert drain.deferrer.arguments == {"workspace_id": str(WS)}
+    assert connection.locks == [f"drain_dirty_scopes:{WS}"]

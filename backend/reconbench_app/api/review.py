@@ -63,6 +63,19 @@ class ManualReconBody(BaseModel):
     run_date: date = Field(default_factory=date.today)
 
 
+def _queue_ledger_refresh(request: Request, connection: Connection, workspace_id: UUID) -> None:
+    """A reject or release changes which invoices consume PO quantities (PD-0b-3)."""
+
+    queue = getattr(request.app.state, "job_queue", None)
+    enqueue = getattr(queue, "enqueue_pending_recomputes", None)
+    if callable(enqueue):
+        enqueue(workspace_id=workspace_id, connection=connection)
+
+
+# Actions that change whether a case's invoice consumes PO quantities (ledger exclusions).
+_LEDGER_ACTIONS = frozenset({"reject", "release"})
+
+
 def _insert_action(
     connection: Connection,
     actor: ActorContext,
@@ -203,6 +216,8 @@ def add_case_action(
                 reason=body.reason,
                 note=body.note,
             )
+            if result["status"] == 200 and body.action in _LEDGER_ACTIONS:
+                _queue_ledger_refresh(request, connection, actor.workspace_id)
     except ApiProblem as exc:
         raise exc
     if result["status"] == 404:
@@ -251,6 +266,11 @@ def bulk_case_actions(
                 items.append({"case_id": str(item.case_id), "status": 409, "current": exc.current})
             except ApiProblem as exc:
                 items.append({"case_id": str(item.case_id), "status": exc.status, "code": exc.code})
+        if any(
+            result.get("status") == 200 and result.get("action") in _LEDGER_ACTIONS
+            for result in items
+        ):
+            _queue_ledger_refresh(request, connection, actor.workspace_id)
         return IdempotentResult(200, {"bulk_id": bulk_id, "items": items})
 
     with Session(request.app.state.database_engine) as session:

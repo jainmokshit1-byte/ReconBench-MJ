@@ -98,6 +98,9 @@ def find_document(
                 LEFT JOIN vendor v ON v.id = d.vendor_id
                 WHERE d.workspace_id = :wid
                   AND (d.id = :uid OR d.doc_no = :ident OR d.canonical_doc_no = :canon)
+                ORDER BY (d.id = :uid) DESC,
+                         (d.withdrawn_at IS NULL AND d.current_version_id IS NOT NULL) DESC,
+                         d.updated_at DESC
                 LIMIT 1
                 """
             )
@@ -113,7 +116,11 @@ def find_document(
                 LEFT JOIN vendor v ON v.id = d.vendor_id
                 WHERE d.workspace_id = :wid
                   AND (d.doc_no = :ident OR d.canonical_doc_no = :canon)
-                ORDER BY d.first_seen_at DESC
+                -- The current document first (not withdrawn, with a current version), then
+                -- the most recently updated: a newer withdrawn copy never hides it (PD-0b-2).
+                ORDER BY (d.withdrawn_at IS NULL AND d.current_version_id IS NOT NULL) DESC,
+                         d.updated_at DESC,
+                         d.first_seen_at DESC
                 LIMIT 1
                 """
             )

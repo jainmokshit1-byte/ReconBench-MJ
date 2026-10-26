@@ -1211,6 +1211,13 @@ class IngestionService:
                 scope_id=scope_id,
                 reason=reason,
             )
+        if any(row["doc_type"] != "po" for row in rows):
+            # A withdrawn invoice or GRN changes the ledgers of the POs it was linked to
+            # without marking a scope: queue the drain, which runs before any mapping job
+            # queued later, so no ledger row is read stale (PD-0b-3).
+            enqueue_pending = getattr(self.queue, "enqueue_pending_recomputes", None)
+            if callable(enqueue_pending):
+                enqueue_pending(workspace_id=workspace_id, connection=connection)
 
     @requires("files.upload")
     def ingest_file(self, file_id: UUID, *, job_id: int | None = None) -> None:

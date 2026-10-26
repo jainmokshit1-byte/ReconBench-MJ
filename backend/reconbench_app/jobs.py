@@ -183,22 +183,9 @@ class ProcrastinateJobQueue(QueuePort):
         )
 
     def enqueue_pending_recomputes(self, *, workspace_id: UUID, connection: Connection) -> int:
-        scopes = metadata.tables["dirty_scope"]
-        po_ids = connection.scalars(
-            sa.select(scopes.c.scope_id)
-            .where(
-                scopes.c.workspace_id == workspace_id,
-                scopes.c.scope_kind == "po",
-                scopes.c.processed_at.is_(None),
-            )
-            .order_by(scopes.c.first_marked_at, scopes.c.id)
-        ).all()
-        for po_id in po_ids:
-            self.enqueue_recompute_po(
-                workspace_id=workspace_id,
-                po_document_id=UUID(str(po_id)),
-                connection=connection,
-            )
+        # One drain job brings every PO ledger up to date: it rebuilds the scoped POs and
+        # checks every current PO against its input fingerprint, so no per-PO job is
+        # queued (PD-0b-3). It keeps its place in the queue, ahead of later mapping jobs.
         return self.enqueue_dirty_scopes(workspace_id=workspace_id, connection=connection)
 
 
@@ -449,8 +436,14 @@ def register_ingestion_tasks(
     def drain_dirty_scopes(context: JobContext, workspace_id: str) -> None:
         del context
         resolved_workspace_id = UUID(workspace_id)
-        while ledger_service.drain_dirty_scopes(resolved_workspace_id)["scopes"]:
-            pass
+        result = ledger_service.drain_dirty_scopes(resolved_workspace_id, sweep=True)
+        failed = result["failed"]
+        while result["processed"]:
+            result = ledger_service.drain_dirty_scopes(resolved_workspace_id)
+            failed += result["failed"]
+        if failed:
+            # Every other PO and scope is committed; the failing POs keep their scopes open.
+            raise RuntimeError(f"{failed} PO ledger rebuild(s) failed; see the worker log")
 
     @task_app.task(
         name="reconbench.evaluate_cases",
@@ -461,6 +454,18 @@ def register_ingestion_tasks(
     def evaluate_cases(context: JobContext, run_id: str) -> None:
         del context
         reconciliation_service.evaluate_run(UUID(run_id))
+        # A case found to be a duplicate stops consuming PO quantities (a ledger input that
+        # marks no scope): queue the drain so the ledgers follow before later mapping jobs.
+        with engine.begin() as connection:
+            workspace_id = connection.scalar(
+                sa.select(metadata.tables["recon_run"].c.workspace_id).where(
+                    metadata.tables["recon_run"].c.id == UUID(run_id)
+                )
+            )
+            if workspace_id is not None:
+                queue.enqueue_pending_recomputes(
+                    workspace_id=UUID(str(workspace_id)), connection=connection
+                )
 
     @task_app.task(
         name="reconbench.build_export",

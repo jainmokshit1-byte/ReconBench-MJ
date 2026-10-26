@@ -687,7 +687,14 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         assert drained["pos"] == 1
         assert drained["changed"] == 0
         drained_again = ledger_service.drain_dirty_scopes(workspace_id)
-        assert drained_again == {"scopes": 0, "pos": 0, "changed": 0, "entries": 0}
+        assert drained_again == {
+            "scopes": 0,
+            "processed": 0,
+            "failed": 0,
+            "pos": 0,
+            "changed": 0,
+            "entries": 0,
+        }
         with ingestion_engine.connect() as connection:
             linked_invoice_id = connection.scalar(
                 sa.select(metadata.tables["document"].c.id).where(

@@ -48,10 +48,10 @@ def rebuild_ledgers(database_url: str) -> dict[str, int]:
                 totals["entries"] += int(result["entries"])
             while True:
                 result = service.drain_dirty_scopes(workspace_id)
-                totals["scopes"] += result["scopes"]
+                totals["scopes"] += result["processed"]
                 totals["changed"] += result["changed"]
                 totals["entries"] += result["entries"]
-                if result["scopes"] == 0:
+                if result["processed"] == 0:
                     break
         return totals
     finally:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -22,7 +23,18 @@ from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.mapping_service import MappingService, _make_document
 
+_LOGGER = logging.getLogger(__name__)
 _ACTIVE_LINK_STATES = ("auto", "suggested", "confirmed")
+# A PO whose rebuild raises one of these is rolled back alone; anything else (for
+# example a lost database connection) still fails the whole job for a retry.
+_PO_REBUILD_ERRORS = (
+    ValueError,
+    LookupError,
+    TypeError,
+    ArithmeticError,
+    sa.exc.DataError,
+    sa.exc.IntegrityError,
+)
 
 
 def _deterministic_link(link: sa.Table) -> sa.ColumnElement[bool]:
@@ -70,6 +82,23 @@ class _CurrentSnapshot:
     governing: frozenset[UUID]
 
 
+@dataclass(frozen=True, slots=True)
+class _BatchInputs:
+    """Per-PO inputs read once for a batch of POs (PD-0b-3).
+
+    Each value is what ``rebuild_po_connection`` would read for one PO: the same rows in
+    the same order. Rebuilding one PO changes only that PO's ledger rows, so none of
+    these goes stale inside the batch.
+    """
+
+    workspace_id: UUID
+    links: dict[UUID, list[RowMapping]]
+    ledger_hashes: dict[UUID, set[str]]
+    ledger_counts: dict[UUID, int]
+    exclusions: dict[UUID, str]
+    mapping_config: Any
+
+
 class LedgerRebuildService:
     """Rebuild ledgers from the current PO, active links and source versions."""
 
@@ -77,6 +106,7 @@ class LedgerRebuildService:
         self.engine = engine
         self.mapping = MappingService(engine)
         self._batch_snapshot: _CurrentSnapshot | None = None
+        self._batch_inputs: _BatchInputs | None = None
 
     def _current_snapshot(self, connection: Connection, workspace_id: UUID) -> _CurrentSnapshot:
         batch = self._batch_snapshot
@@ -131,6 +161,10 @@ class LedgerRebuildService:
         line_rows = snapshot.line_rows
 
         target = by_document.get(po_document_id)
+        if target is None and self._is_workspace_po(connection, workspace_id, po_document_id):
+            # A withdrawn PO, or one without a current version, has no ledger: the app never
+            # shows one (mapping and v_grni_now read current POs only), so its rows go (PD-0b-1).
+            return self._remove_obsolete_ledger(connection, workspace_id, po_document_id)
         if target is None or target[1].header.doc_type is not DocType.PO:
             raise ValueError("PO document is not current in this workspace")
 
@@ -142,10 +176,25 @@ class LedgerRebuildService:
         po_line_rows = line_rows.get(po_version_id, [])
         po_lines = {line.line_no: line for line in po_document.lines}
         po_db_lines = {int(line["line_no"]): line for line in po_line_rows}
-        mapping_config = self.mapping._mapping_config(connection, workspace_id)
-        links = self._active_links(connection, workspace_id, po_document_id)
+        inputs = self._batch_inputs
+        if inputs is not None and inputs.workspace_id != workspace_id:
+            inputs = None
+        mapping_config = (
+            inputs.mapping_config
+            if inputs is not None
+            else self.mapping._mapping_config(connection, workspace_id)
+        )
+        links = (
+            inputs.links.get(po_document_id, [])
+            if inputs is not None
+            else self._active_links(connection, workspace_id, po_document_id)
+        )
         opening_rows = self._opening_balances(connection, workspace_id, po_row)
-        all_exclusions = self._invoice_exclusions(connection, workspace_id)
+        all_exclusions = (
+            inputs.exclusions
+            if inputs is not None
+            else self._invoice_exclusions(connection, workspace_id)
+        )
         linked_document_ids = {cast(UUID, link["from_document_id"]) for link in links}
         exclusions = {
             document_id: reason
@@ -201,22 +250,27 @@ class LedgerRebuildService:
         input_hash = _hash_payload(payload)
 
         ledger = metadata.tables["po_line_ledger"]
-        current_hashes = set(
-            connection.scalars(
-                sa.select(ledger.c.input_hash).where(
+        current_count: int | None
+        if inputs is not None:
+            current_hashes = inputs.ledger_hashes.get(po_document_id, set())
+            current_count = inputs.ledger_counts.get(po_document_id, 0)
+        else:
+            current_hashes = set(
+                connection.scalars(
+                    sa.select(ledger.c.input_hash).where(
+                        ledger.c.workspace_id == workspace_id,
+                        ledger.c.po_document_id == po_document_id,
+                    )
+                ).all()
+            )
+            current_count = connection.scalar(
+                sa.select(sa.func.count())
+                .select_from(ledger)
+                .where(
                     ledger.c.workspace_id == workspace_id,
                     ledger.c.po_document_id == po_document_id,
                 )
-            ).all()
-        )
-        current_count = connection.scalar(
-            sa.select(sa.func.count())
-            .select_from(ledger)
-            .where(
-                ledger.c.workspace_id == workspace_id,
-                ledger.c.po_document_id == po_document_id,
             )
-        )
         if current_count == len(po_lines) and current_hashes == (
             {input_hash} if po_lines else set()
         ):
@@ -300,8 +354,17 @@ class LedgerRebuildService:
         return {"lines": len(ledger_values), "entries": len(entry_values), "changed": True}
 
     @requires("links.edit")
-    def drain_dirty_scopes(self, workspace_id: UUID, *, limit: int = 100) -> dict[str, int]:
-        """Claim and process a coalesced batch; a failure rolls back the whole batch."""
+    def drain_dirty_scopes(
+        self, workspace_id: UUID, *, limit: int = 100, sweep: bool = False
+    ) -> dict[str, int]:
+        """Claim a coalesced batch of scopes and rebuild the POs they name.
+
+        With ``sweep`` every current PO is checked too: an unchanged input fingerprint
+        leaves its ledger untouched, so the batch ends equal to a full recompute whatever
+        marked it (PD-0b-3). Each PO runs in its own savepoint: one that fails is rolled
+        back alone and keeps its scopes open for the next drain, while every other PO and
+        scope commits (PD-0b-1). ``failed`` counts the POs that raised.
+        """
 
         if limit < 1 or limit > 1000:
             raise ValueError("dirty-scope batch limit must be between 1 and 1000")
@@ -319,7 +382,7 @@ class LedgerRebuildService:
                     .with_for_update(skip_locked=True)
                 ).mappings()
             )
-            rebuilt: set[UUID] = set()
+            pos_by_scope: dict[UUID, set[UUID]] = {}
             for scope in claimed:
                 kind = str(scope["scope_kind"])
                 scope_id = cast(UUID, scope["scope_id"])
@@ -338,38 +401,140 @@ class LedgerRebuildService:
                             document.c.vendor_id.in_(vendor_ids),
                         )
                     ).all()
-                    rebuilt.update(cast(UUID, po_id) for po_id in po_ids)
+                    named = {cast(UUID, po_id) for po_id in po_ids}
                 elif kind == "po":
-                    rebuilt.add(scope_id)
+                    named = {scope_id}
                 elif kind == "invoice":
-                    link_ids = self._linked_po_ids(connection, workspace_id, scope_id)
-                    rebuilt.update(link_ids)
+                    named = self._linked_po_ids(connection, workspace_id, scope_id)
                 else:
                     raise ValueError(f"unsupported dirty scope kind: {kind}")
+                pos_by_scope[cast(UUID, scope["id"])] = named
 
+            rebuilt: set[UUID] = set().union(*pos_by_scope.values())
             # One snapshot of the current documents for the whole batch (WI-PERF1, D98).
-            self._batch_snapshot = (
-                self._current_snapshot(connection, workspace_id) if len(rebuilt) > 1 else None
-            )
+            snapshot = self._current_snapshot(connection, workspace_id)
+            if sweep:
+                rebuilt.update(self._current_po_ids(snapshot))
+            self._batch_snapshot = snapshot if len(rebuilt) > 1 else None
             try:
-                results = [
-                    self.rebuild_po_connection(connection, workspace_id, po_id)
-                    for po_id in sorted(rebuilt, key=str)
-                ]
+                results, failed = self._rebuild_each(connection, workspace_id, rebuilt)
             finally:
                 self._batch_snapshot = None
-            if claimed:
+            processed = [scope_id for scope_id, named in pos_by_scope.items() if not named & failed]
+            if processed:
                 connection.execute(
                     sa.update(scopes)
-                    .where(scopes.c.id.in_([row["id"] for row in claimed]))
+                    .where(scopes.c.id.in_(processed))
                     .values(processed_at=sa.func.now(), claimed_at=sa.func.now())
                 )
             return {
                 "scopes": len(claimed),
+                "processed": len(processed),
+                "failed": len(failed),
                 "pos": len(results),
                 "changed": sum(bool(item["changed"]) for item in results),
                 "entries": sum(int(item["entries"]) for item in results),
             }
+
+    @requires("links.edit")
+    def sweep_connection(self, connection: Connection, workspace_id: UUID) -> dict[str, int]:
+        """Bring every current PO ledger up to its inputs inside the caller's transaction.
+
+        Equal to a full recompute: unchanged fingerprints write nothing (PD-0b-3). A PO
+        that fails is rolled back alone and reported.
+        """
+
+        snapshot = self._current_snapshot(connection, workspace_id)
+        self._batch_snapshot = snapshot
+        try:
+            results, failed = self._rebuild_each(
+                connection, workspace_id, set(self._current_po_ids(snapshot))
+            )
+        finally:
+            self._batch_snapshot = None
+        return {
+            "pos": len(results),
+            "failed": len(failed),
+            "changed": sum(bool(item["changed"]) for item in results),
+        }
+
+    @staticmethod
+    def _current_po_ids(snapshot: _CurrentSnapshot) -> list[UUID]:
+        return [
+            document_id
+            for document_id, (_row, document) in snapshot.by_document.items()
+            if document.header.doc_type is DocType.PO
+        ]
+
+    def _rebuild_each(
+        self, connection: Connection, workspace_id: UUID, po_ids: set[UUID]
+    ) -> tuple[list[dict[str, int | bool]], set[UUID]]:
+        results: list[dict[str, int | bool]] = []
+        failed: set[UUID] = set()
+        self._batch_inputs = (
+            self._prefetch_inputs(connection, workspace_id, po_ids) if len(po_ids) > 1 else None
+        )
+        try:
+            for po_id in sorted(po_ids, key=str):
+                try:
+                    with connection.begin_nested():
+                        results.append(self.rebuild_po_connection(connection, workspace_id, po_id))
+                except _PO_REBUILD_ERRORS:
+                    _LOGGER.exception("ledger_rebuild_failed po_document_id=%s", po_id)
+                    failed.add(po_id)
+        finally:
+            self._batch_inputs = None
+        return results, failed
+
+    def _prefetch_inputs(
+        self, connection: Connection, workspace_id: UUID, po_ids: set[UUID]
+    ) -> _BatchInputs:
+        """Read the per-PO inputs of a batch in a few queries instead of several per PO."""
+
+        pointer = metadata.tables["link_current"]
+        link = metadata.tables["link"]
+        ledger = metadata.tables["po_line_ledger"]
+        ids = sorted(po_ids, key=str)
+        links: dict[UUID, list[RowMapping]] = defaultdict(list)
+        for row in connection.execute(
+            sa.select(*link.c)
+            .select_from(
+                pointer.join(
+                    link,
+                    sa.and_(
+                        pointer.c.workspace_id == link.c.workspace_id,
+                        pointer.c.current_link_id == link.c.id,
+                    ),
+                )
+            )
+            .where(
+                pointer.c.workspace_id == workspace_id,
+                pointer.c.to_document_id.in_(ids),
+                pointer.c.link_type.in_(("inv_po", "grn_po")),
+                link.c.state.in_(_ACTIVE_LINK_STATES),
+                _deterministic_link(link),
+            )
+            # The per-PO order of _active_links within each PO.
+            .order_by(link.c.from_document_id, link.c.from_line_no, link.c.id)
+        ).mappings():
+            links[cast(UUID, row["to_document_id"])].append(row)
+        hashes: dict[UUID, set[str]] = defaultdict(set)
+        counts: dict[UUID, int] = defaultdict(int)
+        for stored in connection.execute(
+            sa.select(ledger.c.po_document_id, ledger.c.input_hash).where(
+                ledger.c.workspace_id == workspace_id, ledger.c.po_document_id.in_(ids)
+            )
+        ):
+            hashes[cast(UUID, stored.po_document_id)].add(str(stored.input_hash))
+            counts[cast(UUID, stored.po_document_id)] += 1
+        return _BatchInputs(
+            workspace_id=workspace_id,
+            links=dict(links),
+            ledger_hashes=dict(hashes),
+            ledger_counts=dict(counts),
+            exclusions=self._invoice_exclusions(connection, workspace_id),
+            mapping_config=self.mapping._mapping_config(connection, workspace_id),
+        )
 
     @staticmethod
     def _active_links(
@@ -649,6 +814,16 @@ class LedgerRebuildService:
             or 0
         )
         return {"lines": 0, "entries": 0, "changed": bool(removed)}
+
+    @staticmethod
+    def _is_workspace_po(connection: Connection, workspace_id: UUID, document_id: UUID) -> bool:
+        document = metadata.tables["document"]
+        doc_type = connection.scalar(
+            sa.select(document.c.doc_type).where(
+                document.c.workspace_id == workspace_id, document.c.id == document_id
+            )
+        )
+        return doc_type == DocType.PO.value
 
     @staticmethod
     def _merged_vendor_ids(
