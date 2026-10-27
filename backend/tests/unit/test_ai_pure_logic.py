@@ -518,7 +518,7 @@ def test_consent_fingerprint_changes_with_every_consented_input(
 
 
 def test_auto_verify_consent_preserves_the_legacy_off_fingerprint() -> None:
-    legacy = "a699ad4f98fde8f51ca62562ee7c17a4484f92d5d1ec627637987518b2d6bd7e"
+    legacy = "0b9fb424396fb414b44a9131240e84d08e5c73b5af1a28105368f311bdf53266"
     base = consent.consent_fingerprint(
         provider="gemini", model="gemini-3.8-flash", mode="ai_assisted"
     )

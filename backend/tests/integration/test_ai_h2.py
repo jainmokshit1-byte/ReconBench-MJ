@@ -48,6 +48,17 @@ from reconbench_app.settings import Settings
 from reconbench_core.version import ENGINE_VERSION
 from sqlalchemy.engine import Connection, Engine, make_url
 
+# D103 decision 7: H2–H4 are off in the product; this keeps the kept code tested
+LEGACY_HOOKS_BY_MODE: dict[str, tuple[str, ...]] = {
+    "ai_assisted": ("h1_extract:fallback", "h2_item", "h3_rerank", "h4_vendor"),
+    "ai_first": ("h1_extract:all_pdfs", "h2_item", "h3_rerank", "h4_vendor"),
+}
+
+
+@pytest.fixture(autouse=True)
+def _legacy_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("reconbench_app.ai.consent.HOOKS_BY_MODE", LEGACY_HOOKS_BY_MODE)
+
 SENTINEL_KEY = "AIzaSyD-synthetic-h2-key-000000000000000"
 MODEL = "gemini-3.8-flash"
 APPROVAL = "SYNTHETIC-TEST-APPROVAL-1"

@@ -111,23 +111,40 @@ class SettingsSnapshot:
         return self.reader_strategy
 
     @property
-    def vision_provider(self) -> str | None:
-        """The one provider that reads page images (``single``) or shadows (``shadow``)."""
+    def active_provider(self) -> str | None:
+        """The one active AI provider.
 
-        if self.reader_strategy == "off":
-            return "gemini" if self.vision_enabled else None
-        return self.primary_reader
+        rules_only/shadow -> None, single -> primary_reader, off -> provider.
+        """
+
+        if self.mode == "rules_only":
+            return None
+        if self.strategy == "shadow":
+            return None
+        if self.strategy == "single":
+            return self.primary_reader or self.provider or "gemini"
+        return self.provider
+
+    @property
+    def active_model(self) -> str | None:
+        """The model of the active provider (vllm -> vllm card model, gemini -> model)."""
+
+        if self.active_provider == "vllm":
+            return self.vllm.model if self.vllm else None
+        if self.active_provider == "gemini":
+            return self.model
+        return None
+
+    @property
+    def vision_provider(self) -> str | None:
+        return self.active_provider
 
     @property
     def vision_target(self) -> tuple[str | None, str | None]:
-        """``(provider, model)`` a vision request goes to; text hooks always use Gemini's."""
+        return self.target(VISION_HOOK)
 
-        if self.vision_provider == "vllm":
-            return "vllm", self.vllm.model if self.vllm else None
-        return self.provider, self.model
-
-    def target(self, hook: str | None) -> tuple[str | None, str | None]:
-        return self.vision_target if hook == VISION_HOOK else (self.provider, self.model)
+    def target(self, hook: str | None = None) -> tuple[str | None, str | None]:
+        return (self.active_provider, self.active_model)
 
     @property
     def hooks(self) -> tuple[str, ...]:
@@ -136,14 +153,14 @@ class SettingsSnapshot:
 
     @property
     def expected_fingerprint(self) -> str | None:
-        if self.provider is None or self.model is None:
+        if self.active_provider is None or self.active_model is None:
             return None
         return fingerprint_for(
-            provider=self.provider,
-            model=self.model,
+            provider=self.provider or "gemini",
+            model=self.model or "",
             mode=self.mode,
             reader_strategy=self.strategy,
-            primary_reader=self.vision_provider,
+            primary_reader=self.primary_reader,
             apply_mode=self.apply_mode,
             auto_verify_field_types=self.auto_verify_field_types,
             vllm_model=self.vllm.model if self.vllm else None,
@@ -331,16 +348,29 @@ def request_blocker(
     settings = load_settings(connection, request["workspace_id"])
     if settings is None or settings.version != int(request["settings_version"]):
         return BLOCK_SETTINGS_CHANGED
-    if request["call_kind"] == "provider_test" and request["provider"] == "vllm":
-        target: tuple[str | None, str | None] = (
-            "vllm",
-            settings.vllm.model if settings.vllm else None,
-        )
+    if request["call_kind"] == "provider_test":
+        if request["provider"] == "vllm":
+            target: tuple[str | None, str | None] = (
+                "vllm",
+                settings.vllm.model if settings.vllm else None,
+            )
+        elif request["provider"] == "gemini":
+            gemini_model = (
+                settings.gemini.model
+                if settings.gemini and settings.gemini.model
+                else settings.model
+            )
+            target = ("gemini", gemini_model)
+        else:
+            target = (None, None)
     else:
         target = settings.target(request["hook"])
     if target != (request["provider"], request["model"]) or target[0] != provider_name:
         return BLOCK_PROVIDER_CHANGED
     if request["call_kind"] == "hook":
+        card = settings.vllm if provider_name == "vllm" else settings.gemini
+        if card is not None and not card.enabled:
+            return BLOCK_PROVIDER_DISABLED
         if settings.mode == "rules_only" or settings.mode != request["mode"]:
             return BLOCK_AI_OFF
         if request["hook"] == VISION_HOOK and settings.strategy != (

@@ -58,21 +58,21 @@ KEYS = {
 }
 # Consent fingerprints of the vLLM single/shadow settings per vLLM prompt variant.
 VLLM_FINGERPRINTS = {
-    "qwen": {"vllm_shadow": "cb7d2ee11860635c871be31515e410ea5cbeb209713c208f3ecace15bd83c838"},
+    "qwen": {
+        "vllm_single": "17e3f93b40f2d705e1b45b01a26109b8c81acc8dba7dc7744d4b243e79ca14a2",
+        "vllm_shadow": "83dae0e64c8d5fefa7749d0f940811e93dee74c944bcd9e075ce50c877123983",
+    },
     "qwen_v5": {
-        "vllm_shadow": "e4eef8f4d1729e1341c90e01014f26108f54d01374cd98b0a8a3e80a8e549925",
-        "vllm_single": "9212c85d8feb917de1b2d599a36a26eeae0910bf7bf09e782df78d57f6c91608",
+        "vllm_single": "14bb16a653945bb79629c82f12f8b131b94112826c0054c217939d0221c8f68e",
     },
     "qwen_v6": {
-        "vllm_shadow": "7ee9e2814554acaff326788141b53dd059715d087904636286546e8e7c5eb50c",
-        "vllm_single": "32824ed7360463859f9346e6c31383078083c958c95775992b3ce26cf84db289",
+        "vllm_single": "c8c4c7f26fecc113fe28f72faf62e868ff3968f337067006e5ef889b1330359f",
     },
     "qwen_v7": {
-        "vllm_shadow": "8ea94862225d1a4743bb66ac80db75be108e91c42e13ac77454d14720948ee14",
-        "vllm_single": "14545b2fa353625c255faafbea01c75e430c4d6811daa95399732ce0d2fc5acf",
+        "vllm_single": "0786bc3915063e41839be065bd49018e41233eb1710f2161ecf4fc675a7de872",
     },
 }
-GEMINI_SHADOW = "bad2261b031ef22db213bfb8d51270b33c218ee8eb7db0ef84b98394ed0260ba"
+GEMINI_SHADOW = "9311d3f975a703a83dc9adee75a4990e7f3f90339496e8aab336729743614396"
 
 
 def _sha(text: str) -> str:
@@ -343,10 +343,9 @@ def test_only_the_vllm_fingerprints_follow_the_prompt_variant(
     variants = ("qwen", "qwen_v5", "qwen_v6", "qwen_v7")
     by_variant = {variant: vllm_variant(variant) for variant in variants}
     assert by_variant["qwen"] == current  # the reader is on v4.qwen again (D77)
-    for name in ("legacy", "off", "gemini_single", "gemini_shadow"):
+    for name in ("legacy", "off", "gemini_single", "gemini_shadow", "vllm_shadow"):
         assert len({item[name] for item in by_variant.values()}) == 1, name
-    for name in ("vllm_single", "vllm_shadow"):
-        assert len({item[name] for item in by_variant.values()}) == len(variants), name
+    assert len({item["vllm_single"] for item in by_variant.values()}) == len(variants)
     for variant, pins in VLLM_FINGERPRINTS.items():
         for name, value in pins.items():
             assert by_variant[variant][name] == value, (variant, name)

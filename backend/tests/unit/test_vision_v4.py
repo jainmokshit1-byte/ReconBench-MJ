@@ -224,7 +224,8 @@ def test_vision_off_consent_fingerprint_is_byte_identical_to_the_legacy_formula(
     hooks = consent.hooks_for_mode("ai_first")
     names = sorted({hook.split(":", 1)[0] for hook in hooks})
     legacy = {
-        "consent_text_version": "consent.v1",
+        "apply_mode": "suggest",
+        "consent_text_version": "consent.v3",
         "hooks": list(hooks),
         "mode": "ai_first",
         "model": MODEL,

@@ -90,8 +90,8 @@ class AiHookEnqueuer:
         settings = load_settings(connection, workspace_id)
         if (
             settings is None
-            or settings.provider is None
-            or settings.model is None
+            or settings.active_provider is None
+            or settings.active_model is None
             or not settings.consent_current
         ):
             return None

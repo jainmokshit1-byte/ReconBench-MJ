@@ -14,6 +14,7 @@ import pytest
 from reconbench_app.ai import runtime_checks
 from reconbench_app.ai.runtime_checks import (
     BLOCK_AI_OFF,
+    BLOCK_PROVIDER_CHANGED,
     ProviderConfig,
     SettingsSnapshot,
     fingerprint_for,
@@ -158,9 +159,9 @@ def _snapshot(strategy: str) -> SettingsSnapshot:
 @pytest.mark.parametrize(
     ("strategy", "shadow", "blocked"),
     [
-        ("shadow", True, None),
+        ("shadow", True, BLOCK_PROVIDER_CHANGED),
         ("single", True, BLOCK_AI_OFF),
-        ("shadow", False, BLOCK_AI_OFF),
+        ("shadow", False, BLOCK_PROVIDER_CHANGED),
         ("single", False, None),
     ],
 )
@@ -208,7 +209,7 @@ def test_shadow_consent_fingerprints_are_pinned() -> None:
             vllm_model=LOCAL_MODEL,
             vllm_base_url=URL,
         )
-        == "cb7d2ee11860635c871be31515e410ea5cbeb209713c208f3ecace15bd83c838"
+        == "83dae0e64c8d5fefa7749d0f940811e93dee74c944bcd9e075ce50c877123983"
     )
     assert (
         fingerprint_for(
@@ -218,5 +219,5 @@ def test_shadow_consent_fingerprints_are_pinned() -> None:
             reader_strategy="shadow",
             primary_reader="gemini",
         )
-        == "bad2261b031ef22db213bfb8d51270b33c218ee8eb7db0ef84b98394ed0260ba"
+        == "9311d3f975a703a83dc9adee75a4990e7f3f90339496e8aab336729743614396"
     )

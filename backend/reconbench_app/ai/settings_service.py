@@ -51,8 +51,8 @@ from reconbench_app.ai.redaction import REDACTION_VERSION
 from reconbench_app.ai.runtime_checks import (
     BLOCK_KEY_EXPIRED,
     BLOCK_KEY_NOT_SET,
+    BLOCK_PROVIDER_DISABLED,
     fingerprint_for,
-    load_key,
     load_provider_key,
     load_settings,
 )
@@ -441,10 +441,21 @@ class AiSettingsService:
         configs = self._configs(connection, workspace_id)
         vllm = configs.get("vllm")
         local_reader = strategy.primary_reader == "vllm"
+        active_provider = (
+            strategy.primary_reader if strategy.reader_strategy == "single"
+            else None if strategy.reader_strategy == "shadow"
+            else None if (row and row["mode"] == "rules_only")
+            else provider
+        )
+        active_model = (
+            (vllm["model"] if vllm else None) if active_provider == "vllm"
+            else model if active_provider == "gemini"
+            else None
+        )
         fingerprint = (
             fingerprint_for(
-                provider=provider,
-                model=model,
+                provider=active_provider or provider or "gemini",
+                model=model or "",
                 mode=mode,
                 reader_strategy=strategy.reader_strategy,
                 primary_reader=strategy.primary_reader,
@@ -453,7 +464,7 @@ class AiSettingsService:
                 vllm_model=vllm["model"] if vllm else None,
                 vllm_base_url=vllm["base_url"] if vllm else None,
             )
-            if provider and model and mode != "rules_only"
+            if mode != "rules_only" and active_provider and active_model
             else None
         )
         key = self._secret_view(
@@ -477,7 +488,7 @@ class AiSettingsService:
                 "text_version": consent_text_version(auto_verify_field_types=auto_verify_fields),
                 "required_fingerprint": fingerprint,
                 "text": consent_text(
-                    provider="Google Gemini",
+                    provider=active_provider or "gemini",
                     model=model or "the selected model",
                     auto_verify_field_types=auto_verify_fields,
                     reader_strategy=strategy.reader_strategy,
@@ -694,7 +705,10 @@ class AiSettingsService:
             return status("CONSENT_NEEDED", "Consent needed")
         if not settings.consent_current:
             return status("CONSENT_OUTDATED", "Consent outdated: review and consent again")
-        key = load_key(connection, settings, now)
+        active_provider = settings.active_provider
+        if active_provider is None:
+            return status("OFF", "Off: rules only")
+        key = load_provider_key(connection, settings, active_provider, now)
         if key == BLOCK_KEY_NOT_SET:
             event = self._last_key_event(connection, workspace_id)
             if event is not None and event["action"] == "ai.key_remove":
@@ -712,7 +726,10 @@ class AiSettingsService:
             return status("KEY_NOT_SET", "Key not set")
         if key == BLOCK_KEY_EXPIRED:
             return status("KEY_EXPIRED", "Key expired: the session ended or reached its time limit")
+        if key == BLOCK_PROVIDER_DISABLED:
+            return status("PROVIDER_DISABLED", "Provider disabled")
         assert not isinstance(key, str)
+        key_created_at = key.created_at if key is not None else None
         requests = ledger.REQUESTS
         recent = (
             connection.execute(
@@ -727,7 +744,11 @@ class AiSettingsService:
                 .where(
                     requests.c.workspace_id == workspace_id,
                     requests.c.finished_at.is_not(None),
-                    requests.c.created_at >= key.created_at,
+                    *(
+                        [requests.c.created_at >= key_created_at]
+                        if key_created_at is not None
+                        else []
+                    ),
                 )
                 .order_by(requests.c.finished_at.desc())
                 .limit(20)
@@ -757,11 +778,11 @@ class AiSettingsService:
             sa.select(sa.func.max(requests.c.finished_at)).where(
                 requests.c.workspace_id == workspace_id,
                 requests.c.call_kind == "provider_test",
-                requests.c.provider == settings.provider,
+                requests.c.provider == active_provider,
                 requests.c.settings_version == settings.version,
                 requests.c.request_state == "succeeded",
                 requests.c.apply_outcome == "applied",
-                requests.c.created_at >= key.created_at,
+                *([requests.c.created_at >= key_created_at] if key_created_at is not None else []),
             )
         )
         if passed_at is None:
@@ -842,8 +863,21 @@ class AiSettingsService:
             _Strategy(reader_strategy, primary_reader, apply_mode),
             vllm_ready=bool(vllm_model and vllm_base_url),
         )
+        if reader_strategy == "shadow":
+            raise AiSettingsError(
+                422,
+                "shadow_not_allowed",
+                "Shadow mode is not allowed",
+                "Shadow reader mode is not supported.",
+            )
         vision = reader_strategy == "single"
         local = primary_reader == "vllm"
+        active_provider = (
+            primary_reader if reader_strategy == "single"
+            else None if reader_strategy == "shadow"
+            else None if mode == "rules_only"
+            else "gemini"
+        )
         if any(field_type not in AUTO_VERIFY_FIELD_TYPES for field_type in auto_verify_field_types):
             raise AiSettingsError(
                 422,
@@ -859,11 +893,11 @@ class AiSettingsService:
         return {
             "mode": mode,
             "mode_label": MODE_LABELS.get(mode, mode),
-            "provider": "gemini",
+            "provider": active_provider or "gemini",
             "model": model,
             "text_version": consent_text_version(auto_verify_field_types=auto_verify_fields),
             "text": consent_text(
-                provider="Google Gemini",
+                provider=active_provider or "gemini",
                 model=model,
                 auto_verify_field_types=auto_verify_fields,
                 reader_strategy=reader_strategy,
@@ -872,7 +906,7 @@ class AiSettingsService:
                 vision_base_url=vllm_base_url if local else None,
             ),
             "fingerprint": fingerprint_for(
-                provider="gemini",
+                provider=active_provider or "gemini",
                 model=model,
                 mode=mode,
                 reader_strategy=reader_strategy,
@@ -925,6 +959,13 @@ class AiSettingsService:
             ) from None
 
     def _check_strategy(self, strategy: _Strategy, *, vllm_ready: bool) -> None:
+        if strategy.reader_strategy == "shadow":
+            raise AiSettingsError(
+                422,
+                "shadow_not_allowed",
+                "Shadow mode is not allowed",
+                "Shadow reader mode is not supported.",
+            )
         if strategy.apply_mode == "merge":
             raise AiSettingsError(
                 422,
@@ -1045,17 +1086,7 @@ class AiSettingsService:
                 or (gemini_update.model if gemini_update else None)
                 or (row["model"] if row else None)
             )
-            if (
-                gemini_update is not None
-                and gemini_update.enabled is False
-                and mode != "rules_only"
-            ):
-                raise AiSettingsError(
-                    422,
-                    "gemini_required",
-                    "Gemini is in use",
-                    "Text suggestions use Gemini. Switch to rules only to turn Gemini off.",
-                )
+            # gemini_required removed: inactive provider may be switched off.
             auto_verify_fields = tuple(
                 body.auto_verify_field_types
                 if body.auto_verify_field_types is not None
@@ -1133,10 +1164,41 @@ class AiSettingsService:
             )
             if strategy != current or vllm_update is not None:
                 self._check_strategy(strategy, vllm_ready=vllm_ready)
+            active_provider = (
+                strategy.primary_reader if strategy.reader_strategy == "single"
+                else None if strategy.reader_strategy == "shadow"
+                else None if mode == "rules_only"
+                else provider
+            )
+            if mode != "rules_only" and active_provider is not None:
+                if (
+                    active_provider == "gemini"
+                    and gemini_update is not None
+                    and gemini_update.enabled is False
+                ):
+                    raise AiSettingsError(
+                        422,
+                        "active_provider_in_use",
+                        "Active provider in use",
+                        "The active provider's connection cannot be disabled "
+                        "while AI assist is on.",
+                    )
+                if (
+                    active_provider == "vllm"
+                    and vllm_update is not None
+                    and vllm_update.enabled is False
+                ):
+                    raise AiSettingsError(
+                        422,
+                        "active_provider_in_use",
+                        "Active provider in use",
+                        "The active provider's connection cannot be disabled "
+                        "while AI assist is on.",
+                    )
             vision_on = strategy.reader_strategy == "single"
             fingerprint = (
                 fingerprint_for(
-                    provider=provider,
+                    provider=active_provider or provider or "gemini",
                     model=model,
                     mode=mode,
                     reader_strategy=strategy.reader_strategy,
@@ -1267,13 +1329,22 @@ class AiSettingsService:
                 or mode != "rules_only"
                 or key_changed
             ):
+                gemini_enabled = (
+                    gemini_update.enabled
+                    if gemini_update is not None and gemini_update.enabled is not None
+                    else (mode != "rules_only")
+                    if active_provider == "gemini"
+                    else bool(gemini_row["enabled"])
+                    if gemini_row is not None
+                    else (mode != "rules_only")
+                )
                 self._upsert_config(
                     connection,
                     actor,
                     gemini_row,
                     "gemini",
                     {
-                        "enabled": mode != "rules_only",
+                        "enabled": gemini_enabled,
                         "model": model,
                         **({"key_secret_id": new_secret} if key_changed else {}),
                         "limits": (
@@ -1336,6 +1407,12 @@ class AiSettingsService:
                         before_state=before_config,
                         after_state=after_config,
                     )
+            before_active_provider = (
+                current.primary_reader if current.reader_strategy == "single"
+                else None if current.reader_strategy == "shadow"
+                else None if (row and row["mode"] == "rules_only")
+                else (row["provider"] if row else None)
+            )
             if (strategy.reader_strategy, strategy.primary_reader) != (
                 current.reader_strategy,
                 current.primary_reader,
@@ -1354,6 +1431,16 @@ class AiSettingsService:
                         "reader_strategy": strategy.reader_strategy,
                         "primary_reader": strategy.primary_reader,
                     },
+                )
+            if before_active_provider != active_provider:
+                write_audit_event(
+                    connection,
+                    actor,
+                    action="ai.active_provider_change",
+                    target_type="ai_setting",
+                    target_id=after_row["id"],
+                    before_state={"active_provider": before_active_provider},
+                    after_state={"active_provider": active_provider},
                 )
             if strategy.apply_mode != current.apply_mode:
                 write_audit_event(
@@ -1489,10 +1576,17 @@ class AiSettingsService:
     def _public_state(row: Any, card: Any = None) -> dict[str, Any] | None:
         if row is None:
             return None
+        active_provider = (
+            row["primary_reader"] if row["reader_strategy"] == "single"
+            else None if row["reader_strategy"] == "shadow"
+            else None if row["mode"] == "rules_only"
+            else row["provider"]
+        )
         return {
             "version": int(row["version"]),
             "mode": row["mode"],
             "provider": row["provider"],
+            "active_provider": active_provider,
             "model": row["model"],
             "key_set": row["key_secret_id"] is not None
             or (card is not None and card["key_secret_id"] is not None),
@@ -1632,7 +1726,18 @@ class AiSettingsService:
                     )
                 test_model: str = vllm.model
             else:
-                if settings is None or settings.provider is None or settings.model is None:
+                gemini = settings.gemini if settings is not None else None
+                model = (
+                    gemini.model
+                    if gemini and gemini.model
+                    else (settings.model if settings else None)
+                )
+                gemini_configured = bool(
+                    settings is not None
+                    and (gemini and gemini.enabled or settings.provider == "gemini")
+                    and model is not None
+                )
+                if not gemini_configured or model is None:
                     raise AiSettingsError(
                         422,
                         "provider_required",
@@ -1646,7 +1751,7 @@ class AiSettingsService:
                         "External calls disabled",
                         "This deployment does not allow provider calls (RB_AI_EXTERNAL_CALLS).",
                     )
-                test_model = settings.model
+                test_model = model
             key = load_provider_key(connection, settings, provider, now)
             if isinstance(key, str):
                 raise AiSettingsError(

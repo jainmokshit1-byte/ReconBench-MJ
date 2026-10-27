@@ -462,7 +462,7 @@ def test_auto_verify_field_selection_is_opt_in_and_reconsented(harness: Harness)
     preview_response = harness.client.get("/api/v1/ai/consent-preview", params=params)
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
-    assert preview["text_version"] == "consent.v2"
+    assert preview["text_version"] == "consent.v4"
     assert preview["auto_verify_field_types"] == ["doc_no", "gstin"]
     assert "document number" in preview["text"] and "GSTIN" in preview["text"]
 
@@ -478,7 +478,7 @@ def test_auto_verify_field_selection_is_opt_in_and_reconsented(harness: Harness)
     assert saved.status_code == 200, saved.text
     assert saved.json()["auto_verify"]["field_types"] == ["doc_no", "gstin"]
     assert saved.json()["consent"]["current"] is True
-    assert saved.json()["consent"]["text_version"] == "consent.v2"
+    assert saved.json()["consent"]["text_version"] == "consent.v4"
 
     changed_again = harness.put({"auto_verify_field_types": ["doc_no"]})
     assert changed_again.status_code == 422
@@ -1092,3 +1092,140 @@ def test_health_heartbeat_marks_each_enabled_server_card(harness: Harness) -> No
     assert provider_health(harness.engine, narrowed, now) == 1
     assert calls == [f"{VLLM_URL}/models"]
     assert harness.get()["providers"][1]["health"]["ok"] is False
+
+
+def test_live_like_reconsent_flow(harness: Harness) -> None:
+    _vllm_gate(harness)
+    _enable(harness)
+    vllm_resp = harness.put({"providers": [_vllm_card()]})
+    assert vllm_resp.status_code == 200, vllm_resp.text
+    preview = _vllm_preview(harness)
+    harness.put(
+        {
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "consent": {"accept": True, "fingerprint": preview["fingerprint"]},
+        }
+    )
+    old_fingerprint = "0" * 64
+    with harness.engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "UPDATE ai_setting "
+                "SET consent_fingerprint = :fp, consent_text_version = 'consent.v2' "
+                "WHERE workspace_id = :w"
+            ),
+            {"fp": old_fingerprint, "w": harness.workspace_id},
+        )
+
+    view = harness.get()
+    assert view["status"]["code"] == "CONSENT_OUTDATED"
+    assert view["consent"]["current"] is False
+
+    preview_resp = harness.client.get(
+        "/api/v1/ai/consent-preview",
+        params={
+            "provider": "gemini",
+            "model": MODEL,
+            "mode": "ai_assisted",
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "vllm_model": VLLM_MODEL,
+            "vllm_base_url": VLLM_URL,
+        },
+    )
+    assert preview_resp.status_code == 200, preview_resp.text
+    preview_data = preview_resp.json()
+    assert preview_data["provider"] == "vllm"
+    assert [h["hook"] for h in preview_data["hooks"]] == ["h6_vision:fallback"]
+    assert "Google Gemini" not in preview_data["text"]
+    assert "company vLLM server" in preview_data["text"]
+    assert VLLM_URL in preview_data["text"]
+    assert VLLM_MODEL in preview_data["text"]
+    assert "No other provider receives data" in preview_data["text"]
+
+    put_resp = harness.put(
+        {
+            "mode": "ai_assisted",
+            "provider": "gemini",
+            "model": MODEL,
+            "consent": {"accept": True, "fingerprint": preview_data["fingerprint"]},
+        }
+    )
+    assert put_resp.status_code == 200, put_resp.text
+    updated = put_resp.json()
+    assert updated["consent"]["current"] is True
+    assert updated["reader_strategy"] == "single"
+    assert updated["primary_reader"] == "vllm"
+    assert updated["status"]["code"] != "CONSENT_OUTDATED"
+
+
+def test_settings_switch_vllm_gemini_vllm_and_shadow_refused(harness: Harness) -> None:
+    _vllm_gate(harness)
+    _enable(harness)
+    harness.put({"providers": [_vllm_card()]})
+
+    # Switch to vLLM reader with consent
+    vllm_prev = _vllm_preview(harness)
+    harness.put(
+        {
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "consent": {"accept": True, "fingerprint": vllm_prev["fingerprint"]},
+        }
+    )
+    assert harness.get()["primary_reader"] == "vllm"
+
+    # Switch vLLM -> Gemini with consent
+    gemini_prev = harness.client.get(
+        "/api/v1/ai/consent-preview",
+        params={
+            "mode": "ai_assisted",
+            "model": MODEL,
+            "reader_strategy": "single",
+            "primary_reader": "gemini",
+        },
+    ).json()
+    assert gemini_prev["provider"] == "gemini"
+    assert "Google Gemini" in gemini_prev["text"]
+    harness.put(
+        {
+            "reader_strategy": "single",
+            "primary_reader": "gemini",
+            "consent": {"accept": True, "fingerprint": gemini_prev["fingerprint"]},
+        }
+    )
+    assert harness.get()["primary_reader"] == "gemini"
+
+    # Switch Gemini -> vLLM with consent
+    vllm_prev2 = _vllm_preview(harness)
+    assert vllm_prev2["provider"] == "vllm"
+    harness.put(
+        {
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "consent": {"accept": True, "fingerprint": vllm_prev2["fingerprint"]},
+        }
+    )
+    assert harness.get()["primary_reader"] == "vllm"
+
+    # Shadow -> 422 shadow_not_allowed on consent-preview
+    shadow_prev = harness.client.get(
+        "/api/v1/ai/consent-preview",
+        params={
+            "mode": "ai_assisted",
+            "model": MODEL,
+            "reader_strategy": "shadow",
+            "primary_reader": "vllm",
+            "vllm_model": VLLM_MODEL,
+            "vllm_base_url": VLLM_URL,
+        },
+    )
+    assert shadow_prev.status_code == 422
+    assert shadow_prev.json()["code"] == "shadow_not_allowed"
+
+    # Shadow -> 422 shadow_not_allowed on PUT
+    shadow_put = harness.put({"reader_strategy": "shadow", "primary_reader": "vllm"})
+    assert shadow_put.status_code == 422
+    assert shadow_put.json()["code"] == "shadow_not_allowed"
+

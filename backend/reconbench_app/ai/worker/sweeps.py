@@ -19,6 +19,7 @@ from reconbench_app.ai.endpoint_policy import EndpointNotAllowed
 from reconbench_app.ai.fixtures import PROVIDER_TEST
 from reconbench_app.ai.limits import AiLimits, LimitsState
 from reconbench_app.ai.redaction import REDACTION_VERSION
+from reconbench_app.ai.runtime_checks import load_settings
 from reconbench_app.db.metadata import metadata
 
 _LOGGER = logging.getLogger(__name__)
@@ -121,18 +122,11 @@ def gemini_health(
     """
 
     configs = metadata.tables["ai_provider_config"]
-    settings = metadata.tables["ai_setting"]
     with engine.connect() as connection:
         cards = (
             connection.execute(
                 sa.select(
                     configs.c.workspace_id,
-                    settings.c.mode,
-                    settings.c.model,
-                    settings.c.version,
-                )
-                .select_from(
-                    configs.join(settings, settings.c.workspace_id == configs.c.workspace_id)
                 )
                 .where(
                     configs.c.provider == "gemini",
@@ -140,12 +134,6 @@ def gemini_health(
                         configs.c.connected_at.is_not(None),
                         configs.c.last_error_code.is_not(None),
                     ),
-                    sa.or_(
-                        configs.c.key_secret_id.is_not(None),
-                        settings.c.key_secret_id.is_not(None),
-                    ),
-                    settings.c.provider == "gemini",
-                    settings.c.model.is_not(None),
                     sa.or_(
                         configs.c.last_health_at.is_(None),
                         configs.c.last_health_at <= now - every,
@@ -158,6 +146,14 @@ def gemini_health(
     ran = 0
     hour = now.astimezone(UTC).strftime("%Y%m%dT%H")
     for card in cards:
+        with engine.begin() as connection:
+            settings = load_settings(connection, card["workspace_id"])
+            if (
+                settings is None
+                or settings.active_provider != "gemini"
+                or settings.active_model is None
+            ):
+                continue
         with engine.begin() as connection:
             recent = connection.scalar(
                 sa.select(sa.func.count())
@@ -178,15 +174,15 @@ def gemini_health(
                     workspace_id=card["workspace_id"],
                     call_kind="provider_test",
                     hook=None,
-                    mode=str(card["mode"]),
+                    mode=settings.mode,
                     subject_type="fixture",
                     subject_id=None,
                     subject_version=hour,
                     operation_key=f"{connection_state.HEALTH_PREFIX}gemini:{hour}",
-                    settings_version=int(card["version"]),
+                    settings_version=settings.version,
                     consent_fingerprint=None,
                     provider="gemini",
-                    model=str(card["model"]),
+                    model=settings.active_model,
                     prompt_version=PROVIDER_TEST.fixture_id,
                     schema_version=SCHEMA_VERSIONS["provider_test"],
                     redaction_version=REDACTION_VERSION,

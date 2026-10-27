@@ -51,6 +51,7 @@ AuditAction = Literal[
     "ai.provider_rotate",
     "ai.reader_strategy_change",
     "ai.apply_mode_change",
+    "ai.active_provider_change",
     "ai.manage_denied",
     "document.correct",
     "document.duplicate_held",

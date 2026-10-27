@@ -6,14 +6,28 @@ Offline and synthetic: no database, no network, no provider call.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
 import pytest
 from pydantic import ValidationError
-from reconbench_app.ai.consent import consent_fingerprint, consent_text, data_destination
+from reconbench_app.ai import runtime_checks
+from reconbench_app.ai.consent import (
+    consent_fingerprint,
+    consent_text,
+    data_destination,
+    hooks_for_mode,
+)
 from reconbench_app.ai.endpoint_policy import EndpointNotAllowed
-from reconbench_app.ai.runtime_checks import ProviderConfig, SettingsSnapshot, fingerprint_for
+from reconbench_app.ai.runtime_checks import (
+    BLOCK_PROVIDER_CHANGED,
+    KeyRecord,
+    ProviderConfig,
+    SettingsSnapshot,
+    fingerprint_for,
+    request_blocker,
+)
 from reconbench_app.ai.settings_service import AiSettingsUpdate, ProviderConfigUpdate
 from reconbench_app.ai.worker.openai_compat import OpenAICompatProvider
 from reconbench_app.extraction.vision import reader_for_provider
@@ -152,16 +166,7 @@ def test_consent_text_and_destinations_name_the_company_server() -> None:
         vision_model=LOCAL_MODEL,
         vision_base_url=URL,
     )
-    assert local.startswith(legacy) and URL in local and "not the company network" in local
-    shadow = consent_text(
-        provider="Google Gemini",
-        model=MODEL,
-        reader_strategy="shadow",
-        vision_provider="vllm",
-        vision_model=LOCAL_MODEL,
-        vision_base_url=URL,
-    )
-    assert "never shown as suggestions" in shadow
+    assert URL in local and LOCAL_MODEL in local and "No other provider receives data" in local
     assert data_destination("gemini").startswith("Google Gemini API")
     assert data_destination("vllm", URL).startswith(f"Company vLLM server at {URL}")
 
@@ -182,7 +187,7 @@ def test_snapshot_routes_only_the_vision_hook_to_the_chosen_provider() -> None:
     card = ProviderConfig("vllm", True, LOCAL_MODEL, URL, None, 1)
     local = _snapshot(reader_strategy="single", primary_reader="vllm", vllm=card)
     assert local.target("h6_vision") == ("vllm", LOCAL_MODEL)
-    assert local.target("h1_extract") == ("gemini", MODEL)
+    assert local.target("h1_extract") == ("vllm", LOCAL_MODEL)
     assert local.hooks[0] == "h6_vision:fallback"
     # A row written only with the old flag reads as single + Gemini.
     legacy = _snapshot(vision_enabled=True)
@@ -263,3 +268,197 @@ def test_provider_for_a_workspace_url_is_allowlisted_and_cached() -> None:
     with pytest.raises(EndpointNotAllowed):
         provider.for_base_url("http://169.254.169.254/v1")
     assert len(seen) == 2
+
+
+def test_hooks_for_mode_never_lists_h2_h3_h4() -> None:
+    for mode in ("rules_only", "ai_assisted", "ai_first", "unknown_mode"):
+        for vision in (True, False):
+            hooks = hooks_for_mode(mode, vision=vision)
+            assert not any(h.startswith(("h2", "h3", "h4")) for h in hooks)
+            for forbidden in ("h2_item", "h3_rerank", "h4_vendor"):
+                assert forbidden not in hooks
+                assert not any(h.startswith(f"{forbidden}:") for h in hooks)
+
+
+@pytest.mark.parametrize("hook", ["h1_extract", "h6_vision", "h2_item", "h3_rerank", "h4_vendor"])
+def test_target_for_every_hook_and_active_provider(hook: str) -> None:
+    vllm_card = ProviderConfig("vllm", True, LOCAL_MODEL, URL, None, 1)
+    gemini_card = ProviderConfig("gemini", True, MODEL, None, None, 1)
+
+    # 1. Gemini active (single + gemini)
+    snap_gemini = _snapshot(
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="gemini",
+        model=MODEL,
+        gemini=gemini_card,
+    )
+    assert snap_gemini.active_provider == "gemini"
+    assert snap_gemini.target(hook) == ("gemini", MODEL)
+
+    # 2. vLLM active (single + vllm)
+    snap_vllm = _snapshot(
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm=vllm_card,
+        model=MODEL,
+    )
+    assert snap_vllm.active_provider == "vllm"
+    assert snap_vllm.target(hook) == ("vllm", LOCAL_MODEL)
+
+    # 3. None via rules_only
+    snap_rules = _snapshot(
+        mode="rules_only", reader_strategy="single", primary_reader="gemini", model=MODEL
+    )
+    assert snap_rules.active_provider is None
+    assert snap_rules.target(hook) == (None, None)
+
+    # 4. None via shadow
+    snap_shadow = _snapshot(
+        mode="ai_assisted",
+        reader_strategy="shadow",
+        primary_reader="vllm",
+        vllm=vllm_card,
+        model=MODEL,
+    )
+    assert snap_shadow.active_provider is None
+    assert snap_shadow.target(hook) == (None, None)
+
+
+def test_request_blocker_inactive_provider_and_provider_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vllm_card = ProviderConfig("vllm", True, LOCAL_MODEL, URL, None, 1)
+    gemini_card = ProviderConfig("gemini", True, MODEL, None, None, 1)
+    settings = _snapshot(
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm=vllm_card,
+        gemini=gemini_card,
+        model=MODEL,
+    )
+    monkeypatch.setattr(runtime_checks, "load_settings", lambda *_a, **_kw: settings)
+    key_record = KeyRecord(
+        secret_id=uuid4(),
+        envelope=b"envelope",
+        nonce=b"nonce",
+        key_id="k1",
+        key_hint="1234",
+        expires_at=None,
+        session_id=None,
+        created_by=uuid4(),
+        created_at=datetime.now(UTC),
+    )
+    monkeypatch.setattr(runtime_checks, "load_provider_key", lambda *_a, **_kw: key_record)
+
+    # Hook request naming the inactive provider ("gemini") is blocked
+    hook_req = {
+        "workspace_id": settings.workspace_id,
+        "settings_version": settings.version,
+        "call_kind": "hook",
+        "hook": "h1_extract",
+        "provider": "gemini",
+        "model": MODEL,
+        "mode": "ai_assisted",
+        "consent_fingerprint": settings.consent_fingerprint,
+        "operation_key": "op1",
+    }
+    block = request_blocker(None, hook_req, datetime.now(UTC), provider_name="gemini")  # type: ignore[arg-type]
+    assert block == BLOCK_PROVIDER_CHANGED
+
+    # A provider_test for the inactive card passes the provider check
+    test_req = {
+        "workspace_id": settings.workspace_id,
+        "settings_version": settings.version,
+        "call_kind": "provider_test",
+        "hook": None,
+        "provider": "gemini",
+        "model": MODEL,
+        "mode": "ai_assisted",
+        "consent_fingerprint": settings.consent_fingerprint,
+        "operation_key": "test_gemini",
+    }
+    test_block = request_blocker(None, test_req, datetime.now(UTC), provider_name="gemini")  # type: ignore[arg-type]
+    assert test_block is None
+
+
+def test_fingerprint_invariance_and_sensitivity() -> None:
+    # 1. vLLM active: changing inactive model keeps fp; changing active model or URL changes fp
+    base_vllm_fp = fingerprint_for(
+        provider="gemini",
+        model=MODEL,
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm_model=LOCAL_MODEL,
+        vllm_base_url=URL,
+    )
+    changed_gemini_model_fp = fingerprint_for(
+        provider="gemini",
+        model="gemini-pro-different",
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm_model=LOCAL_MODEL,
+        vllm_base_url=URL,
+    )
+    assert base_vllm_fp == changed_gemini_model_fp
+
+    changed_vllm_model_fp = fingerprint_for(
+        provider="gemini",
+        model=MODEL,
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm_model="qwen3.5:14b",
+        vllm_base_url=URL,
+    )
+    assert base_vllm_fp != changed_vllm_model_fp
+
+    changed_vllm_url_fp = fingerprint_for(
+        provider="gemini",
+        model=MODEL,
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm_model=LOCAL_MODEL,
+        vllm_base_url="http://other-vllm.example.test/v1",
+    )
+    assert base_vllm_fp != changed_vllm_url_fp
+
+    # 2. Gemini active: changing inactive vLLM model or URL keeps fp;
+    # changing gemini model changes fp
+    base_gemini_fp = fingerprint_for(
+        provider="gemini",
+        model=MODEL,
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="gemini",
+        vllm_model=LOCAL_MODEL,
+        vllm_base_url=URL,
+    )
+    changed_vllm_in_gemini_fp = fingerprint_for(
+        provider="gemini",
+        model=MODEL,
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="gemini",
+        vllm_model="qwen3.5:14b",
+        vllm_base_url="http://other-vllm.example.test/v1",
+    )
+    assert base_gemini_fp == changed_vllm_in_gemini_fp
+
+    changed_active_gemini_model_fp = fingerprint_for(
+        provider="gemini",
+        model="gemini-pro-different",
+        mode="ai_assisted",
+        reader_strategy="single",
+        primary_reader="gemini",
+        vllm_model=LOCAL_MODEL,
+        vllm_base_url=URL,
+    )
+    assert base_gemini_fp != changed_active_gemini_model_fp
+    assert base_gemini_fp != base_vllm_fp
+

@@ -269,3 +269,90 @@ def test_vision_sourced_value_is_never_verified_by_its_own_reading() -> None:
     doc_no = result.document.header.doc_no
     assert doc_no is not None and doc_no.confidence is not None
     assert doc_no.confidence < Decimal("0.98")
+
+
+# --- AI HOOK & ROUTING GUARDS (PD-3a / PD-1a) -----------------------------------------------
+
+
+def test_hard_zero_no_mode_lists_h2_h3_h4() -> None:
+    from reconbench_app.ai.consent import HOOKS_BY_MODE, hooks_for_mode
+
+    forbidden = ("h2_item", "h3_rerank", "h4_vendor")
+    for mode in ("rules_only", "ai_assisted", "ai_first"):
+        for vision in (False, True):
+            hooks = hooks_for_mode(mode, vision=vision)
+            assert not any(any(h.startswith(f) for f in forbidden) for h in hooks)
+
+    for _mode, hook_tuple in HOOKS_BY_MODE.items():
+        assert not any(any(h.startswith(f) for f in forbidden) for h in hook_tuple)
+
+
+def test_hard_zero_target_never_returns_inactive_provider() -> None:
+    from reconbench_app.ai.runtime_checks import ProviderConfig, SettingsSnapshot
+
+    vllm = ProviderConfig("vllm", True, "qwen3.5:9b", "http://vllm.example.test/v1", None, 1)
+    gemini = ProviderConfig("gemini", True, "gemini-3.8-flash", None, None, 1)
+
+    # vLLM active -> Gemini is inactive, target() must NEVER return gemini
+    vllm_snap = SettingsSnapshot(
+        workspace_id=uuid4(),
+        mode="ai_assisted",
+        provider="gemini",
+        model="gemini-3.8-flash",
+        version=1,
+        consent_given=True,
+        consent_fingerprint="fp",
+        key_secret_id=None,
+        key_storage="saved",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm=vllm,
+        gemini=gemini,
+    )
+    for hook in ("h1_extract", "h6_vision", "h2_item", "h3_rerank", "h4_vendor"):
+        target_provider, _ = vllm_snap.target(hook)
+        assert target_provider != "gemini"
+        assert target_provider == "vllm"
+
+    # Gemini active -> vLLM is inactive, target() must NEVER return vllm
+    gemini_snap = SettingsSnapshot(
+        workspace_id=uuid4(),
+        mode="ai_assisted",
+        provider="gemini",
+        model="gemini-3.8-flash",
+        version=1,
+        consent_given=True,
+        consent_fingerprint="fp",
+        key_secret_id=None,
+        key_storage="saved",
+        reader_strategy="single",
+        primary_reader="gemini",
+        vllm=vllm,
+        gemini=gemini,
+    )
+    for hook in ("h1_extract", "h6_vision", "h2_item", "h3_rerank", "h4_vendor"):
+        target_provider, _ = gemini_snap.target(hook)
+        assert target_provider != "vllm"
+        assert target_provider == "gemini"
+
+    # rules_only -> target() must return (None, None)
+    rules_snap = SettingsSnapshot(
+        workspace_id=uuid4(),
+        mode="rules_only",
+        provider="gemini",
+        model="gemini-3.8-flash",
+        version=1,
+        consent_given=True,
+        consent_fingerprint="fp",
+        key_secret_id=None,
+        key_storage="saved",
+        reader_strategy="single",
+        primary_reader="vllm",
+        vllm=vllm,
+        gemini=gemini,
+    )
+    for hook in ("h1_extract", "h6_vision", "h2_item", "h3_rerank", "h4_vendor"):
+        target_provider, target_model = rules_snap.target(hook)
+        assert target_provider is None
+        assert target_model is None
+

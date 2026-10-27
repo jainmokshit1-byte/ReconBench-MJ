@@ -553,9 +553,31 @@ def test_a_pending_rotation_is_discarded_by_disconnect(harness: Harness) -> None
 # ---- health --------------------------------------------------------------------------------
 
 
+def _make_gemini_active(h: Harness) -> None:
+    with h.engine.begin() as connection:
+        user_id = connection.scalar(
+            sa.text("SELECT id FROM app_user WHERE workspace_id = :w LIMIT 1"),
+            {"w": h.workspace_id},
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO ai_setting (id, workspace_id, mode, provider, model, consent_given, "
+                "consent_fingerprint, consent_by, consent_at, consent_text_version, "
+                "version, reader_strategy) "
+                "VALUES (gen_random_uuid(), :w, 'ai_assisted', 'gemini', 'gemini-3.8-flash', "
+                "true, :fp, :u, now(), 'consent.v3', 1, 'off') "
+                "ON CONFLICT (workspace_id) DO UPDATE SET mode = 'ai_assisted', "
+                "provider = 'gemini', model = 'gemini-3.8-flash', consent_given = true, "
+                "reader_strategy = 'off'"
+            ),
+            {"w": h.workspace_id, "u": user_id, "fp": "0" * 64},
+        )
+
+
 def test_gemini_health_runs_at_most_hourly_and_flips_the_status_in_one_cycle(
     harness: Harness,
 ) -> None:
+    _make_gemini_active(harness)
     _gemini_run(harness, _connect_gemini(harness).json()["request_id"], OK)
     failing = ScriptedProvider([ProviderFailure("PROVIDER_UNAVAILABLE", delivery="responded")])
     runner = harness.runner(failing)
@@ -588,6 +610,7 @@ def test_gemini_health_runs_at_most_hourly_and_flips_the_status_in_one_cycle(
 
 
 def test_health_never_makes_a_never_tested_card_connected(harness: Harness) -> None:
+    _make_gemini_active(harness)
     _connect_gemini(harness)  # saved, never tested
     provider = ScriptedProvider([OK])
     assert gemini_health(harness.engine, harness.runner(provider).run, datetime.now(UTC)) == 0
