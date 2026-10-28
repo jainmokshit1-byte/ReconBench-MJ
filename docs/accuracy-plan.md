@@ -1640,12 +1640,12 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 #### PD-2a — AI origin and provenance (fixes F1; folds MG-1) — blocks any AI value becoming current
 - **Description:** add `FieldOrigin.AI`; `origin_for` maps `ai_first`/`ai_fallback` to it (today → `ocr`); the reference system check keeps accepting only `ocr`/`erp_import`, so an AI value is never system-checked; per-field provenance (provider, model, prompt, `ai_request_id`, page, box).
 - **Files:** `reconbench_core/schema/__init__.py`, `backend/reconbench_app/ingestion.py`, `reconbench_core/mapping/links.py`.
-- **Acceptance:** scenario "AI-origin PO ref, confidence 1.0, same-vendor open PO, matching amount ⇒ suggested, never auto"; property: no AI-origin field is ever `system_check`. **Status:** pending (step 3).
+- **Acceptance:** scenario "AI-origin PO ref, confidence 1.0, same-vendor open PO, matching amount ⇒ suggested, never auto"; property: no AI-origin field is ever `system_check`. **Status:** done (D104; live 29 Oct 2026, tag live-20261029-b3).
 
 #### PD-2b — Verification-aware data gate (fixes F2; is P2)
 - **Description:** (1) the gate treats a `user`-verified field as confidence 1.0 and a corrected field as verified, so the F2 "0" case disappears; (2) any critical field with origin AI and verification ≠ `user` makes the case Needs review with a new reason (`AI_VALUE_UNVERIFIED`), whatever its confidence; (3) "Save and mark reviewed" marks every displayed critical field `user`-verified (P2), audited.
 - **Files:** `reconbench_core/schema/__init__.py` or `recon/engine.py`, `ReasonCode`, `backend/reconbench_app/ingestion.py`, the review surfaces. Engine version + rules hash bump.
-- **Acceptance:** an AI-read invoice reaches Matched only after a person verifies its critical fields and its links are confirmed (or auto from person-verified refs); rules-read verdicts unchanged except the F2 cases, listed in the change note. **Status:** pending (step 3).
+- **Acceptance:** an AI-read invoice reaches Matched only after a person verifies its critical fields and its links are confirmed (or auto from person-verified refs); rules-read verdicts unchanged except the F2 cases, listed in the change note. **Status:** done (D104; live 29 Oct 2026, tag live-20261029-b3).
 
 #### PD-2c — Settings switch for scanned invoices (D103 decision 2; replaces the per-upload method choice)
 - **Description:** one workspace setting "Scanned invoices: read with rules / read with AI", default rules, admin only, audited. Digital vs scanned stays automatic per page; a PDF with any scanned page counts as scanned. The **method actually used is stored per version** in its own column (it survives a person's save, F9) and is shown on the document page and in the Excel export (Q13). PO/GRN files and XML/CSV are always rules (Q5). The switch can be set to AI only when the active provider passed PD-1b.
@@ -1681,7 +1681,7 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 - **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** pending (step 5).
 
 #### PD-4d — Verify AI-read fields (UI part of PD-2b)
-- **Description:** side by side AI value / OCR cross-check / page box; "Verify" per field and "Verify all" only where the AI and OCR values agree (Q8), with a count. **Deps:** PD-2b. **Status:** pending (step 3).
+- **Description:** side by side AI value / OCR cross-check / page box; "Verify" per field and "Verify all" only where the AI and OCR values agree (Q8), with a count. **Deps:** PD-2b. **Status:** done (D104; live 29 Oct 2026, tag live-20261029-b3).
 
 #### PD-5a — End to end on a throwaway copy of live
 - **Description:** every scenario of the audit's §8 by clicking on a throwaway copy; web changes applied in one step after the gate. **Acceptance:** hard zeros 0; 0 `ai_request` for rules-read documents and from mapping/reconciliation; requests only to the active provider. **Status:** pending (step 7).
