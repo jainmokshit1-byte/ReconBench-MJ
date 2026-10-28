@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 seed_module = import_module("reconbench_app.db.seed")
+REASON_CODES = import_module("reconbench_app.db.seed_data").REASON_CODES
 BootstrapSettings = seed_module.BootstrapSettings
 seed_database = seed_module.seed_database
 
@@ -34,9 +35,10 @@ def main() -> int:
         engine.dispose()
     for table_name, count in counts.items():
         print(f"{table_name}: {count}")
-    if counts["reason_code"] != 28 or counts["config_active"] != 1:
+    if counts["reason_code"] != len(REASON_CODES) or counts["config_active"] != 1:
         raise RuntimeError(
-            "seed verification failed: expected 28 reason codes and active config seq 1"
+            f"seed verification failed: expected {len(REASON_CODES)} reason codes "
+            "and active config seq 1"
         )
     if counts["ai_setting"] != 0:
         raise RuntimeError(

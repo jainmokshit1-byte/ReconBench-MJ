@@ -36,7 +36,10 @@ from reconbench_core.schema import (
     DocLine,
     DocType,
     Document,
+    FieldOrigin,
+    FieldSource,
     FieldValue,
+    FieldVerification,
     InvoiceHeader,
     LineResult,
     LineType,
@@ -138,6 +141,74 @@ def _taxable(document: Document) -> Decimal | None:
 
 def _grand_total(document: Document) -> Decimal | None:
     return _decimal(_value(document.header.grand_total))
+
+
+def _field_values(document: Document) -> tuple[tuple[str, FieldValue[object]], ...]:
+    """Every header and line value, named the way a person sees it."""
+
+    values = [
+        (name, value)
+        for name in type(document.header).model_fields
+        if isinstance(value := getattr(document.header, name), FieldValue)
+    ]
+    values.extend(
+        (f"line {line.line_no} {name}", value)
+        for line in document.lines
+        for name in type(line).model_fields
+        if isinstance(value := getattr(line, name), FieldValue)
+    )
+    return tuple(values)
+
+
+def _read_by_ai(field: FieldValue[object]) -> bool:
+    # The same rule as for references (PD-2a): its origin or its source says AI.
+    return field.origin is FieldOrigin.AI or field.source is FieldSource.AI
+
+
+def _checked_by_a_person(field: FieldValue[object]) -> bool:
+    """A value a person verified, or typed in as a correction (PD-2b)."""
+
+    return field.verification is FieldVerification.USER or (
+        field.source is FieldSource.MANUAL and not _read_by_ai(field)
+    )
+
+
+def _gate_confidence(document: Document) -> Decimal | None:
+    """The extraction gate's confidence: ``Document.confidence`` with a person's work counted.
+
+    A value a person checked counts as certain. A corrected value has no confidence of
+    its own, so an invoice whose vendor or lines a person typed in stayed at 0 for ever
+    (F2, PD-2b).
+    """
+
+    def certain(field: object) -> object:
+        if isinstance(field, FieldValue) and _checked_by_a_person(field):
+            return field.model_copy(update={"confidence": Decimal("1")})
+        return field
+
+    header = document.header.model_copy(
+        update={
+            name: certain(getattr(document.header, name))
+            for name in type(document.header).model_fields
+        }
+    )
+    lines = tuple(
+        line.model_copy(
+            update={name: certain(getattr(line, name)) for name in type(line).model_fields}
+        )
+        for line in document.lines
+    )
+    return document.model_copy(update={"header": header, "lines": lines}).confidence
+
+
+def _unverified_ai_values(document: Document) -> tuple[str, ...]:
+    """The values read by AI that no person has verified, whatever their confidence."""
+
+    return tuple(
+        name
+        for name, value in _field_values(document)
+        if _read_by_ai(value) and value.verification is not FieldVerification.USER
+    )
 
 
 def _duplicate_number_key(value: str) -> str:
@@ -1190,8 +1261,10 @@ def evaluate(
     works: list[_LineWork] = []
     case_header_checks: dict[UUID, list[CheckResult]] = {item.document_id: [] for item in invoices}
     case_reasons: dict[UUID, list[ReasonCode]] = {item.document_id: [] for item in invoices}
+    gate_confidence = {item.document_id: _gate_confidence(item.document) for item in invoices}
+    unverified_ai = {item.document_id: _unverified_ai_values(item.document) for item in invoices}
     for invoice in invoices:
-        confidence = invoice.document.confidence
+        confidence = gate_confidence[invoice.document_id]
         # An unreadable scan is reported as such; its missing PO link is a symptom.
         unreadable = ReasonCode.NO_TEXT_LAYER in invoice.document.reason_codes
         # An invoice split out of a multi-document file waits for the split to be accepted.
@@ -1219,6 +1292,23 @@ def evaluate(
                 )
             )
             case_reasons[invoice.document_id].append(gate_code)
+        if unverified_ai[invoice.document_id]:
+            # A value read by AI counts only after a person verifies it (PD-2b).
+            case_header_checks[invoice.document_id].append(
+                _make_check(
+                    "s1.ai_values_verified",
+                    CheckOutcome.REVIEW,
+                    code=ReasonCode.AI_VALUE_UNVERIFIED,
+                    level=ReasonLevel.REVIEW,
+                    expected=Decimal("0"),
+                    actual=Decimal(len(unverified_ai[invoice.document_id])),
+                    evidence={
+                        "message": "Values read by AI count only after a person verifies them.",
+                        "fields": list(unverified_ai[invoice.document_id]),
+                    },
+                )
+            )
+            case_reasons[invoice.document_id].append(ReasonCode.AI_VALUE_UNVERIFIED)
         duplicate_id = exact_duplicates.get(invoice.document_id)
         if duplicate_id is not None:
             case_header_checks[invoice.document_id].append(
@@ -1635,6 +1725,7 @@ def evaluate(
         invoice_works = [work for work in works if work.invoice.document_id == invoice.document_id]
         header_checks = case_header_checks[invoice.document_id]
         reason_codes = list(case_reasons[invoice.document_id])
+        confidence = gate_confidence[invoice.document_id]
         line_results: list[LineResult] = []
         for work in sorted(invoice_works, key=lambda item: item.line.line_no):
             reasons = list(work.reasons)
@@ -1648,8 +1739,9 @@ def evaluate(
                     work.alignment.state if work.alignment else AlignmentState.NOT_ON_PO
                 )
                 low_confidence = (
-                    invoice.document.confidence is None
-                    or invoice.document.confidence < config.extraction_gate
+                    confidence is None
+                    or confidence < config.extraction_gate
+                    or bool(unverified_ai[invoice.document_id])
                     or work.link is None
                     or (
                         work.link.state is not LinkState.CONFIRMED

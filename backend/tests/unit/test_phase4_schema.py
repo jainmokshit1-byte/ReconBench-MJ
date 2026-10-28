@@ -32,9 +32,10 @@ from reconbench_core.schema import (
 )
 
 
-def test_reason_code_catalog_has_the_planned_28_codes() -> None:
-    assert len(REASON_CODES) == 28
-    assert len({code.value for code in REASON_CODES}) == 28
+def test_reason_code_catalog_has_the_planned_29_codes() -> None:
+    # The plan's 28 codes and AI_VALUE_UNVERIFIED (PD-2b).
+    assert len(REASON_CODES) == 29
+    assert len({code.value for code in REASON_CODES}) == 29
 
 
 def test_core_enums_match_all_database_enum_values() -> None:

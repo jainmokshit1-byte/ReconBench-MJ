@@ -20,8 +20,10 @@ class CheckDefinition:
 
 
 CHECK_REGISTRY = (
+    CheckDefinition("s1.ai_values_verified", 1, "S1"),
     CheckDefinition("s1.exact_duplicate", 1, "S1"),
-    CheckDefinition("s1.extraction_gate", 1, "S1"),
+    # Version 2 (PD-2b): a value a person verified or corrected counts as certain.
+    CheckDefinition("s1.extraction_gate", 2, "S1"),
     CheckDefinition("s1.po_open", 1, "S1"),
     CheckDefinition("s1.suspected_duplicate", 1, "S1"),
     CheckDefinition("s1.vendor_resolved", 1, "S1"),

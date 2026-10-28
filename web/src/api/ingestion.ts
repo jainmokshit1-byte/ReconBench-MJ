@@ -384,6 +384,50 @@ export async function correctDocument(
   return value;
 }
 
+/** One value read by AI beside the rules (OCR) reading of the same file (PD-4d). */
+export interface AiValue {
+  field_name: string;
+  line_id: string | null;
+  line_no: number | null;
+  label: string;
+  value_text: string | null;
+  ocr_value_text: string | null;
+  agrees: boolean;
+  verified: boolean;
+  page: number | null;
+  bbox: number[] | null;
+}
+
+export function aiValues(details: DocumentDetails): AiValue[] {
+  const raw = details["ai_values"];
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((item): item is AiValue => isRecord(item)
+    && typeof item["field_name"] === "string"
+    && typeof item["label"] === "string"
+    && typeof item["agrees"] === "boolean"
+    && typeof item["verified"] === "boolean");
+}
+
+/** Record that a person checked these values against the page; or every value that agrees with OCR. */
+export async function verifyAiValues(
+  documentId: string,
+  version: number,
+  choice: { values: { field_name: string; line_id: string | null }[] } | { all_agreeing: true },
+  csrfToken: string,
+): Promise<DocumentDetails> {
+  const response = await request(`/documents/${encodeURIComponent(documentId)}/verify-ai-values`, csrfToken, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "If-Match": `"${version}"`,
+    },
+    body: JSON.stringify(choice),
+  });
+  const value: unknown = await json(response);
+  if (!isRecord(value)) throw new Error("The server returned invalid document details.");
+  return value;
+}
+
 /** Backwards-compatible name retained for invoice-only call sites. */
 export const correctInvoiceDocument = correctDocument;
 

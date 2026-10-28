@@ -195,7 +195,8 @@
         "GSTIN_INVALID",
         "EXTRA_CHARGE",
         "GRN_OVER_PO",
-        "LATE_DELIVERY"
+        "LATE_DELIVERY",
+        "AI_VALUE_UNVERIFIED"
       ],
       "title": "ReasonCode",
       "type": "string"

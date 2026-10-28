@@ -669,4 +669,17 @@ REASON_CODES = (
         "is_proposed": False,
         "is_active": True,
     },
+    {
+        # PD-2b; revision 0033 adds it to existing workspaces with this same text.
+        "code": "AI_VALUE_UNVERIFIED",
+        "level": "review",
+        "stage": "S1",
+        "title": "AI-read values not verified",
+        "message": "A value read by AI counts only after a person verifies it.",
+        "suggested_action": "Open the document and verify each AI-read value against the page.",
+        "overridable": True,
+        "level_configurable": False,
+        "is_proposed": False,
+        "is_active": True,
+    },
 )

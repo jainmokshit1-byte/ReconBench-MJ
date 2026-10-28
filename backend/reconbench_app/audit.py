@@ -54,6 +54,7 @@ AuditAction = Literal[
     "ai.active_provider_change",
     "ai.manage_denied",
     "document.correct",
+    "document.verify_ai_values",
     "document.duplicate_held",
     "document.duplicate_decide",
     "export.create",

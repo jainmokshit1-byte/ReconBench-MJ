@@ -268,6 +268,35 @@
         "title": "AiSuggestionRefBody",
         "type": "object"
       },
+      "AiValueRefBody": {
+        "additionalProperties": false,
+        "description": "One value read by AI: a header field, or a field of the line with this id.",
+        "properties": {
+          "field_name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Field Name",
+            "type": "string"
+          },
+          "line_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Id"
+          }
+        },
+        "required": [
+          "field_name"
+        ],
+        "title": "AiValueRefBody",
+        "type": "object"
+      },
       "AlignWeightsBody": {
         "additionalProperties": false,
         "properties": {
@@ -3650,7 +3679,8 @@
           "GSTIN_INVALID",
           "EXTRA_CHARGE",
           "GRN_OVER_PO",
-          "LATE_DELIVERY"
+          "LATE_DELIVERY",
+          "AI_VALUE_UNVERIFIED"
         ],
         "title": "ReasonCode",
         "type": "string"
@@ -4547,6 +4577,27 @@
           "name"
         ],
         "title": "VendorRenameBody",
+        "type": "object"
+      },
+      "VerifyAiValuesBody": {
+        "additionalProperties": false,
+        "description": "Verify the listed values, or every value whose OCR cross-check agrees (PD-4d).",
+        "properties": {
+          "all_agreeing": {
+            "default": false,
+            "title": "All Agreeing",
+            "type": "boolean"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/AiValueRefBody"
+            },
+            "maxItems": 5000,
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "title": "VerifyAiValuesBody",
         "type": "object"
       },
       "WeightsBody": {
@@ -6712,6 +6763,59 @@
           }
         },
         "summary": "Get Document Raw",
+        "tags": [
+          "API v1",
+          "Documents"
+        ]
+      }
+    },
+    "/api/v1/documents/{document_id}/verify-ai-values": {
+      "post": {
+        "description": "Record that a person checked values read by AI against the page (PD-4d).",
+        "operationId": "verify_ai_values_api_v1_documents__document_id__verify_ai_values_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyAiValuesBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify AI-read values",
         "tags": [
           "API v1",
           "Documents"

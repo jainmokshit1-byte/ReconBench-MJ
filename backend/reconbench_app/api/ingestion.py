@@ -178,6 +178,30 @@ class InvoiceLineCorrection(BaseModel):
         return self
 
 
+class AiValueRefBody(BaseModel):
+    """One value read by AI: a header field, or a field of the line with this id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_name: str = Field(min_length=1, max_length=64)
+    line_id: UUID | None = None
+
+
+class VerifyAiValuesBody(BaseModel):
+    """Verify the listed values, or every value whose OCR cross-check agrees (PD-4d)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    values: list[AiValueRefBody] = Field(default_factory=list, max_length=5_000)
+    all_agreeing: bool = False
+
+    @model_validator(mode="after")
+    def _one_choice(self) -> VerifyAiValuesBody:
+        if bool(self.values) == self.all_agreeing:
+            raise ValueError("send either values or all_agreeing, not both")
+        return self
+
+
 class _CorrectionBodyBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -945,6 +969,44 @@ def correct_invoice_document(
             ],
         )
     except (BatchVersionConflict, IngestionFailure, ObjectStoreUnavailable) as exc:
+        return _handle_ingestion_error(exc, request)
+    if result is None:
+        return _problem(
+            request,
+            status=404,
+            title="Not found",
+            detail="The document was not found.",
+            code="not_found",
+        )
+    return DecimalJSONResponse(
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["document"]["version"]))},
+    )
+
+
+@router.post(
+    "/documents/{document_id}/verify-ai-values",
+    tags=["Documents"],
+    summary="Verify AI-read values",
+)
+@requires("files.upload")
+def verify_ai_values(
+    document_id: UUID,
+    body: VerifyAiValuesBody,
+    request: Request,
+) -> Response:
+    """Record that a person checked values read by AI against the page (PD-4d)."""
+
+    expected_version = require_if_match(request.headers.get("if-match"))
+    try:
+        result = _service(request).verify_ai_values(
+            _actor(request),
+            document_id,
+            expected_version=expected_version,
+            values=[(item.line_id, item.field_name) for item in body.values],
+            all_agreeing=body.all_agreeing,
+        )
+    except (BatchVersionConflict, IngestionFailure) as exc:
         return _handle_ingestion_error(exc, request)
     if result is None:
         return _problem(

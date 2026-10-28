@@ -16,7 +16,7 @@ import pytest
 from reconbench_app.vendor_resolution import anchor_document, field_verified
 from reconbench_core.extraction.consensus import FieldType, decide
 from reconbench_core.extraction.extract import REVIEW_FLOOR, extract_document
-from reconbench_core.mapping import MappingConfig, resolve_links
+from reconbench_core.mapping import MappingConfig, MappingDocument, resolve_links
 from reconbench_core.mapping.vendor import AnchorPlan, VendorNameStatus, plan_vendor_anchors
 from reconbench_core.parsers import parse
 from reconbench_core.parsers.parties import buyer_gstins, guard_result
@@ -26,8 +26,10 @@ from reconbench_core.schema import (
     CaseStatus,
     DocType,
     Document,
+    FieldOrigin,
     FieldSource,
     FieldValue,
+    FieldVerification,
     FileFormat,
     LinkMethod,
     LinkState,
@@ -247,6 +249,113 @@ def test_content_only_link_is_suggested_even_with_the_most_permissive_config() -
     content = [link for link in result.links if link.method is LinkMethod.CONTENT]
     assert content
     assert all(link.state is LinkState.SUGGESTED for link in content)
+
+
+# --- FALSE_AUTO_LINKS: a reference read by AI never auto-links (PD-2a) ----------------------
+
+
+@pytest.mark.parametrize(
+    ("origin", "source"),
+    [
+        (FieldOrigin.AI, FieldSource.AI),
+        (FieldOrigin.AI, FieldSource.RULE),
+        (FieldOrigin.OCR, FieldSource.AI),
+    ],
+)
+def test_ai_read_po_reference_at_full_confidence_is_suggested_never_auto(
+    origin: FieldOrigin, source: FieldSource
+) -> None:
+    invoice = mapping_case._source(
+        10,
+        mapping_case._document(
+            mapping_case._invoice_xml("INV-10", po_ref="PO-100", qty="100", amount="1000"),
+            DocType.INVOICE,
+        ),
+    )
+    po = mapping_case._po(20, mapping_case._document(mapping_case._po_xml("PO-100"), DocType.PO))
+
+    def read_by(origin: FieldOrigin, source: FieldSource) -> MappingDocument:
+        po_refs = invoice.document.header.po_refs
+        assert po_refs is not None
+        header = invoice.document.header.model_copy(
+            update={
+                "po_refs": po_refs.model_copy(
+                    update={"origin": origin, "source": source, "confidence": Decimal("1")}
+                )
+            }
+        )
+        document = invoice.document.model_copy(update={"header": header})
+        return invoice.model_copy(update={"document": document})
+
+    control = resolve_links([read_by(FieldOrigin.OCR, FieldSource.RULE)], [po])[0]
+    result = resolve_links([read_by(origin, source)], [po])[0]
+
+    # The same reference read by OCR passes the system check on the matching amount.
+    assert [link.state for link in control.links] == [LinkState.AUTO]
+    assert len(control.field_verifications) == 1
+    assert result.links
+    assert all(link.state is LinkState.SUGGESTED for link in result.links)
+    assert not result.field_verifications
+
+
+# --- FALSE_MATCHED: an invoice read by AI is never Matched before a person verifies it (PD-2b)
+
+
+@pytest.mark.parametrize(
+    "verification", [FieldVerification.NONE, FieldVerification.SYSTEM_CHECK]
+)
+def test_ai_read_invoice_at_full_confidence_is_never_matched_until_a_person_verifies_it(
+    verification: FieldVerification,
+) -> None:
+    po_doc = recon_case._document(recon_case._po_xml().replace("20260101", "20260115"), DocType.PO)
+    po = recon_case._record(1, po_doc, DocType.PO)
+    grn_doc = recon_case._document(recon_case._grn_xml(10, accepted=10), DocType.GRN)
+    grn = recon_case._record(2, grn_doc, DocType.GRN)
+    invoice_doc = recon_case._document(recon_case._invoice_xml("INV-2201", 10), DocType.INVOICE)
+
+    def read_by_ai(verification: FieldVerification) -> Document:
+        def read(value: object) -> object:
+            if not isinstance(value, FieldValue):
+                return value
+            return value.model_copy(
+                update={
+                    "origin": FieldOrigin.AI,
+                    "source": FieldSource.AI,
+                    "confidence": Decimal("1"),
+                    "verification": verification,
+                }
+            )
+
+        header = invoice_doc.header.model_copy(
+            update={
+                name: read(getattr(invoice_doc.header, name))
+                for name in type(invoice_doc.header).model_fields
+            }
+        )
+        lines = tuple(
+            line.model_copy(
+                update={name: read(getattr(line, name)) for name in type(line).model_fields}
+            )
+            for line in invoice_doc.lines
+        )
+        return invoice_doc.model_copy(update={"header": header, "lines": lines})
+
+    def evaluate(document: Document) -> CaseStatus:
+        invoice = recon_case._record(3, document, DocType.INVOICE)
+        link = recon_case._link(11, invoice.document_id, po.document_id)
+        snapshot = ReconciliationSnapshot(
+            documents=(po, grn, invoice),
+            links=(
+                recon_case._link(10, grn.document_id, po.document_id),
+                link.model_copy(update={"state": LinkState.CONFIRMED}),
+            ),
+        )
+        results = evaluate_components(snapshot, ReconciliationConfig(), date(2026, 2, 2))
+        return next(result.status for result in results if result.invoice_id == invoice.document_id)
+
+    assert evaluate(read_by_ai(verification)) is CaseStatus.NEEDS_REVIEW
+    # The same values, each verified by a person, are Matched.
+    assert evaluate(read_by_ai(FieldVerification.USER)) is CaseStatus.MATCHED
 
 
 # --- FALSE_SAFE: a vision reading alone never verifies a value (D42) ------------------------

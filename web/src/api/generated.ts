@@ -639,6 +639,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/documents/{document_id}/verify-ai-values": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Verify AI-read values
+         * @description Record that a person checked values read by AI against the page (PD-4d).
+         */
+        post: operations["verify_ai_values_api_v1_documents__document_id__verify_ai_values_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/duplicate-holds": {
         parameters: {
             query?: never;
@@ -1325,6 +1345,16 @@ export interface components {
              * @enum {string}
              */
             scope: "header" | "line";
+        };
+        /**
+         * AiValueRefBody
+         * @description One value read by AI: a header field, or a field of the line with this id.
+         */
+        AiValueRefBody: {
+            /** Field Name */
+            field_name: string;
+            /** Line Id */
+            line_id?: string | null;
         };
         /** AlignWeightsBody */
         AlignWeightsBody: {
@@ -2358,7 +2388,7 @@ export interface components {
          * ReasonCode
          * @enum {string}
          */
-        ReasonCode: "DUP_INVOICE" | "NO_PO_LINK" | "LINK_INFERRED" | "LOW_CONFIDENCE_DATA" | "DUP_SUSPECTED" | "ITEM_UNSURE" | "NO_TEXT_LAYER" | "VENDOR_MISMATCH" | "PO_NOT_OPEN" | "ITEM_NOT_ON_PO" | "QTY_OVER_PO" | "QTY_OVER_GRN" | "RATE_HIGH" | "TOTAL_MISMATCH" | "MATH_ERROR" | "PO_VALUE_EXCEEDED" | "CURRENCY_DIFF" | "UOM_MISMATCH" | "DATE_ORDER" | "GRN_PENDING" | "RATE_LOW" | "TAX_RATE_DIFF" | "TAX_TYPE_MISMATCH" | "HSN_DIFF" | "GSTIN_INVALID" | "EXTRA_CHARGE" | "GRN_OVER_PO" | "LATE_DELIVERY";
+        ReasonCode: "DUP_INVOICE" | "NO_PO_LINK" | "LINK_INFERRED" | "LOW_CONFIDENCE_DATA" | "DUP_SUSPECTED" | "ITEM_UNSURE" | "NO_TEXT_LAYER" | "VENDOR_MISMATCH" | "PO_NOT_OPEN" | "ITEM_NOT_ON_PO" | "QTY_OVER_PO" | "QTY_OVER_GRN" | "RATE_HIGH" | "TOTAL_MISMATCH" | "MATH_ERROR" | "PO_VALUE_EXCEEDED" | "CURRENCY_DIFF" | "UOM_MISMATCH" | "DATE_ORDER" | "GRN_PENDING" | "RATE_LOW" | "TAX_RATE_DIFF" | "TAX_TYPE_MISMATCH" | "HSN_DIFF" | "GSTIN_INVALID" | "EXTRA_CHARGE" | "GRN_OVER_PO" | "LATE_DELIVERY" | "AI_VALUE_UNVERIFIED";
         /** ReasonCodeCatalog */
         ReasonCodeCatalog: {
             /** Items */
@@ -2659,6 +2689,19 @@ export interface components {
         VendorRenameBody: {
             /** Name */
             name: string;
+        };
+        /**
+         * VerifyAiValuesBody
+         * @description Verify the listed values, or every value whose OCR cross-check agrees (PD-4d).
+         */
+        VerifyAiValuesBody: {
+            /**
+             * All Agreeing
+             * @default false
+             */
+            all_agreeing: boolean;
+            /** Values */
+            values?: components["schemas"]["AiValueRefBody"][];
         };
         /** WeightsBody */
         WeightsBody: {
@@ -3966,6 +4009,41 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    verify_ai_values_api_v1_documents__document_id__verify_ai_values_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyAiValuesBody"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

@@ -19,6 +19,7 @@ import type { AiFieldSuggestion, AiSuggestionRef } from "../api/ai";
 import { useAuth } from "../auth/useAuth";
 import { buildAccuracyCorrectionExport } from "../utils/accuracyCorrectionExport";
 import { AiSuggestionsPanel } from "./AiSuggestionsPanel";
+import { AiValuesVerify } from "./AiValuesVerify";
 
 const PdfPreview = lazy(() => import("./PdfPreview").then((module) => ({ default: module.PdfPreview })));
 
@@ -490,6 +491,7 @@ function DocumentCard({
         return visibleLines.some((line) => line["line_no"] === suggestion.line_no)
           || !lineDraft.some((line) => line.line_no === suggestion.line_no);
       }} /> : null}
+      <AiValuesVerify details={details} csrfToken={csrfToken} fieldLabels={fieldLabels} onFocusSource={onFocusSource} onSaved={onSaved} />
       {reviewOnly && needsVerification ? (
         <section className="verify-unverified-fields" aria-label="Fields needing verification">
           <h4>Fields to verify</h4>

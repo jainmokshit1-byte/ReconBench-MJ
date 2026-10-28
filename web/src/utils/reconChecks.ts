@@ -49,11 +49,13 @@ export const REASON_TEXT: Record<string, ReasonText> = {
   EXTRA_CHARGE: { title: "Charge not on PO", message: "A charge line such as freight or packing is not on the PO." },
   GRN_OVER_PO: { title: "Received more than ordered", message: "Received quantity is above the ordered quantity; the excess is not billable." },
   LATE_DELIVERY: { title: "Late delivery", message: "The goods were received after the PO delivery date." },
+  AI_VALUE_UNVERIFIED: { title: "AI-read values not verified", message: "A value read by AI counts only after a person verifies it." },
 };
 
 const CHECK_NAMES: Record<string, string> = {
   "s1.exact_duplicate": "Duplicate invoice",
   "s1.suspected_duplicate": "Possible duplicate",
+  "s1.ai_values_verified": "AI-read values verified",
   "s1.extraction_gate": "Data quality",
   "s1.po_open": "PO open",
   "s1.vendor_resolved": "Vendor resolved",

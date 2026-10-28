@@ -27,6 +27,8 @@ from reconbench_core.schema import (
     DocType,
     Document,
     FieldOrigin,
+    FieldSource,
+    FieldValue,
     FieldVerification,
     FrozenModel,
     GRNHeader,
@@ -344,6 +346,30 @@ def _line_po_refs(document: Document) -> tuple[tuple[int, str], ...]:
     )
 
 
+def _read_by_ai(field: object | None) -> bool:
+    return bool(
+        field is not None
+        and (
+            getattr(field, "origin", None) is FieldOrigin.AI
+            or getattr(field, "source", None) is FieldSource.AI
+        )
+    )
+
+
+def _has_ai_values(document: Document) -> bool:
+    """Whether any header or line value was read by AI (PD-2a).
+
+    Such a document is never system-checked: any of its values could be the
+    corroboration for a reference, so its references wait for a person.
+    """
+
+    values = [getattr(document.header, name) for name in type(document.header).model_fields]
+    values.extend(
+        getattr(line, name) for line in document.lines for name in type(line).model_fields
+    )
+    return any(isinstance(value, FieldValue) and _read_by_ai(value) for value in values)
+
+
 def _field_is_user_verified(field: object | None) -> bool:
     return bool(
         field is not None
@@ -352,10 +378,14 @@ def _field_is_user_verified(field: object | None) -> bool:
 
 
 def _field_is_verified(field: object | None) -> bool:
+    verification = getattr(field, "verification", FieldVerification.NONE)
     return bool(
         field is not None
-        and getattr(field, "verification", FieldVerification.NONE)
-        in {FieldVerification.USER, FieldVerification.SYSTEM_CHECK}
+        and (
+            verification is FieldVerification.USER
+            # Only a person verifies an AI-read value, never a system check (PD-2a).
+            or (verification is FieldVerification.SYSTEM_CHECK and not _read_by_ai(field))
+        )
     )
 
 
@@ -2392,6 +2422,7 @@ def _amount_in_band(
 
 
 def _field_has_system_confidence(field: object, config: MappingConfig) -> bool:
+    # FieldOrigin.AI is deliberately absent: an AI-read value is never system-checked (PD-2a).
     origin = getattr(field, "origin", None)
     confidence = getattr(field, "confidence", None)
     return (
@@ -2412,6 +2443,8 @@ def _system_check_reference_fields(
     proposals: list[FieldVerificationUpdate] = []
     for source in documents:
         header = source.document.header
+        # PD-2a: a document with any AI-read value is never system-checked.
+        ai_read = _has_ai_values(source.document)
         header_updates: dict[str, object] = {}
         for field_name in ("po_refs",):
             field = getattr(header, field_name, None)
@@ -2429,7 +2462,7 @@ def _system_check_reference_fields(
                         for po in purchase_orders
                     )
                 )
-                if still_identifies_po:
+                if still_identifies_po and not ai_read:
                     # Verification records that the reference passed its system
                     # check. Later billing must not erase that identity evidence;
                     # capacity is reported separately on the proposed link.
@@ -2438,7 +2471,7 @@ def _system_check_reference_fields(
                 header_updates[field_name] = field.model_copy(
                     update={"verification": FieldVerification.NONE}
                 )
-            if len(values) != 1 or not _field_has_system_confidence(field, config):
+            if ai_read or len(values) != 1 or not _field_has_system_confidence(field, config):
                 if was_system_checked:
                     proposals.append(
                         FieldVerificationUpdate(
@@ -2506,7 +2539,7 @@ def _system_check_reference_fields(
                     and _canonical(_doc_no(po.document)) == _canonical(field.value)
                     for po in purchase_orders
                 )
-                if still_identifies_po:
+                if still_identifies_po and not ai_read:
                     line_updates[line.line_no] = line.model_copy(update={"po_ref": field})
                     continue
                 line_updates[line.line_no] = line.model_copy(
@@ -2514,7 +2547,7 @@ def _system_check_reference_fields(
                         "po_ref": field.model_copy(update={"verification": FieldVerification.NONE})
                     }
                 )
-            if not _field_has_system_confidence(field, config):
+            if ai_read or not _field_has_system_confidence(field, config):
                 if was_system_checked:
                     proposals.append(
                         FieldVerificationUpdate(
@@ -2604,6 +2637,8 @@ def _system_check_invoice_grn_references(
     for source in documents:
         header = source.document.header
         field = header.grn_refs if isinstance(header, InvoiceHeader) else None
+        # PD-2a: a document with any AI-read value is never system-checked.
+        ai_read = _has_ai_values(source.document)
         header_updates: dict[str, object] = {}
         if field is not None and not _field_is_user_verified(field):
             was_system_checked = field.verification is FieldVerification.SYSTEM_CHECK
@@ -2630,7 +2665,7 @@ def _system_check_invoice_grn_references(
                         ):
                             still_identifies_grn = True
                             break
-                if still_identifies_grn:
+                if still_identifies_grn and not ai_read:
                     # Keep an established corroborating reference after its GRN
                     # has been fully consumed; open quantity is a separate check.
                     header_updates["grn_refs"] = field
@@ -2647,7 +2682,7 @@ def _system_check_invoice_grn_references(
                     update={"verification": FieldVerification.NONE}
                 )
             matches: set[UUID] = set()
-            if len(values) == 1 and _field_has_system_confidence(field, config):
+            if not ai_read and len(values) == 1 and _field_has_system_confidence(field, config):
                 reference = values[0]
                 for grn in documents:
                     if (

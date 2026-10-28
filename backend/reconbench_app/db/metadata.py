@@ -355,7 +355,7 @@ _tables["field_evidence"] = sa.Table(
         name="field_evidence_owner_ck",
     ),
     sa.CheckConstraint(
-        "origin IS NULL OR origin IN ('ocr', 'manual', 'erp_import')",
+        "origin IS NULL OR origin IN ('ocr', 'manual', 'erp_import', 'ai')",
         name="field_evidence_origin_ck",
     ),
     sa.CheckConstraint(

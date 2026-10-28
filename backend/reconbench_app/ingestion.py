@@ -13,10 +13,10 @@ import tempfile
 import time
 import zipfile
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, BinaryIO, Protocol, cast
 from uuid import UUID
@@ -249,6 +249,12 @@ _CORRECTION_LINE_COLUMNS_BY_TYPE: Mapping[str, Mapping[str, str]] = {
     DocType.GRN.value: _GRN_CORRECTION_LINE_COLUMNS,
 }
 _MANUAL_SNIPPET = "Entered by reviewer; not quoted from the PDF source."
+# The invoice values the extraction gate reads (Document.confidence). Marking an invoice
+# reviewed verifies each one the person was shown (P2, PD-2b).
+_REVIEWED_HEADER_FIELDS = frozenset(
+    {"doc_no", "doc_date", "grand_total", "vendor_name", "vendor_gstin"}
+)
+_REVIEWED_LINE_FIELDS = frozenset({"quantity", "rate", "amount"})
 _AI_SNIPPET_LIMIT = 500
 _CORRECTION_QA_CODE = "CORRECTION_QA_FAILED"
 
@@ -3278,24 +3284,8 @@ class IngestionService:
         line_table = metadata.tables["doc_line"]
         evidence_table = metadata.tables["field_evidence"]
 
-        def origin_for(value: FieldValue[Any]) -> FieldOrigin | None:
-            if value.origin is not None:
-                return value.origin
-            if value.source is FieldSource.MANUAL or extraction_method is ExtractionMethod.MANUAL:
-                return FieldOrigin.MANUAL
-            if extraction_method in {ExtractionMethod.XML_PROFILE, ExtractionMethod.CSV_MAPPING}:
-                return FieldOrigin.ERP_IMPORT
-            if extraction_method in {
-                ExtractionMethod.PDF_TEXT,
-                ExtractionMethod.PDF_OCR,
-                ExtractionMethod.AI_FALLBACK,
-                ExtractionMethod.AI_FIRST,
-            }:
-                return FieldOrigin.OCR
-            return None
-
         def evidence_provenance(value: FieldValue[Any]) -> dict[str, Any]:
-            origin = origin_for(value)
+            origin = _field_origin(value, extraction_method)
             return {
                 "confidence": value.confidence if origin is not FieldOrigin.MANUAL else None,
                 "origin": origin.value if origin is not None else None,
@@ -3952,6 +3942,14 @@ class IngestionService:
                 ),
             )
             evidences = connection.execute(evidence_query).mappings().all()
+            ai_values = _ai_values(
+                connection,
+                workspace_id,
+                document_id=document_id,
+                version={column.name: header[column] for column in version.c},
+                lines=lines,
+                evidences=evidences,
+            )
             events = (
                 connection.execute(
                     sa.select(*event.c)
@@ -3966,6 +3964,7 @@ class IngestionService:
             "version": {column.name: header[column] for column in version.c},
             "lines": [dict(row) for row in lines],
             "field_evidence": [dict(row) for row in evidences],
+            "ai_values": ai_values,
             "processing_log": [dict(row) for row in events],
         }
 
@@ -4337,7 +4336,8 @@ class IngestionService:
             current_line_ids = list(old_line_by_id)
             old_evidence = (
                 connection.execute(
-                    sa.select(*evidence_table.c).where(
+                    sa.select(*evidence_table.c)
+                    .where(
                         evidence_table.c.workspace_id == actor.workspace_id,
                         sa.or_(
                             evidence_table.c.document_version_id == previous_version_id,
@@ -4346,6 +4346,8 @@ class IngestionService:
                             else sa.false(),
                         ),
                     )
+                    # Oldest first, so each value's latest row wins below.
+                    .order_by(evidence_table.c.created_at, evidence_table.c.id)
                 )
                 .mappings()
                 .all()
@@ -4478,6 +4480,7 @@ class IngestionService:
             changed_line_fields: dict[UUID, set[str]] = {}
             changed_line_values: dict[tuple[UUID, str], Any] = {}
             line_no_by_owner: dict[UUID, int] = {}
+            shown_line_fields: dict[UUID, set[str]] = {}
             for supplied in requested_lines:
                 unknown_fields = set(supplied) - {"id", "line_no", *line_columns}
                 if unknown_fields:
@@ -4516,6 +4519,7 @@ class IngestionService:
                 row.setdefault("spec_tokens", [])
                 change_owner_id = cast(UUID, old_row["id"]) if old_row is not None else new_line_id
                 line_no_by_owner[change_owner_id] = line_no
+                shown_line_fields[change_owner_id] = set(supplied) & set(line_columns)
                 for field_name, column_name in line_columns.items():
                     if field_name not in supplied:
                         continue
@@ -4657,7 +4661,26 @@ class IngestionService:
 
             manual_evidence_done: set[tuple[str, UUID | None, str]] = set()
             header_column_by_field = header_columns
-            for old_item in old_evidence:
+            is_invoice = doc_type == DocType.INVOICE.value
+            # Unchanged values that marking the document reviewed verified (P2, PD-2b).
+            verified_fields: set[str] = set()
+
+            def verify(item: dict[str, Any], name: str) -> None:
+                item.update(
+                    verification=FieldVerification.USER.value,
+                    verified_by=str(actor.actor_id),
+                    verified_at=sa.func.now(),
+                )
+                verified_fields.add(name)
+
+            # Only each value's latest row moves to the new version. The copies share one
+            # time and their ids are not ordered, so an older row copied as well could hide a
+            # later verification (PD-2b).
+            latest_evidence = {
+                (row["document_version_id"], row["doc_line_id"], row["field_name"]): row
+                for row in old_evidence
+            }
+            for old_item in latest_evidence.values():
                 item = dict(old_item)
                 old_line_id = cast(UUID | None, item["doc_line_id"])
                 if old_line_id is not None:
@@ -4677,11 +4700,18 @@ class IngestionService:
                             ),
                         )
                         manual_evidence_done.add(("line", old_line_id, field_name))
-                    elif verified and item["field_name"] == "po_ref":
-                        item.update(
-                            verification=FieldVerification.USER.value,
-                            verified_by=str(actor.actor_id),
-                            verified_at=sa.func.now(),
+                    elif verified and _verified_by_review(
+                        item,
+                        references=("po_ref",),
+                        shown_key_fields=(
+                            _REVIEWED_LINE_FIELDS & shown_line_fields.get(old_line_id, set())
+                            if is_invoice
+                            else frozenset()
+                        ),
+                    ):
+                        verify(
+                            item,
+                            f"line {line_no_by_owner.get(old_line_id)} {item['field_name']}",
                         )
                 else:
                     item["document_version_id"] = new_version_id
@@ -4695,12 +4725,16 @@ class IngestionService:
                             **manual_evidence(("header", None, field_name)),
                         )
                         manual_evidence_done.add(("header", None, field_name))
-                    elif verified and field_name in {"po_refs", "grn_refs"}:
-                        item.update(
-                            verification=FieldVerification.USER.value,
-                            verified_by=str(actor.actor_id),
-                            verified_at=sa.func.now(),
-                        )
+                    elif verified and _verified_by_review(
+                        item,
+                        references=("po_refs", "grn_refs"),
+                        shown_key_fields=(
+                            _REVIEWED_HEADER_FIELDS & set(header_patch)
+                            if is_invoice
+                            else frozenset()
+                        ),
+                    ):
+                        verify(item, str(item["field_name"]))
                 item["id"] = new_id()
                 item.pop("created_at", None)
                 connection.execute(sa.insert(evidence_table).values(**item))
@@ -4790,6 +4824,7 @@ class IngestionService:
                     "corrected_line_count": len(changed_line_fields) + len(removed_line_ids),
                     "removed_line_ids": sorted(str(value) for value in removed_line_ids),
                     "needs_verification": needs_verification,
+                    "verified_fields": sorted(verified_fields),
                     "correction_qa": qa,
                     "ai_suggestion_refs": [
                         {
@@ -4867,6 +4902,161 @@ class IngestionService:
                     scope_id=document_id,
                     reason="invoice extraction corrected or verified by user",
                 )
+        return self.get_document(actor.workspace_id, document_id)
+
+    @requires("files.upload")
+    def verify_ai_values(
+        self,
+        actor: ActorContext,
+        document_id: UUID,
+        *,
+        expected_version: int,
+        values: Sequence[tuple[UUID | None, str]] = (),
+        all_agreeing: bool = False,
+    ) -> dict[str, Any] | None:
+        """Record that a person verified values read by AI (PD-4d).
+
+        Each value gets one new ``user``-verified evidence row; the value itself and the
+        document version stay as they are. "Verify all" covers only the values whose OCR
+        cross-check agrees (Q8); the others need their own Verify.
+        """
+
+        document_table = metadata.tables["document"]
+        version_table = metadata.tables["document_version"]
+        line_table = metadata.tables["doc_line"]
+        evidence_table = metadata.tables["field_evidence"]
+        with self.engine.begin() as connection:
+            current_document = (
+                connection.execute(
+                    sa.select(document_table)
+                    .where(
+                        document_table.c.workspace_id == actor.workspace_id,
+                        document_table.c.id == document_id,
+                        document_table.c.withdrawn_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current_document is None:
+                return None
+            if int(current_document["version"]) != expected_version:
+                raise BatchVersionConflict("The document changed after it was loaded.")
+            if current_document["doc_type"] != DocType.INVOICE.value:
+                raise IngestionFailure(
+                    "AI_VERIFY_UNSUPPORTED", "Values read by AI are verified on invoices only."
+                )
+            version_id = cast(UUID, current_document["current_version_id"])
+            version = (
+                connection.execute(
+                    sa.select(version_table).where(
+                        version_table.c.workspace_id == actor.workspace_id,
+                        version_table.c.id == version_id,
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            lines = (
+                connection.execute(
+                    sa.select(line_table.c.id, line_table.c.line_no).where(
+                        line_table.c.workspace_id == actor.workspace_id,
+                        line_table.c.document_version_id == version_id,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            line_ids = [row["id"] for row in lines]
+            evidences = (
+                connection.execute(
+                    sa.select(*evidence_table.c).where(
+                        evidence_table.c.workspace_id == actor.workspace_id,
+                        sa.or_(
+                            evidence_table.c.document_version_id == version_id,
+                            evidence_table.c.doc_line_id.in_(line_ids) if line_ids else sa.false(),
+                        ),
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            waiting = {
+                (item["line_id"], item["field_name"]): item
+                for item in _ai_values(
+                    connection,
+                    actor.workspace_id,
+                    document_id=document_id,
+                    version=version,
+                    lines=lines,
+                    evidences=evidences,
+                )
+                if not item["verified"]
+            }
+            if all_agreeing:
+                chosen = [item for item in waiting.values() if item["agrees"]]
+            else:
+                chosen = []
+                for key in dict.fromkeys(values):
+                    if key not in waiting:
+                        raise IngestionFailure(
+                            "AI_VALUE_NOT_WAITING",
+                            "A chosen value is not a value read by AI that waits for a person.",
+                        )
+                    chosen.append(waiting[key])
+            if not chosen:
+                raise IngestionFailure(
+                    "AI_VALUE_NONE_TO_VERIFY",
+                    "No value read by AI waits for verification here."
+                    if not all_agreeing
+                    else "No value read by AI agrees with its OCR cross-check.",
+                )
+            latest = _latest_evidence(evidences)
+            for item in chosen:
+                owner = (version_id, None) if item["line_id"] is None else (None, item["line_id"])
+                row = dict(latest[(*owner, item["field_name"])])
+                row.update(
+                    id=new_id(),
+                    verification=FieldVerification.USER.value,
+                    verified_by=str(actor.actor_id),
+                    verified_at=sa.func.now(),
+                )
+                row.pop("created_at", None)
+                connection.execute(sa.insert(evidence_table).values(**row))
+            connection.execute(
+                sa.update(document_table)
+                .where(
+                    document_table.c.workspace_id == actor.workspace_id,
+                    document_table.c.id == document_id,
+                )
+                .values(
+                    input_seq=document_table.c.input_seq + 1,
+                    updated_at=sa.func.now(),
+                    version=document_table.c.version + 1,
+                )
+            )
+            write_audit_event(
+                connection,
+                actor,
+                action="document.verify_ai_values",
+                target_type="document",
+                target_id=document_id,
+                before_state={"document_version_id": str(version_id)},
+                after_state={
+                    "document_version_id": str(version_id),
+                    "verified_fields": sorted(str(item["label"]) for item in chosen),
+                    "verify_all_agreeing": all_agreeing,
+                },
+                reason="Values read by AI verified by user.",
+            )
+            self._mark_dirty_scope(
+                connection,
+                workspace_id=actor.workspace_id,
+                scope_kind="invoice",
+                scope_id=document_id,
+                reason="values read by AI verified by user",
+            )
         return self.get_document(actor.workspace_id, document_id)
 
     def _record_correction_qa(
@@ -5621,6 +5811,26 @@ def _extraction_method(file_format: FileFormat | None, *, is_ocr: bool = False) 
     }.get(file_format, ExtractionMethod.SHELL)
 
 
+def _field_origin(
+    value: FieldValue[Any], extraction_method: ExtractionMethod
+) -> FieldOrigin | None:
+    # A value read by AI is origin AI whatever else it carries, so the reference
+    # system check never accepts it (PD-2a).
+    if value.source is FieldSource.AI:
+        return FieldOrigin.AI
+    if value.origin is not None:
+        return value.origin
+    if value.source is FieldSource.MANUAL or extraction_method is ExtractionMethod.MANUAL:
+        return FieldOrigin.MANUAL
+    if extraction_method in {ExtractionMethod.AI_FALLBACK, ExtractionMethod.AI_FIRST}:
+        return FieldOrigin.AI
+    if extraction_method in {ExtractionMethod.XML_PROFILE, ExtractionMethod.CSV_MAPPING}:
+        return FieldOrigin.ERP_IMPORT
+    if extraction_method in {ExtractionMethod.PDF_TEXT, ExtractionMethod.PDF_OCR}:
+        return FieldOrigin.OCR
+    return None
+
+
 def _validated_archive_path(value: str) -> str | None:
     normalized = value.replace("\\", "/")
     path = PurePosixPath(normalized)
@@ -5804,6 +6014,163 @@ def _plain(value: Any) -> Any:
     if hasattr(value, "value"):
         return value.value
     return value
+
+
+def _verified_by_review(
+    row: Mapping[str, Any], *, references: Collection[str], shown_key_fields: Collection[str]
+) -> bool:
+    """Whether marking a document reviewed verifies this unchanged value (P2, PD-2b).
+
+    References are verified as before, and an invoice's key values where the person was
+    shown them. A value read by AI is never verified this way: it waits for its own Verify.
+    """
+
+    if row["origin"] == FieldOrigin.AI.value or row["source"] == FieldSource.AI.value:
+        return False
+    field_name = str(row["field_name"])
+    return field_name in references or field_name in shown_key_fields
+
+
+# Rules readings of a PDF: the OCR cross-check a value read by AI is shown beside (PD-4d).
+_CROSS_CHECK_METHODS = frozenset({ExtractionMethod.PDF_TEXT.value, ExtractionMethod.PDF_OCR.value})
+
+
+def _read_by_ai(row: Mapping[str, Any]) -> bool:
+    return row["origin"] == FieldOrigin.AI.value or row["source"] == FieldSource.AI.value
+
+
+def _latest_evidence(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[tuple[UUID | None, UUID | None, str], Mapping[str, Any]]:
+    """Each value's latest evidence row, by (version, line, field)."""
+
+    latest: dict[tuple[UUID | None, UUID | None, str], Mapping[str, Any]] = {}
+    for row in sorted(rows, key=lambda item: (item["created_at"], str(item["id"]))):
+        latest[(row["document_version_id"], row["doc_line_id"], str(row["field_name"]))] = row
+    return latest
+
+
+def _values_agree(first: str | None, second: str | None) -> bool:
+    """Whether a value read by AI and its OCR cross-check say the same (Q8)."""
+
+    if first is None or second is None:
+        return False
+    try:
+        return Decimal(first) == Decimal(second)
+    except (InvalidOperation, ValueError):
+        return " ".join(first.split()).casefold() == " ".join(second.split()).casefold()
+
+
+def _cross_check_values(
+    connection: Connection,
+    workspace_id: UUID,
+    *,
+    document_id: UUID,
+    version: Mapping[str, Any],
+) -> dict[tuple[int | None, str], str | None]:
+    """The values the rules read from the same file, by (line number, field).
+
+    The cross-check is the latest earlier version of the document that the rules read
+    from the same source file; values read by AI never cross-check each other.
+    """
+
+    version_table = metadata.tables["document_version"]
+    line_table = metadata.tables["doc_line"]
+    evidence_table = metadata.tables["field_evidence"]
+    if version["source_file_id"] is None:
+        return {}
+    previous = connection.scalar(
+        sa.select(version_table.c.id)
+        .where(
+            version_table.c.workspace_id == workspace_id,
+            version_table.c.document_id == document_id,
+            version_table.c.source_file_id == version["source_file_id"],
+            version_table.c.seq < version["seq"],
+            version_table.c.extraction_method.in_(sorted(_CROSS_CHECK_METHODS)),
+        )
+        .order_by(version_table.c.seq.desc())
+        .limit(1)
+    )
+    if previous is None:
+        return {}
+    line_no = {
+        cast(UUID, row.id): int(row.line_no)
+        for row in connection.execute(
+            sa.select(line_table.c.id, line_table.c.line_no).where(
+                line_table.c.workspace_id == workspace_id,
+                line_table.c.document_version_id == previous,
+            )
+        )
+    }
+    rows = (
+        connection.execute(
+            sa.select(*evidence_table.c).where(
+                evidence_table.c.workspace_id == workspace_id,
+                sa.or_(
+                    evidence_table.c.document_version_id == previous,
+                    evidence_table.c.doc_line_id.in_(list(line_no)) if line_no else sa.false(),
+                ),
+            )
+        )
+        .mappings()
+        .all()
+    )
+    values: dict[tuple[int | None, str], str | None] = {}
+    for row in _latest_evidence(rows).values():
+        if _read_by_ai(row):
+            continue
+        owner = row["doc_line_id"]
+        if owner is not None and owner not in line_no:
+            continue
+        number = None if owner is None else line_no[owner]
+        values[(number, str(row["field_name"]))] = row["value_text"]
+    return values
+
+
+def _ai_values(
+    connection: Connection,
+    workspace_id: UUID,
+    *,
+    document_id: UUID,
+    version: Mapping[str, Any],
+    lines: Sequence[Mapping[str, Any]],
+    evidences: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """The current version's values read by AI, each beside its OCR cross-check (PD-4d)."""
+
+    line_no = {cast(UUID, row["id"]): int(row["line_no"]) for row in lines}
+    read = [row for row in _latest_evidence(evidences).values() if _read_by_ai(row)]
+    if not read:
+        return []
+    cross_check = _cross_check_values(
+        connection, workspace_id, document_id=document_id, version=version
+    )
+    values = []
+    for row in read:
+        owner = row["doc_line_id"]
+        if owner is not None and owner not in line_no:
+            continue
+        number = None if owner is None else line_no[owner]
+        name = str(row["field_name"])
+        ocr_value = cross_check.get((number, name))
+        values.append(
+            {
+                "field_name": name,
+                "line_id": owner,
+                "line_no": number,
+                "label": name if number is None else f"line {number} {name}",
+                "value_text": row["value_text"],
+                "ocr_value_text": ocr_value,
+                "agrees": _values_agree(row["value_text"], ocr_value),
+                "verified": row["verification"] == FieldVerification.USER.value,
+                "page": row["page"],
+                "bbox": row["bbox"],
+            }
+        )
+    return sorted(
+        values,
+        key=lambda item: (item["line_no"] is not None, item["line_no"] or 0, item["field_name"]),
+    )
 
 
 def _field_text(value: Any) -> str:

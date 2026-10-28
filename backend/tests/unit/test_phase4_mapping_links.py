@@ -1138,6 +1138,228 @@ def test_ocr_grn_reference_verification_uses_link_not_open_grn_quantity() -> Non
     assert all(link.state is LinkState.AUTO for link in reopened.links)
 
 
+def _with_header_field(
+    source: MappingDocument, field_name: str, /, **update: Any
+) -> MappingDocument:
+    header = source.document.header
+    field = getattr(header, field_name)
+    assert field is not None
+    document = source.document.model_copy(
+        update={"header": header.model_copy(update={field_name: field.model_copy(update=update)})}
+    )
+    return source.model_copy(update={"document": document})
+
+
+def _with_line_field(
+    source: MappingDocument, line_no: int, field_name: str, value: FieldValue[Any]
+) -> MappingDocument:
+    lines = tuple(
+        line.model_copy(update={field_name: value}) if line.line_no == line_no else line
+        for line in source.document.lines
+    )
+    return source.model_copy(
+        update={"document": source.document.model_copy(update={"lines": lines})}
+    )
+
+
+_AI_READ = ((FieldOrigin.AI, FieldSource.AI), (FieldOrigin.OCR, FieldSource.AI))
+
+
+def test_stale_system_check_on_an_ai_read_header_reference_is_revoked() -> None:
+    invoice = _source(
+        160, _document(_coded_invoice_xml("INV-AI-160", po_ref="PO-AI-161"), DocType.INVOICE)
+    )
+    po = _po(161, _document(_coded_po_xml("PO-AI-161"), DocType.PO))
+    fully_billed = po.model_copy(
+        update={"open_balance": Decimal("0"), "open_qty_by_line": {1: Decimal("0")}}
+    )
+
+    def checked(origin: FieldOrigin, source: FieldSource) -> MappingDocument:
+        return _with_header_field(
+            invoice,
+            "po_refs",
+            origin=origin,
+            source=source,
+            confidence=Decimal("1"),
+            verification=FieldVerification.SYSTEM_CHECK,
+        )
+
+    kept = resolve_links([checked(FieldOrigin.OCR, FieldSource.RULE)], [fully_billed])[0]
+
+    assert kept.links[0].state is LinkState.AUTO
+    assert not kept.field_verifications
+    for origin, source in _AI_READ:
+        for target in (po, fully_billed):
+            revoked = resolve_links([checked(origin, source)], [target])[0]
+            assert revoked.links
+            assert all(link.state is LinkState.SUGGESTED for link in revoked.links)
+            assert [
+                (item.field_name, item.verification) for item in revoked.field_verifications
+            ] == [("po_refs", FieldVerification.NONE)]
+
+
+def test_stale_system_check_on_an_ai_read_line_reference_is_revoked() -> None:
+    invoice_document = _document(_coded_invoice_xml("INV-AI-162"), DocType.INVOICE)
+    po = _po(163, _document(_coded_po_xml("PO-AI-163"), DocType.PO))
+
+    def checked(origin: FieldOrigin, source: FieldSource) -> MappingDocument:
+        reference = FieldValue[str](
+            value="PO-AI-163",
+            confidence=Decimal("1"),
+            source=source,
+            evidence=FieldEvidence(),
+            origin=origin,
+            verification=FieldVerification.SYSTEM_CHECK,
+        )
+        return _with_line_field(_source(162, invoice_document), 1, "po_ref", reference)
+
+    kept = resolve_links([checked(FieldOrigin.OCR, FieldSource.RULE)], [po])[0]
+
+    assert kept.links[0].state is LinkState.AUTO
+    assert not kept.field_verifications
+    for origin, source in _AI_READ:
+        revoked = resolve_links([checked(origin, source)], [po])[0]
+        assert revoked.links
+        assert all(link.state is LinkState.SUGGESTED for link in revoked.links)
+        assert [
+            (item.field_name, item.line_no, item.verification)
+            for item in revoked.field_verifications
+        ] == [("po_ref", 1, FieldVerification.NONE)]
+
+
+def test_stale_system_check_on_an_ai_read_grn_reference_is_revoked() -> None:
+    invoice = _source(
+        164,
+        _document(
+            _invoice_xml(
+                "INV-AI-164",
+                grn_ref="GRN-AI-165",
+                date="20260110",
+                qty="10",
+                rate="10",
+                amount="100",
+                description="Part MOD-100",
+            ),
+            DocType.INVOICE,
+        ),
+    )
+    grn = _verify_header_reference(
+        _source(
+            165,
+            _document(
+                "<GRN><GRNNo>GRN-AI-165</GRNNo><GRNDate>20260115</GRNDate>"
+                "<Supplier>Acme Supplies</Supplier><PORef>PO-AI-166</PORef>"
+                "<Line><ItemCode>MOD-100</ItemCode><Description>Part MOD-100</Description>"
+                "<Qty>10</Qty></Line></GRN>",
+                DocType.GRN,
+            ),
+        ),
+        "po_refs",
+    )
+    po = _po(166, _document(_coded_po_xml("PO-AI-166"), DocType.PO)).model_copy(
+        update={
+            "grn_support_qty_by_line": {1: Decimal("10")},
+            "open_grn_qty_by_line": {1: Decimal("0")},
+        }
+    )
+
+    def checked(origin: FieldOrigin, source: FieldSource) -> MappingDocument:
+        return _with_header_field(
+            invoice,
+            "grn_refs",
+            origin=origin,
+            source=source,
+            confidence=Decimal("1"),
+            verification=FieldVerification.SYSTEM_CHECK,
+        )
+
+    kept = resolve_links([checked(FieldOrigin.OCR, FieldSource.RULE), grn], [po])[0]
+
+    assert kept.links
+    assert all(link.state is LinkState.AUTO for link in kept.links)
+    assert not kept.field_verifications
+    for origin, source in _AI_READ:
+        revoked = resolve_links([checked(origin, source), grn], [po])[0]
+        assert revoked.links
+        assert all(link.state is LinkState.SUGGESTED for link in revoked.links)
+        assert [(item.field_name, item.verification) for item in revoked.field_verifications] == [
+            ("grn_refs", FieldVerification.NONE)
+        ]
+
+
+def test_a_document_with_any_ai_read_value_is_never_system_checked() -> None:
+    invoice = _with_header_reference_provenance(
+        _source(
+            167,
+            _document(_coded_invoice_xml("INV-MIXED-167", po_ref="PO-MIXED-168"), DocType.INVOICE),
+        ),
+        "po_refs",
+        origin=FieldOrigin.OCR,
+        confidence=Decimal("0.99"),
+    )
+    po = _po(168, _document(_coded_po_xml("PO-MIXED-168"), DocType.PO))
+    amount = invoice.document.lines[0].amount
+    assert amount is not None
+    mixed = _with_line_field(
+        invoice,
+        1,
+        "amount",
+        amount.model_copy(update={"origin": FieldOrigin.AI, "source": FieldSource.AI}),
+    )
+
+    control = resolve_links([invoice], [po])[0]
+    result = resolve_links([mixed], [po])[0]
+
+    assert control.links[0].state is LinkState.AUTO
+    assert [item.verification for item in control.field_verifications] == [
+        FieldVerification.SYSTEM_CHECK
+    ]
+    assert result.links
+    assert all(link.state is LinkState.SUGGESTED for link in result.links)
+    assert not result.field_verifications
+
+
+def test_only_a_person_verifies_an_ai_read_anchor() -> None:
+    invoice = _source(169, _document(_invoice_xml("INV-AI-169"), DocType.INVOICE))
+    grn = _verify_header_reference(
+        _verify_header_reference(
+            _source(
+                170,
+                _document(
+                    "<GRN><GRNNo>GRN-AI-170</GRNNo>"
+                    "<SupplierInvoiceNo>INV-AI-169</SupplierInvoiceNo>"
+                    "<Supplier>Acme Supplies</Supplier><PORef>PO-AI-171</PORef></GRN>",
+                    DocType.GRN,
+                ),
+            ),
+            "supplier_invoice_no",
+        ),
+        "po_refs",
+    )
+    po = _po(171, _document(_po_xml("PO-AI-171"), DocType.PO))
+
+    def states(
+        origin: FieldOrigin, source: FieldSource, verification: FieldVerification
+    ) -> set[LinkState]:
+        anchored = _with_header_field(
+            invoice, "doc_no", origin=origin, source=source, verification=verification
+        )
+        result = next(
+            item
+            for item in resolve_links((anchored, grn), (po,))
+            if item.document_id == invoice.document_id
+        )
+        assert result.links
+        return {link.state for link in result.links}
+
+    assert states(FieldOrigin.OCR, FieldSource.RULE, FieldVerification.SYSTEM_CHECK) == {
+        LinkState.AUTO
+    }
+    for origin, source in _AI_READ:
+        assert states(origin, source, FieldVerification.SYSTEM_CHECK) == {LinkState.SUGGESTED}
+        assert states(origin, source, FieldVerification.USER) == {LinkState.AUTO}
+
+
 def test_handwritten_annotation_reference_needs_amount_corroboration() -> None:
     matching_document = _document(
         _coded_invoice_xml("INV-ANNOTATION", qty="100", rate="10", amount="1000"),

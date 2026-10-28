@@ -46,7 +46,15 @@ NEW_CONFIG_COLUMNS = (
 )
 
 _REWIND = (
-    # 0030 (last-manager lock, WI-PV3) is removed first; the upgrade re-applies it.
+    # 0033 (AI_VALUE_UNVERIFIED reason, PD-2b) is removed first; the upgrade re-applies it.
+    "DELETE FROM reason_code WHERE code = 'AI_VALUE_UNVERIFIED'",
+    # 0032 (AI field origin, PD-2a) is removed next; the upgrade re-applies it.
+    "ALTER TABLE field_evidence DROP CONSTRAINT field_evidence_origin_ck, "
+    "ADD CONSTRAINT field_evidence_origin_ck "
+    "CHECK (origin IS NULL OR origin IN ('ocr', 'manual', 'erp_import'))",
+    # 0031 (duplicate holds, PD-0b-4) is removed next; the upgrade re-applies it.
+    "DROP TABLE duplicate_hold",
+    # 0030 (last-manager lock, WI-PV3) is removed next; the upgrade re-applies it.
     "DROP TRIGGER app_user_last_manager ON app_user",
     "DROP FUNCTION app_user_last_manager_guard()",
     # 0029 (Gemini key move, key tier; WI-PV2) is removed next; the upgrade re-applies it.
@@ -96,7 +104,7 @@ def migrated() -> Iterator[tuple[Engine, dict[str, UUID], UUID]]:
     try:
         with engine.begin() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-            assert heads == {"0031"}, heads
+            assert heads == {"0033"}, heads
             for statement in _REWIND:
                 connection.exec_driver_sql(statement)
             user_id = connection.scalar(sa.text("SELECT id FROM app_user LIMIT 1"))

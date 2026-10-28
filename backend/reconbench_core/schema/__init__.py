@@ -100,6 +100,9 @@ class FieldOrigin(StrEnum):
     OCR = "ocr"
     MANUAL = "manual"
     ERP_IMPORT = "erp_import"
+    # Read by an AI provider: never system-checked; it counts only after a person
+    # verifies it (PD-2a).
+    AI = "ai"
 
 
 class FieldVerification(StrEnum):
@@ -356,6 +359,8 @@ class ReasonCode(StrEnum):
     EXTRA_CHARGE = "EXTRA_CHARGE"
     GRN_OVER_PO = "GRN_OVER_PO"
     LATE_DELIVERY = "LATE_DELIVERY"
+    # A value read by AI that no person has verified yet (PD-2b).
+    AI_VALUE_UNVERIFIED = "AI_VALUE_UNVERIFIED"
 
 
 class CheckOutcome(StrEnum):
@@ -409,6 +414,7 @@ GSTIN_INVALID = ReasonCode.GSTIN_INVALID
 EXTRA_CHARGE = ReasonCode.EXTRA_CHARGE
 GRN_OVER_PO = ReasonCode.GRN_OVER_PO
 LATE_DELIVERY = ReasonCode.LATE_DELIVERY
+AI_VALUE_UNVERIFIED = ReasonCode.AI_VALUE_UNVERIFIED
 REASON_CODES = tuple(ReasonCode)
 
 
@@ -832,4 +838,5 @@ __all__ = [
     "EXTRA_CHARGE",
     "GRN_OVER_PO",
     "LATE_DELIVERY",
+    "AI_VALUE_UNVERIFIED",
 ]

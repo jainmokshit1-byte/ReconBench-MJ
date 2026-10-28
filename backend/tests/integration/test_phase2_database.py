@@ -23,7 +23,7 @@ from reconbench_app.db.repository import (
     workspace_filter,
 )
 from reconbench_app.db.seed import canonical_hash
-from reconbench_app.db.seed_data import DEFAULT_CONFIG
+from reconbench_app.db.seed_data import DEFAULT_CONFIG, REASON_CODES
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -169,14 +169,11 @@ def test_repository_constraints_roles_and_audit_chain(
             )
         )
         assert active_id == config_id
-        assert (
-            connection.scalar(
-                sa.select(sa.func.count())
-                .select_from(metadata.tables["reason_code"])
-                .where(metadata.tables["reason_code"].c.workspace_id == workspace_id)
-            )
-            == 28
-        )
+        assert connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(metadata.tables["reason_code"])
+            .where(metadata.tables["reason_code"].c.workspace_id == workspace_id)
+        ) == len(REASON_CODES)
 
     vendor_id = new_id()
     with phase2_engine.begin() as connection:

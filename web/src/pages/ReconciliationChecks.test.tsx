@@ -12,7 +12,7 @@ const ENGINE_REASON_CODES = [
   "QTY_OVER_PO", "QTY_OVER_GRN", "RATE_HIGH", "TOTAL_MISMATCH", "MATH_ERROR",
   "PO_VALUE_EXCEEDED", "CURRENCY_DIFF", "UOM_MISMATCH", "DATE_ORDER", "GRN_PENDING",
   "RATE_LOW", "TAX_RATE_DIFF", "TAX_TYPE_MISMATCH", "HSN_DIFF", "GSTIN_INVALID",
-  "EXTRA_CHARGE", "GRN_OVER_PO", "LATE_DELIVERY",
+  "EXTRA_CHARGE", "GRN_OVER_PO", "LATE_DELIVERY", "AI_VALUE_UNVERIFIED",
 ];
 
 afterEach(cleanup);
@@ -107,7 +107,7 @@ describe("reconciliation checks as verifiable rows (PD-4a)", () => {
 
   it("has a plain sentence for every reason code of the engine", () => {
     const codes = ENGINE_REASON_CODES;
-    expect(codes).toHaveLength(28);
+    expect(codes).toHaveLength(29);
     for (const code of codes) expect(REASON_TEXT[code]?.message, code).toBeTruthy();
   });
 
