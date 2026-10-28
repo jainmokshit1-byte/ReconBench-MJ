@@ -170,6 +170,29 @@ def consent_text_version(*, auto_verify_field_types: tuple[str, ...] = ()) -> st
     return AUTO_VERIFY_CONSENT_TEXT_VERSION if auto_verify_field_types else CONSENT_TEXT_VERSION
 
 
+def active_provider_for(
+    *,
+    mode: str,
+    reader_strategy: str,
+    primary_reader: str | None,
+    provider: str | None,
+) -> str | None:
+    """The one active AI provider.
+
+    mode rules_only -> None, strategy shadow -> None, strategy single -> primary_reader,
+    strategy off -> provider. No or 'gemini' fallback anywhere.
+    """
+    if mode == "rules_only":
+        return None
+    if reader_strategy == "shadow":
+        return None
+    if reader_strategy == "single":
+        return primary_reader
+    if reader_strategy == "off":
+        return provider
+    return provider
+
+
 def consent_text(
     *,
     provider: str,
@@ -182,11 +205,13 @@ def consent_text(
 ) -> str:
     """Consent text naming only the active provider for all hooks."""
 
-    active_is_vllm = (
-        (reader_strategy == "single" and vision_provider == "vllm")
-        or (reader_strategy in {"off", None} and provider == "vllm")
+    active = active_provider_for(
+        mode="ai_first",
+        reader_strategy=reader_strategy or "off",
+        primary_reader=vision_provider,
+        provider=provider,
     )
-    if active_is_vllm:
+    if active == "vllm":
         text = VLLM_CONSENT_TEXT.format(
             base_url=vision_base_url or "the configured URL",
             model=vision_model or "the selected model",
@@ -223,15 +248,15 @@ def consent_fingerprint(
 
     if reader_strategy == "single":
         vision = True
-        active_provider: str | None = vision_provider or "gemini"
     elif reader_strategy in {"off", "shadow"}:
         vision = False
-        active_provider = None if reader_strategy == "shadow" else provider
-    else:
-        active_provider = provider
 
-    if mode == "rules_only":
-        active_provider = None
+    active_provider = active_provider_for(
+        mode=mode,
+        reader_strategy=reader_strategy or "off",
+        primary_reader=vision_provider,
+        provider=provider,
+    )
 
     if active_provider == "vllm":
         active_model = vision_model

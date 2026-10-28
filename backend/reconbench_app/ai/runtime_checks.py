@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
 from reconbench_app.ai.connection_state import ROTATE_PREFIX
-from reconbench_app.ai.consent import consent_fingerprint, hooks_for_mode
+from reconbench_app.ai.consent import active_provider_for, consent_fingerprint, hooks_for_mode
 from reconbench_app.db.metadata import metadata
 
 SETTINGS = metadata.tables["ai_setting"]
@@ -116,14 +116,15 @@ class SettingsSnapshot:
 
         rules_only/shadow -> None, single -> primary_reader, off -> provider.
         """
-
-        if self.mode == "rules_only":
-            return None
-        if self.strategy == "shadow":
-            return None
-        if self.strategy == "single":
-            return self.primary_reader or self.provider or "gemini"
-        return self.provider
+        primary = self.primary_reader
+        if primary is None and self.vision_enabled and self.reader_strategy == "off":
+            primary = self.provider
+        return active_provider_for(
+            mode=self.mode,
+            reader_strategy=self.strategy,
+            primary_reader=primary,
+            provider=self.provider,
+        )
 
     @property
     def active_model(self) -> str | None:
@@ -155,12 +156,15 @@ class SettingsSnapshot:
     def expected_fingerprint(self) -> str | None:
         if self.active_provider is None or self.active_model is None:
             return None
+        primary = self.primary_reader
+        if primary is None and self.vision_enabled and self.reader_strategy == "off":
+            primary = self.provider
         return fingerprint_for(
             provider=self.provider or "gemini",
             model=self.model or "",
             mode=self.mode,
             reader_strategy=self.strategy,
-            primary_reader=self.primary_reader,
+            primary_reader=primary,
             apply_mode=self.apply_mode,
             auto_verify_field_types=self.auto_verify_field_types,
             vllm_model=self.vllm.model if self.vllm else None,
@@ -397,6 +401,7 @@ def request_blocker(
 
 
 __all__ = [
+    "active_provider_for",
     "BLOCK_AI_OFF",
     "BLOCK_CONSENT_NEEDED",
     "BLOCK_CONSENT_OUTDATED",

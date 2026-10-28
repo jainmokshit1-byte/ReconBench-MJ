@@ -122,17 +122,28 @@ def gemini_health(
     """
 
     configs = metadata.tables["ai_provider_config"]
+    settings_table = metadata.tables["ai_setting"]
     with engine.connect() as connection:
         cards = (
             connection.execute(
                 sa.select(
                     configs.c.workspace_id,
                 )
+                .select_from(
+                    configs.join(
+                        settings_table,
+                        settings_table.c.workspace_id == configs.c.workspace_id,
+                    )
+                )
                 .where(
                     configs.c.provider == "gemini",
                     sa.or_(
                         configs.c.connected_at.is_not(None),
                         configs.c.last_error_code.is_not(None),
+                    ),
+                    sa.or_(
+                        configs.c.key_secret_id.is_not(None),
+                        settings_table.c.key_secret_id.is_not(None),
                     ),
                     sa.or_(
                         configs.c.last_health_at.is_(None),
@@ -152,6 +163,10 @@ def gemini_health(
                 settings is None
                 or settings.active_provider != "gemini"
                 or settings.active_model is None
+                or (
+                    not settings.key_secret_id
+                    and not (settings.gemini and settings.gemini.key_secret_id)
+                )
             ):
                 continue
         with engine.begin() as connection:

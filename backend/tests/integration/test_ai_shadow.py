@@ -10,10 +10,14 @@ report holds aggregates only. Synthetic documents; ``ScriptedProvider`` and
 
 from __future__ import annotations
 
+import io
 import json
+from contextlib import redirect_stdout
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+import pytest
 import sqlalchemy as sa
 import test_ai_vision
 from reconbench_app.ai import ledger
@@ -21,10 +25,12 @@ from reconbench_app.ai.enqueue import AiHookEnqueuer
 from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.limits import AiLimits, LimitsState
 from reconbench_app.ai.runtime_checks import fingerprint_for
+from reconbench_app.ai.shadow_report import main as shadow_report_main
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from scripts.vision_fixtures import recorded_response, synthetic_invoice_pdf
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import DBAPIError
 from test_ai_vision import (
     APPROVAL,
     MODEL,
@@ -218,7 +224,7 @@ def test_switching_to_single_drops_a_queued_shadow_request(
     provider = _Recorder([json.dumps(recorded_response())])
     result = _runner(engine, keys[0], provider).run(request_id)
 
-    assert result.state == "skipped"
+    assert (result.state, result.code) == ("skipped", "SETTINGS_CHANGED")
     assert provider.calls == [] and _comparisons(engine, world) == []
 
 
@@ -231,3 +237,153 @@ def test_company_server_shadow_reads_through_its_own_provider_only(
     # A stored shadow row runs nothing (D103 decision 6).
     assert _prepare(world) == []
     assert _vision_requests(engine, world) == []
+
+
+def test_reader_comparison_table_grants_and_append_only(
+    engine: Engine, make_world: Any
+) -> None:
+    world = make_world(vision_on=False)
+    document_id = _upload(world, synthetic_invoice_pdf(), name="shadow-perm.pdf")
+    with engine.connect() as connection:
+        version_id = connection.scalar(
+            sa.select(metadata.tables["document_version"].c.id).where(
+                metadata.tables["document_version"].c.document_id == document_id
+            )
+        )
+    with engine.begin() as connection:
+        req = ledger.NewRequest(
+            workspace_id=world.workspace_id,
+            call_kind="hook",
+            hook="h6_vision",
+            mode="ai_first",
+            subject_type="document_version",
+            subject_id=version_id,
+            subject_version="v1",
+            operation_key=f"h6_vision:{new_id()}",
+            settings_version=1,
+            consent_fingerprint="0" * 64,
+            provider="gemini",
+            model=MODEL,
+            prompt_version="vision.prompt.v4.gemini",
+            schema_version="vision.schema.v4",
+            redaction_version="redaction.v1",
+            shadow=True,
+        )
+        request_id = ledger.create_request(connection, req)
+        comp_id = new_id()
+        connection.execute(
+            sa.insert(COMPARISONS).values(
+                id=comp_id,
+                workspace_id=world.workspace_id,
+                document_version_id=version_id,
+                ai_request_id=request_id,
+                provider="gemini",
+                model=MODEL,
+                prompt_version="vision.prompt.v4.gemini",
+                schema_version="vision.schema.v4",
+                reader_params_digest="0" * 64,
+                counts={"agree_ocr": 1, "fields_total": 1},
+                labels=[{"field_key": "header:doc_no", "label": "agree_ocr"}],
+            )
+        )
+
+    # Append-only, and the report role cannot read it.
+    with engine.connect() as connection:
+        privileges = connection.execute(
+            sa.text(
+                "SELECT has_table_privilege('reconbench_report', 'reader_comparison', 'SELECT'),"
+                " has_table_privilege('reconbench_app', 'reader_comparison', 'SELECT'),"
+                " has_table_privilege('reconbench_app', 'reader_comparison', 'INSERT'),"
+                " has_table_privilege('reconbench_app', 'reader_comparison', 'UPDATE'),"
+                " has_table_privilege('reconbench_app', 'reader_comparison', 'DELETE')"
+            )
+        ).one()
+    assert tuple(privileges) == (False, True, True, False, False)
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            sa.update(COMPARISONS).where(COMPARISONS.c.id == comp_id).values(model="x")
+        )
+
+
+def test_shadow_report_api_and_cli_work_with_stored_comparison(
+    engine: Engine, make_world: Any
+) -> None:
+    world = make_world(vision_on=False)
+    document_id = _upload(world, synthetic_invoice_pdf(), name="shadow-rep.pdf")
+    with engine.connect() as connection:
+        version_id = connection.scalar(
+            sa.select(metadata.tables["document_version"].c.id).where(
+                metadata.tables["document_version"].c.document_id == document_id
+            )
+        )
+    with engine.begin() as connection:
+        connection.execute(
+            sa.update(SETTINGS)
+            .where(SETTINGS.c.workspace_id == world.workspace_id)
+            .values(reader_strategy="shadow", primary_reader="gemini")
+        )
+        req = ledger.NewRequest(
+            workspace_id=world.workspace_id,
+            call_kind="hook",
+            hook="h6_vision",
+            mode="ai_first",
+            subject_type="document_version",
+            subject_id=version_id,
+            subject_version="v1",
+            operation_key=f"h6_vision:{new_id()}",
+            settings_version=1,
+            consent_fingerprint="0" * 64,
+            provider="gemini",
+            model=MODEL,
+            prompt_version="vision.prompt.v4.gemini",
+            schema_version="vision.schema.v4",
+            redaction_version="redaction.v1",
+            shadow=True,
+        )
+        request_id = ledger.create_request(connection, req)
+        connection.execute(
+            sa.insert(COMPARISONS).values(
+                id=new_id(),
+                workspace_id=world.workspace_id,
+                document_version_id=version_id,
+                ai_request_id=request_id,
+                provider="gemini",
+                model=MODEL,
+                prompt_version="vision.prompt.v4.gemini",
+                schema_version="vision.schema.v4",
+                reader_params_digest="0" * 64,
+                counts={"agree_ocr": 1, "fields_total": 1},
+                labels=[{"field_key": "header:doc_no", "label": "agree_ocr"}],
+            )
+        )
+        ledger.finish(
+            connection,
+            request_id,
+            state="succeeded",
+            now=datetime.now(UTC),
+            error_code=None,
+            usage=ledger.Usage(10, 5, 0),
+            actual_usd=None,
+            apply_outcome="applied",
+        )
+
+    # Aggregates only, from the API and the CLI.
+    response = world.client.get("/api/v1/ai/shadow-report")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["reader_strategy"] == "shadow"
+    [entry] = body["providers"]
+    assert entry["provider"] == "gemini" and entry["comparisons"] == 1
+
+    printed = io.StringIO()
+    with redirect_stdout(printed):
+        assert shadow_report_main(["--workspace", str(world.workspace_id)], engine=engine) == 0
+    cli = json.loads(printed.getvalue())
+    assert cli["providers"] == json.loads(json.dumps(body["providers"]))
+
+    values = _values(recorded_response())
+    for text in (response.text, printed.getvalue()):
+        assert not [value for value in values if value in text]
+        assert str(document_id) not in text
+        assert str(version_id) not in text
+        assert str(request_id) not in text

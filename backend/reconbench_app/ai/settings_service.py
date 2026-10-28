@@ -52,6 +52,7 @@ from reconbench_app.ai.runtime_checks import (
     BLOCK_KEY_EXPIRED,
     BLOCK_KEY_NOT_SET,
     BLOCK_PROVIDER_DISABLED,
+    active_provider_for,
     fingerprint_for,
     load_provider_key,
     load_settings,
@@ -441,11 +442,11 @@ class AiSettingsService:
         configs = self._configs(connection, workspace_id)
         vllm = configs.get("vllm")
         local_reader = strategy.primary_reader == "vllm"
-        active_provider = (
-            strategy.primary_reader if strategy.reader_strategy == "single"
-            else None if strategy.reader_strategy == "shadow"
-            else None if (row and row["mode"] == "rules_only")
-            else provider
+        active_provider = active_provider_for(
+            mode=mode,
+            reader_strategy=strategy.reader_strategy,
+            primary_reader=strategy.primary_reader,
+            provider=provider,
         )
         active_model = (
             (vllm["model"] if vllm else None) if active_provider == "vllm"
@@ -872,11 +873,11 @@ class AiSettingsService:
             )
         vision = reader_strategy == "single"
         local = primary_reader == "vllm"
-        active_provider = (
-            primary_reader if reader_strategy == "single"
-            else None if reader_strategy == "shadow"
-            else None if mode == "rules_only"
-            else "gemini"
+        active_provider = active_provider_for(
+            mode=mode,
+            reader_strategy=reader_strategy,
+            primary_reader=primary_reader,
+            provider="gemini",
         )
         if any(field_type not in AUTO_VERIFY_FIELD_TYPES for field_type in auto_verify_field_types):
             raise AiSettingsError(
@@ -1164,11 +1165,11 @@ class AiSettingsService:
             )
             if strategy != current or vllm_update is not None:
                 self._check_strategy(strategy, vllm_ready=vllm_ready)
-            active_provider = (
-                strategy.primary_reader if strategy.reader_strategy == "single"
-                else None if strategy.reader_strategy == "shadow"
-                else None if mode == "rules_only"
-                else provider
+            active_provider = active_provider_for(
+                mode=mode,
+                reader_strategy=strategy.reader_strategy,
+                primary_reader=strategy.primary_reader,
+                provider=provider,
             )
             if mode != "rules_only" and active_provider is not None:
                 if (
@@ -1407,11 +1408,11 @@ class AiSettingsService:
                         before_state=before_config,
                         after_state=after_config,
                     )
-            before_active_provider = (
-                current.primary_reader if current.reader_strategy == "single"
-                else None if current.reader_strategy == "shadow"
-                else None if (row and row["mode"] == "rules_only")
-                else (row["provider"] if row else None)
+            before_active_provider = active_provider_for(
+                mode=str(row["mode"]) if row else "rules_only",
+                reader_strategy=current.reader_strategy,
+                primary_reader=current.primary_reader,
+                provider=row["provider"] if row else None,
             )
             if (strategy.reader_strategy, strategy.primary_reader) != (
                 current.reader_strategy,
@@ -1576,11 +1577,11 @@ class AiSettingsService:
     def _public_state(row: Any, card: Any = None) -> dict[str, Any] | None:
         if row is None:
             return None
-        active_provider = (
-            row["primary_reader"] if row["reader_strategy"] == "single"
-            else None if row["reader_strategy"] == "shadow"
-            else None if row["mode"] == "rules_only"
-            else row["provider"]
+        active_provider = active_provider_for(
+            mode=row["mode"],
+            reader_strategy=row["reader_strategy"],
+            primary_reader=row["primary_reader"],
+            provider=row["provider"],
         )
         return {
             "version": int(row["version"]),
