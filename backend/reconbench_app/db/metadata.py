@@ -1512,6 +1512,8 @@ _tables["document"] = sa.Table(
         "updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
     ),
     sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
+    sa.Column("reading_state", sa.Text(), server_default=sa.text("'ready'::text"), nullable=False),
+    sa.Column("reading_failure_code", sa.Text()),
     sa.PrimaryKeyConstraint("id", name="document_pkey"),
     sa.ForeignKeyConstraint(["batch_id"], ["batch.id"], name="document_batch_id_fkey"),
     sa.ForeignKeyConstraint(
@@ -1524,6 +1526,11 @@ _tables["document"] = sa.Table(
     sa.ForeignKeyConstraint(["vendor_id"], ["vendor.id"], name="document_vendor_id_fkey"),
     sa.ForeignKeyConstraint(["withdrawn_by"], ["app_user.id"], name="document_withdrawn_by_fkey"),
     sa.ForeignKeyConstraint(["workspace_id"], ["workspace.id"], name="document_workspace_id_fkey"),
+    sa.CheckConstraint(
+        "reading_state IN ('ready', 'waiting', 'failed') "
+        "AND (reading_state = 'failed') = (reading_failure_code IS NOT NULL)",
+        name="document_reading_state_ck",
+    ),
 )
 
 _tables["document_warning"] = sa.Table(

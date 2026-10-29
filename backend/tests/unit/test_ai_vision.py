@@ -333,7 +333,6 @@ def _facts(**overrides: Any) -> VisionFacts:
         (_facts(doc_type="po", extraction_method="pdf_text"), "ai_first", "NOT_SCANNED_INVOICE"),
         (_facts(page_count=9), "ai_first", "TOO_MANY_PAGES"),
         (_facts(page_count=0), "ai_first", "NO_PAGES"),
-        (_facts(needs_verification=False), "ai_assisted", "NOT_NEEDED"),
     ],
 )
 def test_ineligible_versions(facts: VisionFacts, mode: str, reason: str) -> None:
@@ -343,6 +342,12 @@ def test_ineligible_versions(facts: VisionFacts, mode: str, reason: str) -> None
 def test_only_scanned_invoice_pdfs_are_eligible() -> None:
     facts = _facts(needs_verification=False)
     assert vision_eligibility(facts, mode="ai_first", max_pages=8).eligible
+
+
+def test_every_scanned_invoice_is_eligible_even_when_the_rules_reading_needs_no_check() -> None:
+    # Step 6 D1: with the switch on AI the reader reads every scanned invoice.
+    facts = _facts(needs_verification=False)
+    assert vision_eligibility(facts, mode="ai_assisted", max_pages=8).eligible
     assert vision_eligibility(_facts(), mode="ai_assisted", max_pages=8).eligible
 
 

@@ -51,6 +51,7 @@ from reconbench_core.schema import (
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
+from reconbench_app import reading_state
 from reconbench_app.audit import write_audit_event
 from reconbench_app.authorization import ActorContext, requires
 from reconbench_app.db.ids import new_id
@@ -2572,6 +2573,8 @@ class MappingService:
                 .where(
                     document.c.workspace_id == workspace_id,
                     document.c.withdrawn_at.is_(None),
+                    # A document waiting for its AI reading is not used yet (PD-2f).
+                    reading_state.ready_clause(document),
                 )
                 .order_by(document.c.natural_key, document.c.id)
             ).mappings()

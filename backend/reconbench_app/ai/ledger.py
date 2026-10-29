@@ -25,6 +25,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.engine import Connection, Engine
 
+from reconbench_app import reading_state
 from reconbench_app.ai.limits import AiLimits, Reservation
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
@@ -106,6 +107,9 @@ class NewRequest:
     # A vision request of the workspace's one reader in ``shadow`` (WI-BE6): its answer
     # goes to ``reader_comparison`` only, never to consensus or a suggestion.
     shadow: bool = False
+    # A person's Retry of a failed AI reading (PD-2f): a new attempt after any final
+    # state, not only after released/skipped. Not part of the request key.
+    person_retry: bool = False
 
     @property
     def key(self) -> str:
@@ -125,7 +129,8 @@ def create_request(connection: Connection, request: NewRequest) -> UUID | None:
     """Insert a queued attempt unless one is live, finished, or unacknowledged.
 
     A new attempt is created only for a new logical request, or after the latest
-    attempt was released, skipped, or acknowledged as uncertain.
+    attempt was released, skipped, or acknowledged as uncertain; a person's Retry of a
+    reading (``person_retry``) also after any other final state.
     """
 
     key = request.key
@@ -142,8 +147,10 @@ def create_request(connection: Connection, request: NewRequest) -> UUID | None:
     attempt_no = 1
     if latest is not None:
         state = latest["request_state"]
-        reusable = state in {"released", "skipped"} or (
-            state == "uncertain" and latest["acknowledged_at"] is not None
+        reusable = (
+            state in {"released", "skipped"}
+            or (state == "uncertain" and latest["acknowledged_at"] is not None)
+            or (request.person_retry and state in {"failed", "succeeded"})
         )
         if not reusable:
             return None
@@ -369,6 +376,7 @@ def _skip(connection: Connection, request_id: UUID, code: str, now: datetime) ->
             request_state="skipped", skip_code=code, finished_at=now, apply_outcome="not_applicable"
         )
     )
+    reading_state.fail_finished_readings(connection, request_id=request_id)
 
 
 def skip_in(connection: Connection, request_id: UUID, code: str, now: datetime) -> None:
@@ -397,6 +405,7 @@ def release(engine: Engine, request_id: UUID, code: str, now: datetime) -> bool:
                 apply_outcome="not_applicable",
             )
         )
+        reading_state.fail_finished_readings(connection, request_id=request_id)
     return bool(result.rowcount)
 
 
@@ -460,6 +469,7 @@ def finish(
         .where(REQUESTS.c.id == request_id, REQUESTS.c.request_state == "sending")
         .values(**values)
     )
+    reading_state.fail_finished_readings(connection, request_id=request_id)
     return bool(result.rowcount)
 
 
@@ -556,6 +566,10 @@ def sweep_requests(engine: Engine, *, now: datetime, queue_timeout_seconds: int)
                 apply_outcome="not_applicable",
             )
         ).rowcount
+        reading_state.fail_finished_readings(connection)
+        reading_state.fail_stalled_readings(
+            connection, cutoff=now - timedelta(seconds=queue_timeout_seconds)
+        )
     return SweepCounts(int(uncertain or 0), int(released or 0), int(skipped or 0))
 
 

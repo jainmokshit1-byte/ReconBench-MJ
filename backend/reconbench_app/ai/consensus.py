@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -27,6 +27,7 @@ from reconbench_core.extraction.consensus import (
     crop_outcome,
     decide,
 )
+from reconbench_core.extraction.merge import MergeResult, merge_readings
 from reconbench_core.parsers.types import ParserHints
 from reconbench_core.schema import (
     DocType,
@@ -41,6 +42,7 @@ from reconbench_core.schema import (
 )
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
+from reconbench_app import reading_state
 from reconbench_app.ai import vision
 from reconbench_app.ai.consent import AUTO_VERIFY_FIELD_TYPES
 from reconbench_app.ai.contracts import DocTypeName, InvalidOutput, VisionOutput
@@ -65,6 +67,22 @@ TEXT_PAGES = metadata.tables["document_text"]
 ConsensusJobDeferrer = Callable[[Connection, UUID, UUID], None]
 ConsensusEnqueuer = Callable[[Connection, UUID, UUID, UUID, UUID], bool]
 ConsensusFollowup = Callable[[Connection, UUID, UUID, UUID, str], None]
+
+
+class AiVersionAppender(Protocol):
+    """Appends a merged AI reading as the current version of a document (PD-2e)."""
+
+    def __call__(
+        self,
+        connection: Connection,
+        *,
+        workspace_id: UUID,
+        document_id: UUID,
+        previous_version: Mapping[str, Any],
+        document: Document,
+        ai_call_id: UUID,
+    ) -> UUID: ...
+
 
 _HEADER_COLUMNS: Mapping[str, str] = {
     "doc_no": "doc_no",
@@ -370,7 +388,12 @@ def _crop_attempt(
 
 
 class ConsensusService:
-    """Run bounded consensus, persist provenance and apply only D42 opt-ins."""
+    """Run bounded consensus, persist provenance and apply only D42 opt-ins.
+
+    For a scanned invoice waiting for its AI reading (PD-2e, PD-2f) the run also merges
+    the checked answer with the rules reading (``arb.llm``) and appends it as the current
+    version in the same transaction; a run that ends any other way fails the reading.
+    """
 
     def __init__(
         self,
@@ -378,10 +401,12 @@ class ConsensusService:
         *,
         ocr_languages: tuple[str, ...] = ("eng",),
         enqueue_followup: ConsensusFollowup | None = None,
+        append_ai_version: AiVersionAppender | None = None,
     ) -> None:
         self.engine = engine
         self.ocr_languages = ocr_languages
         self.enqueue_followup = enqueue_followup
+        self.append_ai_version = append_ai_version
 
     def _fail(self, workspace_id: UUID, consensus_run_id: UUID, error_code: str) -> None:
         with self.engine.begin() as connection:
@@ -400,6 +425,12 @@ class ConsensusService:
                 sa.update(RUNS)
                 .where(RUNS.c.workspace_id == workspace_id, RUNS.c.id == consensus_run_id)
                 .values(status="failed", error_code=error_code[:80], finished_at=sa.func.now())
+            )
+            reading_state.mark_version_failed(
+                connection,
+                workspace_id,
+                cast(UUID, run["document_version_id"]),
+                reading_state.MERGE_FAILED,
             )
             vision.purge_version_pages(
                 connection, workspace_id, cast(UUID, run["document_version_id"]), datetime.now(UTC)
@@ -429,6 +460,20 @@ class ConsensusService:
             return self._finish_non_success(
                 workspace_id, consensus_run_id, "failed", "VISION_ANSWER_INVALID"
             )
+        merge: MergeResult | None = None
+        if document_row["reading_state"] == reading_state.WAITING:
+            # The AI leads, OCR is the visible cross-check (PD-2e, policy ``arb.llm``).
+            merge = merge_readings(
+                document, validation.check, buyer_entities=buyers, gst_rates=rates
+            )
+            if not merge.usable:
+                return self._finish_non_success(
+                    workspace_id,
+                    consensus_run_id,
+                    "failed",
+                    "AI_READING_NOTHING_USABLE",
+                    reading_failure=reading_state.ANSWER_INVALID,
+                )
 
         structured = str(version_row["extraction_method"]) in {"xml_profile", "csv_mapping"}
         source_hint = document.header.extras.get("source")
@@ -491,6 +536,7 @@ class ConsensusService:
             result,
             crop_attempts=crop_attempts,
             selected_types=enabled_types,
+            merge=merge,
         )
         return "succeeded"
 
@@ -602,6 +648,7 @@ class ConsensusService:
         *,
         crop_attempts: Mapping[FieldKey, list[dict[str, object]]],
         selected_types: frozenset[FieldType],
+        merge: MergeResult | None = None,
     ) -> None:
         with self.engine.begin() as connection:
             run = (
@@ -652,6 +699,9 @@ class ConsensusService:
                     .where(RUNS.c.workspace_id == workspace_id, RUNS.c.id == consensus_run_id)
                     .values(status="stale", finished_at=sa.func.now())
                 )
+                reading_state.mark_version_failed(
+                    connection, workspace_id, document_version_id, reading_state.MERGE_FAILED
+                )
                 vision.purge_version_pages(
                     connection, workspace_id, document_version_id, datetime.now(UTC)
                 )
@@ -694,7 +744,21 @@ class ConsensusService:
                 .all()
             )
             result_version_id = None
-            if result.changed:
+            if merge is not None and document_row["reading_state"] == reading_state.WAITING:
+                # Still waiting and still current: the AI version becomes current. A person
+                # who chose "Read with rules" meanwhile keeps that choice (plan R3).
+                if self.append_ai_version is None:
+                    raise RuntimeError("AI reading needs an AI version appender")
+                result_version_id = self.append_ai_version(
+                    connection,
+                    workspace_id=workspace_id,
+                    document_id=cast(UUID, document_row["id"]),
+                    previous_version=dict(version_row),
+                    document=merge.document,
+                    ai_call_id=cast(UUID, run["ai_call_id"]),
+                )
+                reading_state.mark_ready(connection, workspace_id, cast(UUID, document_row["id"]))
+            elif result.changed:
                 result_version_id = _append_verified_version(
                     connection,
                     workspace_id=workspace_id,
@@ -772,6 +836,8 @@ class ConsensusService:
         consensus_run_id: UUID,
         status: str,
         error_code: str | None = None,
+        *,
+        reading_failure: str = reading_state.MERGE_FAILED,
     ) -> str:
         with self.engine.begin() as connection:
             run = (
@@ -792,6 +858,10 @@ class ConsensusService:
                 sa.update(RUNS)
                 .where(RUNS.c.workspace_id == workspace_id, RUNS.c.id == consensus_run_id)
                 .values(**values)
+            )
+            # A waiting invoice whose run ends here gets no AI version: it says so (PD-2f).
+            reading_state.mark_version_failed(
+                connection, workspace_id, cast(UUID, run["document_version_id"]), reading_failure
             )
             vision.purge_version_pages(
                 connection, workspace_id, cast(UUID, run["document_version_id"]), datetime.now(UTC)

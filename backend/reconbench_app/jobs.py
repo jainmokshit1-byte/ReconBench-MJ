@@ -164,16 +164,21 @@ class ProcrastinateJobQueue(QueuePort):
         )
 
     def enqueue_vision_pages(
-        self, *, workspace_id: UUID, document_version_id: UUID, connection: Connection
+        self,
+        *,
+        workspace_id: UUID,
+        document_version_id: UUID,
+        connection: Connection,
+        requested_by: UUID | None = None,
     ) -> int:
-        return self._defer(
-            "prepare_vision_pages",
-            connection=connection,
-            task_kwargs={
-                "workspace_id": str(workspace_id),
-                "document_version_id": str(document_version_id),
-            },
-        )
+        task_kwargs = {
+            "workspace_id": str(workspace_id),
+            "document_version_id": str(document_version_id),
+        }
+        if requested_by is not None:
+            # A person's Retry of a failed reading (PD-2f).
+            task_kwargs["requested_by"] = str(requested_by)
+        return self._defer("prepare_vision_pages", connection=connection, task_kwargs=task_kwargs)
 
     def enqueue_ai_request(self, *, ai_request_id: UUID, connection: Connection) -> int:
         return self._defer(
@@ -272,6 +277,7 @@ def register_ingestion_tasks(
         engine,
         ocr_languages=tuple(settings.pdf_ocr_languages.split("+")),
         enqueue_followup=enqueue_consensus_followup,
+        append_ai_version=service.append_ai_version,
     )
 
     @task_app.task(
@@ -321,10 +327,16 @@ def register_ingestion_tasks(
         pass_context=True,
     )
     def prepare_vision_pages(
-        context: JobContext, workspace_id: str, document_version_id: str
+        context: JobContext,
+        workspace_id: str,
+        document_version_id: str,
+        requested_by: str | None = None,
     ) -> None:
         service.prepare_vision_pages(
-            UUID(workspace_id), UUID(document_version_id), job_id=context.job.id
+            UUID(workspace_id),
+            UUID(document_version_id),
+            job_id=context.job.id,
+            requested_by=UUID(requested_by) if requested_by else None,
         )
 
     @task_app.task(

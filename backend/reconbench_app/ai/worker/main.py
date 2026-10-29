@@ -9,9 +9,10 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from procrastinate import App, PsycopgConnector
+from procrastinate.manager import JobManager
 from sqlalchemy.engine import Connection, make_url
 
-from reconbench_app.ai.consensus import enqueue_consensus_run
+from reconbench_app.ai.consensus import ConsensusJobDeferrer, enqueue_consensus_run
 from reconbench_app.ai.limits import LimitsState, PriceFile, load_limits, load_prices
 from reconbench_app.ai.task_contracts import AI_QUEUE, register_consensus_task_declaration
 from reconbench_app.ai.worker.config import AiWorkerSettings, check_startup_environment
@@ -25,6 +26,28 @@ from reconbench_app.logging_config import configure_logging
 from reconbench_app.worker_control import run_controlled_worker
 
 AI_WORKER_QUEUES = (AI_QUEUE,)
+
+
+def build_consensus_deferrer(app: App) -> ConsensusJobDeferrer:
+    """Defer the parse-queue consensus job inside the caller's SQLAlchemy transaction.
+
+    Built before the app opens: once the worker's async pool is open, the app's
+    connector would run async cursor code on the caller's sync connection (P3,
+    ``consensus_enqueue_failed TypeError``). The sync manager uses that connection.
+    """
+
+    consensus_task = register_consensus_task_declaration(app)
+    sync_job_manager = JobManager(app.connector.get_sync_connector())
+
+    def defer_consensus(connection: Connection, workspace_id: UUID, consensus_run_id: UUID) -> None:
+        deferrer = consensus_task.configure(
+            connection=connection.connection.driver_connection,
+            queueing_lock=f"consensus:{consensus_run_id}",
+        )
+        deferrer.job_manager = sync_job_manager
+        deferrer.defer(workspace_id=str(workspace_id), consensus_run_id=str(consensus_run_id))
+
+    return defer_consensus
 
 
 def main() -> int:
@@ -47,13 +70,7 @@ def main() -> int:
         .render_as_string(hide_password=False)
     )
     app = App(connector=PsycopgConnector(conninfo=conninfo))
-    consensus_task = register_consensus_task_declaration(app)
-
-    def defer_consensus(connection: Connection, workspace_id: UUID, consensus_run_id: UUID) -> None:
-        consensus_task.configure(
-            connection=connection.connection.driver_connection,
-            queueing_lock=f"consensus:{consensus_run_id}",
-        ).defer(workspace_id=str(workspace_id), consensus_run_id=str(consensus_run_id))
+    defer_consensus = build_consensus_deferrer(app)
 
     def enqueue_consensus(
         connection: Connection,

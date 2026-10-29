@@ -1,11 +1,11 @@
 """h6_vision handler: masked page images of one parser version → checked readings.
 
-Nothing is written to the document. The validated answer is kept only in the
-workspace cache (like H1); the review view re-checks it before showing it, and a
-person applies a value through the normal correction save. A shadow request
-(WI-BE6) only writes its ``reader_comparison`` row: no consensus run, no
-suggestion. Once the request is answered the page image bytes are cleared;
-their hash and geometry stay.
+The ai-worker writes nothing to the document version. The validated answer is kept in
+the workspace cache and a consensus run is queued in the same transaction; the general
+worker turns it into the AI version of a waiting scanned invoice (PD-2e). An answer that
+can't be used leaves the document "AI reading failed" (PD-2f, through the ledger). A
+shadow request (WI-BE6) only writes its ``reader_comparison`` row. Once the request is
+answered the page image bytes are cleared; their hash and geometry stay.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from uuid import UUID
 
 from sqlalchemy.engine import Connection
 
+from reconbench_app import reading_state
 from reconbench_app.ai import shadow, vision
 from reconbench_app.ai.consensus import ConsensusEnqueuer
 from reconbench_app.ai.contracts import VisionOutput
@@ -115,7 +116,8 @@ class VisionReadHandler:
             payload=payload,
             output_kind=vision.HOOK,
             max_output_tokens=limits.for_kind(vision.HOOK, local=local).max_output_tokens,
-            cacheable=True,
+            # A person's Retry (PD-2f) asks the provider again: never a cached answer.
+            cacheable=request.get("requested_by") is None,
             redacted=any(page.mask.get("boxes") for page in pages),
             document_id=subject.document_id,
             document_version_id=subject.version_id,
@@ -172,27 +174,28 @@ class VisionReadHandler:
                     connection, request["workspace_id"], subject.version_id, now
                 )
             return "not_applicable"
-        if subject is None or self.consensus_enqueue is None:
-            if subject is not None:
-                vision.purge_version_pages(
-                    connection, request["workspace_id"], subject.version_id, now
-                )
+        if subject is None:
             return "applied"
-        try:
-            # The run row and parse-queue insert share the answer transaction. The
-            # image bytes remain transient until that worker finishes the crop pass.
-            with connection.begin_nested():
-                enqueued = self.consensus_enqueue(
-                    connection,
-                    request["workspace_id"],
-                    subject.version_id,
-                    request["id"],
-                    call_log_id,
-                )
-        except Exception as exc:  # noqa: BLE001 - consensus is advisory in this phase.
-            _LOGGER.warning("consensus_enqueue_failed error_type=%s", type(exc).__name__)
-            enqueued = False
+        enqueued = False
+        if self.consensus_enqueue is not None:
+            try:
+                # The run row and parse-queue insert share the answer transaction. The
+                # image bytes remain transient until that worker finishes the crop pass.
+                with connection.begin_nested():
+                    enqueued = self.consensus_enqueue(
+                        connection,
+                        request["workspace_id"],
+                        subject.version_id,
+                        request["id"],
+                        call_log_id,
+                    )
+            except Exception as exc:  # noqa: BLE001 - the reading fails visibly instead.
+                _LOGGER.warning("consensus_enqueue_failed error_type=%s", type(exc).__name__)
         if not enqueued:
+            # Nothing will turn this answer into a version: the waiting invoice says so.
+            reading_state.mark_version_failed(
+                connection, request["workspace_id"], subject.version_id, reading_state.MERGE_FAILED
+            )
             vision.purge_version_pages(connection, request["workspace_id"], subject.version_id, now)
         return "applied"
 

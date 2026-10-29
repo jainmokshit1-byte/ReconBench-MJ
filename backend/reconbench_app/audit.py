@@ -56,6 +56,8 @@ AuditAction = Literal[
     "ai.manage_denied",
     "document.correct",
     "document.verify_ai_values",
+    "document.reading_retry",
+    "document.reading_use_rules",
     "document.duplicate_held",
     "document.duplicate_decide",
     "export.create",

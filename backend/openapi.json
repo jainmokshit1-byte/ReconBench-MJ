@@ -6784,6 +6784,92 @@
         ]
       }
     },
+    "/api/v1/documents/{document_id}/reading/retry": {
+      "post": {
+        "description": "Ask the active provider to read a failed scanned invoice again (PD-2f, audited).",
+        "operationId": "retry_reading_api_v1_documents__document_id__reading_retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry a failed AI reading",
+        "tags": [
+          "API v1",
+          "Documents"
+        ]
+      }
+    },
+    "/api/v1/documents/{document_id}/reading/use-rules": {
+      "post": {
+        "description": "Use the rules reading of a waiting or failed scanned invoice (PD-2f, audited).",
+        "operationId": "read_with_rules_api_v1_documents__document_id__reading_use_rules_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read a waiting invoice with rules",
+        "tags": [
+          "API v1",
+          "Documents"
+        ]
+      }
+    },
     "/api/v1/documents/{document_id}/verify-ai-values": {
       "post": {
         "description": "Record that a person checked values read by AI against the page (PD-4d).",

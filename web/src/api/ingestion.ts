@@ -428,6 +428,31 @@ export async function verifyAiValues(
   return value;
 }
 
+async function readingAction(
+  documentId: string,
+  version: number,
+  action: "retry" | "use-rules",
+  csrfToken: string,
+): Promise<DocumentDetails> {
+  const response = await request(`/documents/${encodeURIComponent(documentId)}/reading/${action}`, csrfToken, {
+    method: "POST",
+    headers: { "If-Match": `"${version}"` },
+  });
+  const value: unknown = await json(response);
+  if (!isRecord(value)) throw new Error("The server returned invalid document details.");
+  return value;
+}
+
+/** PD-2f: ask the active provider to read a failed scanned invoice again (audited). */
+export function retryReading(documentId: string, version: number, csrfToken: string): Promise<DocumentDetails> {
+  return readingAction(documentId, version, "retry", csrfToken);
+}
+
+/** PD-2f: use the rules reading of a waiting or failed scanned invoice (audited). */
+export function readWithRules(documentId: string, version: number, csrfToken: string): Promise<DocumentDetails> {
+  return readingAction(documentId, version, "use-rules", csrfToken);
+}
+
 /** Backwards-compatible name retained for invoice-only call sites. */
 export const correctInvoiceDocument = correctDocument;
 

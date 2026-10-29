@@ -100,7 +100,7 @@ CONFIG_ACTIVE = metadata.tables["config_active"]
 CONFIG_VERSIONS = metadata.tables["config_version"]
 
 VisionSkipReason = Literal[
-    "MODE_OFF", "NOT_PDF", "NOT_SCANNED_INVOICE", "NOT_NEEDED", "TOO_MANY_PAGES", "NO_PAGES"
+    "MODE_OFF", "NOT_PDF", "NOT_SCANNED_INVOICE", "TOO_MANY_PAGES", "NO_PAGES"
 ]
 ReaderPass = Literal["full", "crop:header", "crop:table", "crop:totals"]
 BoxOrder = Literal["yx", "xy"]
@@ -170,8 +170,8 @@ def vision_eligibility(facts: VisionFacts, *, mode: str, max_pages: int) -> Visi
         return VisionEligibility(False, "NO_PAGES")
     if facts.page_count > max_pages:
         return VisionEligibility(False, "TOO_MANY_PAGES")
-    if mode == "ai_assisted" and not facts.needs_verification:
-        return VisionEligibility(False, "NOT_NEEDED")
+    # With the switch on AI every scanned invoice is read, whether or not the rules
+    # reading needs a check (owner, 29 Oct 2026, step 6 D1).
     return VisionEligibility(True)
 
 
@@ -259,6 +259,49 @@ def load_subject(
         facts=facts,
         object_key=row.object_key,
         current=row.current_version_id == version_id and row.withdrawn_at is None,
+    )
+
+
+def live_request(connection: Connection, workspace_id: UUID, version_id: UUID) -> bool:
+    """Whether a vision request for this version is still running or being merged."""
+
+    return bool(
+        connection.scalar(
+            sa.select(sa.literal(True))
+            .select_from(REQUESTS)
+            .where(
+                REQUESTS.c.workspace_id == workspace_id,
+                REQUESTS.c.subject_id == version_id,
+                REQUESTS.c.hook == HOOK,
+                REQUESTS.c.shadow.is_(False),
+                sa.or_(
+                    REQUESTS.c.request_state.in_(("queued", "reserved", "sending")),
+                    sa.and_(
+                        REQUESTS.c.request_state == "succeeded",
+                        REQUESTS.c.apply_outcome.in_(("applied", "pending")),
+                    ),
+                ),
+            )
+            .limit(1)
+        )
+    )
+
+
+def acknowledge_uncertain(
+    connection: Connection, workspace_id: UUID, version_id: UUID, *, user_id: UUID
+) -> None:
+    """A person's Retry accepts that an uncertain earlier attempt may have been billed."""
+
+    connection.execute(
+        sa.update(REQUESTS)
+        .where(
+            REQUESTS.c.workspace_id == workspace_id,
+            REQUESTS.c.subject_id == version_id,
+            REQUESTS.c.hook == HOOK,
+            REQUESTS.c.request_state == "uncertain",
+            REQUESTS.c.acknowledged_at.is_(None),
+        )
+        .values(acknowledged_by=user_id, acknowledged_at=sa.func.now())
     )
 
 

@@ -20,6 +20,7 @@ import { useAuth } from "../auth/useAuth";
 import { buildAccuracyCorrectionExport } from "../utils/accuracyCorrectionExport";
 import { AiSuggestionsPanel } from "./AiSuggestionsPanel";
 import { AiValuesVerify } from "./AiValuesVerify";
+import { ReadingStatus } from "./ReadingStatus";
 
 const PdfPreview = lazy(() => import("./PdfPreview").then((module) => ({ default: module.PdfPreview })));
 
@@ -33,6 +34,13 @@ interface PreviewData {
 
 function record(value: unknown): Record<string, unknown> {
   return isRecordValue(value) ? value : {};
+}
+
+/** The provider on the method chip (D2): never the server address, only its kind (Q9). */
+function readingProviderLabel(provider: unknown): string {
+  if (provider === "vllm") return " · Company server";
+  if (provider === "gemini") return " · Gemini";
+  return "";
 }
 
 function list(value: unknown): Record<string, unknown>[] {
@@ -323,6 +331,8 @@ function DocumentCard({
   const lines = list(details["lines"]);
   const evidence = list(details["field_evidence"]);
   const needsVerification = version["needs_verification"] === true || document["needs_verification"] === true;
+  // PD-2f, step 6 D4: no edit while the AI reading is pending; a person chooses first.
+  const readingPending = document["reading_state"] === "waiting" || document["reading_state"] === "failed";
   const docType = typeof document["doc_type"] === "string" ? document["doc_type"] : "unknown";
   const allowedHeaders = headerFieldsFor(docType);
   const allowedLineFields = lineFieldsFor(docType);
@@ -480,18 +490,19 @@ function DocumentCard({
           <h3>{valueText(version["doc_no"])}</h3>
         </div>
         <div className="preview-document-badges">
-          {version["reading_method"] === "ai" || version["reading_method"] === "rules" ? <span className="quiet-badge" aria-label="Reading method">{version["reading_method"] === "ai" ? "Read by AI" : "Read by rules"}</span> : null}
+          {version["reading_method"] === "ai" || version["reading_method"] === "rules" ? <span className="quiet-badge" aria-label="Reading method">{version["reading_method"] === "ai" ? `Read by AI${readingProviderLabel(details["reading_provider"])}` : "Read by rules"}</span> : null}
           {version["extraction_method"] === "pdf_ocr" ? <span className="ocr-chip">OCR-assisted</span> : null}
           {needsVerification ? <span className="verification-chip"><AlertTriangle size={13} /> Needs verification</span> : <span className="quiet-badge">Parsed</span>}
         </div>
       </div>
-      {allowedHeaders.length ? <div className="invoice-correction-toolbar"><button className="button button-subtle" type="button" onClick={() => { if (editing) { setDraft(correctionDraft(version)); setLineDraft(lines.map(correctionLine)); setVerified(false); setApplied({}); } setEditing((current) => !current); setSaveError(null); }}>{editing ? "Cancel editing" : `Edit extracted ${docType.toUpperCase()}`}</button>{(document["vendor_id"] === null || document["vendor_id"] === undefined) ? <Link className="button button-subtle" to={`/mapping?document_id=${encodeURIComponent(String(document["id"] ?? ""))}`}>Assign vendor</Link> : null}{saveNotice ? <span role="status">{saveNotice}</span> : null}</div> : null}
+      {allowedHeaders.length && !readingPending ? <div className="invoice-correction-toolbar"><button className="button button-subtle" type="button" onClick={() => { if (editing) { setDraft(correctionDraft(version)); setLineDraft(lines.map(correctionLine)); setVerified(false); setApplied({}); } setEditing((current) => !current); setSaveError(null); }}>{editing ? "Cancel editing" : `Edit extracted ${docType.toUpperCase()}`}</button>{(document["vendor_id"] === null || document["vendor_id"] === undefined) ? <Link className="button button-subtle" to={`/mapping?document_id=${encodeURIComponent(String(document["id"] ?? ""))}`}>Assign vendor</Link> : null}{saveNotice ? <span role="status">{saveNotice}</span> : null}</div> : null}
       {typeof document["id"] === "string" ? <AiSuggestionsPanel documentId={document["id"]} documentVersion={documentVersion} fieldLabels={fieldLabels} applyBlockedReason={applyBlockedReason} onApply={applySuggestion} onKeepCurrent={keepCurrentValue} onFocusSource={onFocusSource} isRelevantSuggestion={(suggestion) => {
         if (!reviewOnly || !needsVerification) return true;
         if (suggestion.scope === "header") return visibleHeaders.some(([field]) => field === suggestion.field);
         return visibleLines.some((line) => line["line_no"] === suggestion.line_no)
           || !lineDraft.some((line) => line.line_no === suggestion.line_no);
       }} /> : null}
+      <ReadingStatus details={details} csrfToken={csrfToken} onSaved={onSaved} />
       <AiValuesVerify details={details} csrfToken={csrfToken} fieldLabels={fieldLabels} onFocusSource={onFocusSource} onSaved={onSaved} />
       {reviewOnly && needsVerification ? (
         <section className="verify-unverified-fields" aria-label="Fields needing verification">

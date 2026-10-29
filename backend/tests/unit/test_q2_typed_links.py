@@ -11,9 +11,20 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+import pytest
 from reconbench_core.mapping import MappingDocument, MappingPO, resolve_links
 from reconbench_core.parsers import parse
-from reconbench_core.schema import DocType, Document, LinkState, LinkType
+from reconbench_core.schema import (
+    DocType,
+    Document,
+    FieldOrigin,
+    FieldSource,
+    FieldVerification,
+    LinkState,
+    LinkType,
+)
+from tests.unit import test_d4_matching as d4
+from tests.unit import test_phase4_mapping_links as phase4
 
 _VENDOR = UUID(int=100)
 PO_NO = "PO/25-26/01-100"
@@ -157,3 +168,93 @@ def test_a_handwritten_grn_number_without_part_or_amount_support_makes_no_link()
     assert not [
         link for link in results[invoice.document_id].links if link.link_type is LinkType.INV_GRN
     ]
+
+
+# --------------------------------------------------------------------------- PD-2h, R1
+
+
+def _read_by_ai(document: Document, *, ocr_total: str | None, verified: bool = False) -> Document:
+    """The invoice as the AI read it: its grand total has origin AI (PD-2a)."""
+
+    total = document.header.grand_total
+    assert total is not None
+    ai_total = total.model_copy(
+        update={
+            "source": FieldSource.AI,
+            "origin": FieldOrigin.AI,
+            "verification": FieldVerification.USER if verified else FieldVerification.NONE,
+        }
+    )
+    extras = dict(document.header.extras)
+    if ocr_total is not None:
+        extras["ocr_reading"] = {"grand_total": ocr_total}
+    header = document.header.model_copy(update={"grand_total": ai_total, "extras": extras})
+    return document.model_copy(update={"header": header})
+
+
+def _hint_links(invoice: Document) -> list[Any]:
+    resolutions = resolve_links([d4._source(1, invoice)], [d4._po(2, d4._po_document())])
+    return [link for link in resolutions[0].links if "Handwritten" in link.evidence]
+
+
+@pytest.mark.parametrize(
+    ("ocr_total", "verified", "linked"),
+    [
+        (None, False, False),  # the AI total would support its own handwritten reference
+        ("1100.00", False, False),  # the OCR cross-check disagrees
+        ("1179.50", False, True),  # the OCR cross-check agrees within one rupee
+        (None, True, True),  # a person verified the total
+    ],
+)
+def test_a_handwritten_reference_needs_a_total_the_ai_did_not_support_alone(
+    ocr_total: str | None, verified: bool, linked: bool
+) -> None:
+    """PD-2h self-support guard (D103 decision 4)."""
+
+    invoice = _read_by_ai(
+        d4._invoice([d4._ref("po", "08-081")]), ocr_total=ocr_total, verified=verified
+    )
+    links = _hint_links(invoice)
+    assert bool(links) is linked
+    # Hint links are 100 % suggestions.
+    assert all(link.state is LinkState.SUGGESTED for link in links)
+
+
+def test_a_rules_read_total_keeps_the_wi_d4_rule() -> None:
+    [link] = _hint_links(d4._invoice([d4._ref("po", "08-081")]))
+    assert link.state is LinkState.SUGGESTED
+
+
+def _with_ai_description(source: MappingDocument, *, verified: bool) -> MappingDocument:
+    document = source.document
+    line = document.lines[0]
+    assert line.description is not None
+    description = line.description.model_copy(
+        update={
+            "source": FieldSource.AI,
+            "origin": FieldOrigin.AI,
+            "verification": FieldVerification.USER if verified else FieldVerification.NONE,
+        }
+    )
+    lines = (line.model_copy(update={"description": description}), *document.lines[1:])
+    return source.model_copy(update={"document": document.model_copy(update={"lines": lines})})
+
+
+@pytest.mark.parametrize(("verified", "state"), [(False, "suggested"), (True, "auto")])
+def test_no_link_is_auto_while_a_value_read_by_ai_waits_for_a_person(
+    verified: bool, state: str
+) -> None:
+    """Step 6 R1: a person-verified PO reference alone no longer makes an AI-read
+    invoice's link automatic; every AI value must have had a person's click (PD-2b)."""
+
+    invoice = phase4._verify_header_reference(
+        phase4._source(
+            10,
+            phase4._document(phase4._invoice_xml("INV-10", po_ref="PO-100"), DocType.INVOICE),
+        ),
+        "po_refs",
+    )
+    po = phase4._po(20, phase4._document(phase4._po_xml("PO-100"), DocType.PO))
+    assert resolve_links([invoice], [po])[0].links[0].state is LinkState.AUTO
+    result = resolve_links([_with_ai_description(invoice, verified=verified)], [po])[0]
+    assert result.links and {link.state.value for link in result.links} == {state}

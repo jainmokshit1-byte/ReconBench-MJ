@@ -1022,6 +1022,52 @@ def verify_ai_values(
     )
 
 
+def _reading_action(document_id: UUID, request: Request, *, retry: bool) -> Response:
+    expected_version = require_if_match(request.headers.get("if-match"))
+    service = _service(request)
+    action = service.retry_reading if retry else service.read_with_rules
+    try:
+        result = action(_actor(request), document_id, expected_version=expected_version)
+    except (BatchVersionConflict, IngestionFailure) as exc:
+        return _handle_ingestion_error(exc, request)
+    if result is None:
+        return _problem(
+            request,
+            status=404,
+            title="Not found",
+            detail="The document was not found.",
+            code="not_found",
+        )
+    return DecimalJSONResponse(
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["document"]["version"]))},
+    )
+
+
+@router.post(
+    "/documents/{document_id}/reading/retry",
+    tags=["Documents"],
+    summary="Retry a failed AI reading",
+)
+@requires("files.upload")
+def retry_reading(document_id: UUID, request: Request) -> Response:
+    """Ask the active provider to read a failed scanned invoice again (PD-2f, audited)."""
+
+    return _reading_action(document_id, request, retry=True)
+
+
+@router.post(
+    "/documents/{document_id}/reading/use-rules",
+    tags=["Documents"],
+    summary="Read a waiting invoice with rules",
+)
+@requires("files.upload")
+def read_with_rules(document_id: UUID, request: Request) -> Response:
+    """Use the rules reading of a waiting or failed scanned invoice (PD-2f, audited)."""
+
+    return _reading_action(document_id, request, retry=False)
+
+
 @router.get("/documents/{document_id}/ai-suggestions", tags=["Documents"])
 @requires("data.view")
 def get_document_ai_suggestions(document_id: UUID, request: Request) -> Response:

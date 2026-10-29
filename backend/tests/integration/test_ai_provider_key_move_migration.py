@@ -35,7 +35,10 @@ VLLM_KEY = "synthetic-vllm-key-pv2-0000"
 TESTED_AT = datetime(2026, 10, 18, 9, 30, tzinfo=UTC)
 
 _REWIND_0029 = (
-    # 0035 (scanned-invoice switch and reading method, PD-2c) is removed first; the upgrade
+    # 0036 (waiting for reading, PD-2f) is removed first; the upgrade re-applies it.
+    "ALTER TABLE document DROP CONSTRAINT document_reading_state_ck, "
+    "DROP COLUMN reading_failure_code, DROP COLUMN reading_state",
+    # 0035 (scanned-invoice switch and reading method, PD-2c) is removed next; the upgrade
     # re-applies it.
     "ALTER TABLE document_version DROP CONSTRAINT document_version_reading_method_ck, "
     "DROP COLUMN reading_method",
@@ -192,7 +195,7 @@ def _clone_at_0028(public_key: SealingPublicKey, *, conflict: bool = False) -> I
         clone = Clone(engine, clone_url)
         with engine.begin() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-            assert heads == {"0035"}, heads
+            assert heads == {"0036"}, heads
             for statement in _REWIND_0029:
                 connection.exec_driver_sql(statement)
             # Cards of the source database keep no key from other tests.

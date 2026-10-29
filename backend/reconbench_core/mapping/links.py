@@ -370,6 +370,21 @@ def _has_ai_values(document: Document) -> bool:
     return any(isinstance(value, FieldValue) and _read_by_ai(value) for value in values)
 
 
+def _has_unverified_ai_values(document: Document) -> bool:
+    """Whether any value read by AI still waits for a person's check (PD-2b)."""
+
+    values = [getattr(document.header, name) for name in type(document.header).model_fields]
+    values.extend(
+        getattr(line, name) for line in document.lines for name in type(line).model_fields
+    )
+    return any(
+        isinstance(value, FieldValue)
+        and _read_by_ai(value)
+        and value.verification is not FieldVerification.USER
+        for value in values
+    )
+
+
 def _field_is_user_verified(field: object | None) -> bool:
     return bool(
         field is not None
@@ -1304,6 +1319,27 @@ def _grand_total(document: Document) -> Decimal | None:
     return field.value if field is not None and field.value is not None else None
 
 
+def _self_supported_total(document: Document) -> Decimal | None:
+    """The invoice total a handwritten-reference hint may rest on (PD-2h guard).
+
+    A total read by AI supports the hint only when a person verified it or the OCR
+    reading of the same file agrees within one rupee; otherwise the AI reading would
+    support its own handwritten reference. A total read by rules is used as before.
+    """
+
+    field = document.header.grand_total
+    total = _grand_total(document)
+    if field is None or total is None or not _read_by_ai(field) or _field_is_user_verified(field):
+        return total
+    ocr_reading = document.header.extras.get("ocr_reading")
+    ocr_text = ocr_reading.get("grand_total") if isinstance(ocr_reading, Mapping) else None
+    try:
+        ocr_total = Decimal(str(ocr_text)) if ocr_text is not None else None
+    except ArithmeticError:
+        return None
+    return total if _within_rupee(total, ocr_total) else None
+
+
 def _within_rupee(left: Decimal | None, right: Decimal | None) -> bool:
     return (
         left is not None
@@ -1340,7 +1376,7 @@ def _handwritten_header_links(
     if not isinstance(source.document.header, InvoiceHeader):
         return ()
     vendor = _gstin_value(source.document, "vendor_gstin")
-    total = _grand_total(source.document)
+    total = _self_supported_total(source.document)
     if vendor is None or total is None:
         return ()
     grns = tuple(
@@ -3228,6 +3264,24 @@ def resolve_links(
                     )
                 )
             result = result.model_copy(update={"links": tuple(dated_links)})
+        if _has_unverified_ai_values(source.document):
+            # A value read by AI counts only after a person's check (PD-2b): no link that
+            # rests on such a document is automatic, whatever the method (step 6 R1, PD-3b).
+            result = result.model_copy(
+                update={
+                    "links": tuple(
+                        link.model_copy(
+                            update={
+                                "state": LinkState.SUGGESTED,
+                                "evidence": f"{link.evidence}; AI-read values not verified",
+                            }
+                        )
+                        if link.state is LinkState.AUTO
+                        else link
+                        for link in result.links
+                    )
+                }
+            )
         issue, detail = last_issues[source.document_id]
         reason_detail = result.reason_detail or detail
         reference_text = result.reference_text

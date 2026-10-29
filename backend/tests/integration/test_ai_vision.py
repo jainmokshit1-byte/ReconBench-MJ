@@ -30,6 +30,7 @@ import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from reconbench_app import ingestion as ingestion_module
+from reconbench_app import reading_state
 from reconbench_app.ai import consensus as consensus_app
 from reconbench_app.ai import vision
 from reconbench_app.ai.consensus import ConsensusService, enqueue_consensus_run
@@ -153,11 +154,19 @@ class _FakeQueue:
         del task_name, file_id, connection
         return 1
 
+    retried_by: list[UUID | None] = field(default_factory=list)
+
     def enqueue_vision_pages(
-        self, *, workspace_id: UUID, document_version_id: UUID, connection: Connection
+        self,
+        *,
+        workspace_id: UUID,
+        document_version_id: UUID,
+        connection: Connection,
+        requested_by: UUID | None = None,
     ) -> int:
         del workspace_id, connection
         self.vision_versions.append(document_version_id)
+        self.retried_by.append(requested_by)
         return len(self.vision_versions)
 
 
@@ -456,6 +465,16 @@ def _vision_requests(engine: Engine, world: World) -> list[Any]:
         )
 
 
+def _reading(engine: Engine, document_id: UUID) -> tuple[str, str | None]:
+    with engine.connect() as connection:
+        row = connection.execute(
+            sa.select(DOCUMENTS.c.reading_state, DOCUMENTS.c.reading_failure_code).where(
+                DOCUMENTS.c.id == document_id
+            )
+        ).one()
+    return str(row.reading_state), row.reading_failure_code
+
+
 def _ready_invoice(
     engine: Engine, keys: tuple[Keyring, SealingPublicKey], world: World
 ) -> tuple[UUID, _Recorder]:
@@ -516,15 +535,47 @@ def test_page_images_are_read_as_suggestions_and_never_change_the_document(
     assert all(item["page"] == 1 for item in view["suggestions"])
 
 
-def test_dark_consensus_records_crop_provenance_without_applying_values(
+@pytest.fixture
+def forget_ai_values(engine: Engine) -> Iterator[Any]:
+    """Remove the AI-origin evidence a test stored in the shared database.
+
+    The migration tests rewind a copy of this database below revision 0032, which is
+    refused while any value has origin AI (PD-2a, by design). The append-only trigger is
+    paused for that one statement, as revisions 0024 and 0035 do.
+    """
+
+    workspaces: list[UUID] = []
+    yield workspaces.append
+    if workspaces:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("ALTER TABLE field_evidence DISABLE TRIGGER field_evidence_append_only")
+            )
+            connection.execute(
+                sa.text(
+                    "DELETE FROM field_evidence WHERE origin = 'ai' AND workspace_id = ANY(:ids)"
+                ),
+                {"ids": workspaces},
+            )
+            connection.execute(
+                sa.text("ALTER TABLE field_evidence ENABLE TRIGGER field_evidence_append_only")
+            )
+
+
+def test_the_ai_reading_becomes_the_current_version_with_crop_provenance(
     engine: Engine,
     keys: tuple[Keyring, SealingPublicKey],
     make_world: Any,
     monkeypatch: pytest.MonkeyPatch,
+    forget_ai_values: Any,
 ) -> None:
+    """PD-2e: answer → consensus run → merged ``ai_first`` version, current and unverified."""
+
     world = make_world()
+    forget_ai_values(world.workspace_id)
     document_id = _upload(world, synthetic_invoice_pdf(), name="consensus-invoice.pdf")
     before = _state(engine, document_id)
+    assert _reading(engine, document_id) == ("waiting", None)
     assert _prepare(world) == ["queued"]
     [request_id] = world.ai_queue.request_ids
     run_ids: list[UUID] = []
@@ -588,10 +639,52 @@ def test_dark_consensus_records_crop_provenance_without_applying_values(
         return {need.key.text(): "" for need in needs}
 
     monkeypatch.setattr(consensus_app, "reread_vision_crops_isolated", recorded_crop_reads)
-    service = ConsensusService(engine)
+    followups: list[UUID] = []
+    service = ConsensusService(
+        engine,
+        enqueue_followup=lambda _c, _w, doc_id, _f, _t: followups.append(doc_id),
+        append_ai_version=world.service.append_ai_version,
+    )
     assert service._process(world.workspace_id, consensus_run_id) == "succeeded"
     assert crop_rounds == [1, 2]
-    assert _state(engine, document_id) == before
+    after = _state(engine, document_id)
+    assert after[0] != before[0]  # a new current version
+    assert _reading(engine, document_id) == ("ready", None)
+    assert followups == [document_id]  # vendor resolution, then mapping, run again
+    with engine.connect() as connection:
+        version = (
+            connection.execute(
+                sa.select(metadata.tables["document_version"]).where(
+                    metadata.tables["document_version"].c.id == after[0]
+                )
+            )
+            .mappings()
+            .one()
+        )
+        ai_evidence = (
+            connection.execute(
+                sa.select(metadata.tables["field_evidence"]).where(
+                    metadata.tables["field_evidence"].c.document_version_id == after[0],
+                    metadata.tables["field_evidence"].c.origin == "ai",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert (version["extraction_method"], version["reading_method"]) == ("ai_first", "ai")
+    assert version["derived_from_version_id"] == before[0]
+    assert version["needs_verification"] is True
+    assert version["extras"]["header"]["reading_policy"] == "arb.llm"
+    assert version["extras"]["header"]["cross_check"]
+    assert ai_evidence
+    # Every AI value: its call, unverified, below the review floor (PD-2a, MG-2, MG-10).
+    assert all(row["ai_call_id"] is not None for row in ai_evidence)
+    assert all(row["verification"] == "none" for row in ai_evidence)
+    assert all(row["confidence"] < Decimal("0.70") for row in ai_evidence)
+    # The document page names the provider and lists the AI values beside OCR (PD-4d).
+    page = world.client.get(f"/api/v1/documents/{document_id}").json()
+    assert page["reading_provider"] == "gemini"
+    assert page["ai_values"] and all(item["verified"] is False for item in page["ai_values"])
     [after_page] = _page_rows(engine, world)
     assert after_page["image"] is None and after_page["purged_at"] is not None
     with engine.connect() as connection:
@@ -612,6 +705,7 @@ def test_dark_consensus_records_crop_provenance_without_applying_values(
             .all()
         )
     assert run["status"] == "succeeded" and run["summary"]
+    assert run["result_version_id"] == after[0]
     assert decisions
     assert all(not item["auto_verified"] and not item["reopened"] for item in decisions)
     assert any(
@@ -688,6 +782,13 @@ def test_consented_d42_field_appends_a_same_value_verified_version(
     ).run(request_id)
     assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
     [consensus_run_id] = run_ids
+    # The person chose the rules reading meanwhile, so no AI version is made (plan R3);
+    # D42 (the workspace opt-in) still applies to that rules version.
+    chosen = world.client.post(
+        f"/api/v1/documents/{document_id}/reading/use-rules",
+        headers={"If-Match": _view(world, document_id)[1], "X-CSRF-Token": CSRF},
+    )
+    assert chosen.status_code == 200, chosen.text
 
     def recorded_crop_reads(
         _pages: Any, needs: Any, *, languages: tuple[str, ...], round_no: int
@@ -794,6 +895,21 @@ def test_correction_save_records_vision_provenance(
     document_id, _provider = _ready_invoice(engine, keys, world)
     view, etag = _view(world, document_id)
     ai_call_id = view["ai_call_id"]
+    # Step 6 D4: no correction while the invoice waits for its reading (no merge job runs
+    # here, so the reading failed); the person chooses the rules reading first.
+    refused = world.client.put(
+        f"/api/v1/documents/{document_id}/correction",
+        json={"vendor_name": "Typo Traders"},
+        headers={"If-Match": etag, "X-CSRF-Token": CSRF},
+    )
+    assert refused.status_code == 409 and refused.json()["code"] == "reading_pending"
+    rules = world.client.post(
+        f"/api/v1/documents/{document_id}/reading/use-rules",
+        headers={"If-Match": etag, "X-CSRF-Token": CSRF},
+    )
+    assert rules.status_code == 200, rules.text
+    assert rules.json()["document"]["reading_state"] == "ready"
+    etag = rules.headers["etag"]
     rejected = world.client.put(
         f"/api/v1/documents/{document_id}/correction",
         json={
@@ -833,6 +949,26 @@ def test_correction_save_records_vision_provenance(
     # The reading stays reviewable on the corrected version.
     after, _etag = _view(world, document_id)
     assert after["state"] == "available"
+
+
+def test_an_answer_nothing_can_merge_fails_the_reading(
+    engine: Engine, keys: tuple[Keyring, SealingPublicKey], make_world: Any
+) -> None:
+    """P3 no longer hides (PD-2e/PD-2f): a failed merge enqueue fails the reading visibly."""
+
+    world = make_world()
+    document_id = _upload(world, synthetic_invoice_pdf(), name="vision-merge.pdf")
+    assert _reading(engine, document_id) == ("waiting", None)
+    assert _prepare(world) == ["queued"]
+    [request_id] = world.ai_queue.request_ids
+
+    def broken(*_args: Any) -> bool:
+        raise TypeError("synthetic enqueue failure")
+
+    provider = _Recorder([json.dumps(recorded_response())])
+    result = _runner(engine, keys[0], provider, consensus_enqueue=broken).run(request_id)
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
+    assert _reading(engine, document_id) == ("failed", reading_state.MERGE_FAILED)
 
 
 def test_grn_pdfs_are_never_read_by_ai(engine: Engine, make_world: Any) -> None:
@@ -913,10 +1049,17 @@ def test_a_superseded_version_discards_the_answer(
 
     class _DuringCall(_Recorder):
         def complete(self, request: ProviderRequest, *, api_key: str) -> ProviderResult:
+            # The person chooses the rules reading while the call runs (plan R3), then
+            # corrects it, so the answer's version is no longer current.
+            rules = world.client.post(
+                f"/api/v1/documents/{document_id}/reading/use-rules",
+                headers={"If-Match": etag, "X-CSRF-Token": CSRF},
+            )
+            assert rules.status_code == 200, rules.text
             saved = world.client.put(
                 f"/api/v1/documents/{document_id}/correction",
                 json={"doc_no": "SYN-INV-0042-R"},
-                headers={"If-Match": etag, "X-CSRF-Token": CSRF},
+                headers={"If-Match": rules.headers["etag"], "X-CSRF-Token": CSRF},
             )
             assert saved.status_code == 200, saved.text
             return super().complete(request, api_key=api_key)
@@ -927,6 +1070,8 @@ def test_a_superseded_version_discards_the_answer(
     assert (result.state, result.apply_outcome) == ("succeeded", "discarded_stale")
     view, _etag = _view(world, document_id)
     assert view["state"] == "unavailable" and view["code"] == "discarded_stale"
+    # The late answer changes nothing: the person's rules reading stays the one used.
+    assert _reading(engine, document_id) == ("ready", None)
 
 
 def test_vllm_reader_reads_one_page_per_call_and_feeds_the_same_pipeline(

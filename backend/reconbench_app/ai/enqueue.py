@@ -10,12 +10,14 @@ applying. Creating the ledger row and deferring its job share one transaction.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 from sqlalchemy.engine import Connection
 
+from reconbench_app import reading_state
 from reconbench_app.ai import h1, h2, h3, h4, ledger, vision
 from reconbench_app.ai.contracts import SCHEMA_VERSIONS
 from reconbench_app.ai.gate import DeploymentGate
@@ -37,6 +39,22 @@ from reconbench_app.extraction.vision import (
 
 if TYPE_CHECKING:
     from reconbench_app.mapping_service import MappingSnapshot
+
+
+# Eligibility reasons of a scanned invoice the reader can't take (PD-2f, D5).
+_REFUSED_SCANNED = frozenset({"TOO_MANY_PAGES", "NO_PAGES"})
+
+
+@dataclass(frozen=True, slots=True)
+class ScannedReadings:
+    """The AI reading plan of freshly parsed versions (PD-2e, PD-2f)."""
+
+    targets: tuple[tuple[UUID, UUID], ...] = ()
+    """(version id, document id) to read with AI."""
+    refused: tuple[tuple[UUID, str], ...] = ()
+    """(document id, failure code) of scanned invoices the reader can't take."""
+    rules: tuple[UUID, ...] = ()
+    """Document ids whose fresh current version is read by rules only."""
 
 
 class AiJobQueue(Protocol):
@@ -134,6 +152,7 @@ class AiHookEnqueuer:
         operation_key: str,
         run_id: UUID | None = None,
         requested_by: UUID | None = None,
+        person_retry: bool = False,
     ) -> UUID | None:
         provider, model = settings.target(hook)
         assert provider is not None and model is not None
@@ -159,6 +178,7 @@ class AiHookEnqueuer:
                 requested_by=requested_by,
                 reader_params=self._reader_params(hook, settings),
                 shadow=hook == vision.HOOK and settings.strategy == "shadow",
+                person_retry=person_retry,
             ),
         )
         if request_id is None:
@@ -233,32 +253,54 @@ class AiHookEnqueuer:
             )
         return queued
 
-    def vision_targets(
+    def scanned_readings(
         self, connection: Connection, workspace_id: UUID, version_ids: Sequence[UUID]
-    ) -> list[UUID]:
-        """Freshly parsed scanned invoices whose pages should be prepared for the vision reader.
+    ) -> ScannedReadings:
+        """Which freshly parsed versions the AI reads, and which scanned invoices it can't.
 
-        Only with the scanned-invoice switch on AI (PD-2c); every other version gets no call.
+        Only with the scanned-invoice switch on AI (PD-2c); every other version gets no
+        call and stays read by rules. A scanned invoice the reader can't take (too many
+        pages, over the call cap of one upload) is refused with a stated reason, so it
+        shows "AI reading failed" instead of silently counting as read by rules (D5).
         """
 
         ready = self.ready(connection, workspace_id, vision.HOOK)
-        if ready is None:
-            return []
-        settings, limits = ready
-        if not settings.reads_scanned_invoices:
-            return []
-        targets: list[UUID] = []
+        settings, limits = ready if ready is not None else (None, None)
+        reads = settings is not None and settings.reads_scanned_invoices
+        targets: list[tuple[UUID, UUID]] = []
+        refused: list[tuple[UUID, str]] = []
+        rules: list[UUID] = []
         for version_id in version_ids:
-            if len(targets) >= limits.per_operation_calls:
-                break
             subject = vision.load_subject(connection, workspace_id, version_id)
-            if (
-                subject is not None
-                and subject.current
-                and vision.eligibility(subject, mode=settings.mode, limits=limits).eligible
-            ):
-                targets.append(version_id)
-        return targets
+            if subject is None or not subject.current:
+                continue
+            if not reads:
+                rules.append(subject.document_id)
+                continue
+            assert settings is not None and limits is not None
+            verdict = vision.eligibility(subject, mode=settings.mode, limits=limits)
+            if verdict.eligible:
+                if len(targets) >= limits.per_operation_calls:
+                    refused.append((subject.document_id, reading_state.NOT_QUEUED))
+                else:
+                    targets.append((version_id, subject.document_id))
+            elif verdict.reason in _REFUSED_SCANNED:
+                refused.append((subject.document_id, reading_state.NOT_ELIGIBLE))
+            else:
+                rules.append(subject.document_id)
+        return ScannedReadings(tuple(targets), tuple(refused), tuple(rules))
+
+    def vision_targets(
+        self, connection: Connection, workspace_id: UUID, version_ids: Sequence[UUID]
+    ) -> list[UUID]:
+        """Freshly parsed scanned invoices whose pages should be prepared for the vision reader."""
+
+        return [
+            version_id
+            for version_id, _document_id in self.scanned_readings(
+                connection, workspace_id, version_ids
+            ).targets
+        ]
 
     def vision_read(
         self,
@@ -268,11 +310,14 @@ class AiHookEnqueuer:
         *,
         subject_version: str,
         skip_code: str | None = None,
+        requested_by: UUID | None = None,
     ) -> UUID | None:
         """Queue one vision request after its pages were stored (same transaction).
 
         With ``skip_code`` the request is recorded as skipped at once (for example the
         pages could not be rendered), so the review view can say why nothing came.
+        ``requested_by`` is a person's Retry (PD-2f): a new attempt after a failed one,
+        in its own operation, so the first attempt's call budget doesn't refuse it.
         """
 
         ready = self.ready(connection, workspace_id, vision.HOOK)
@@ -287,7 +332,13 @@ class AiHookEnqueuer:
                 subject_type=vision.SUBJECT_TYPE,
                 subject_id=version_id,
                 subject_version=subject_version,
-                operation_key=f"{vision.HOOK}:{version_id}",
+                operation_key=(
+                    f"{vision.HOOK}:{version_id}"
+                    if requested_by is None
+                    else f"{vision.HOOK}:{version_id}:retry:{new_id()}"
+                ),
+                requested_by=requested_by,
+                person_retry=requested_by is not None,
             )
         provider, model = settings.vision_target
         assert provider is not None and model is not None

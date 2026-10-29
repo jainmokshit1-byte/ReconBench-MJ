@@ -33,6 +33,7 @@ from reconbench_core.parsers.types import BuyerEntityHint
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
+from reconbench_app import reading_state
 from reconbench_app.ai.enqueue import AiHookEnqueuer
 from reconbench_app.authorization import requires
 from reconbench_app.db.ids import new_id
@@ -162,6 +163,8 @@ class VendorResolutionService:
                     .where(
                         document.c.workspace_id == workspace_id,
                         document.c.withdrawn_at.is_(None),
+                        # A document waiting for its AI reading is not used yet (PD-2f).
+                        reading_state.ready_clause(document),
                     )
                     .order_by(document.c.natural_key, document.c.id)
                 )

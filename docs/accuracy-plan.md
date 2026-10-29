@@ -1632,7 +1632,7 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 - **Tests:** integration "mapping pass + reconciliation run with AI configured and consent current ⇒ `ai_request` count unchanged"; unit on `hooks_for_mode`. **Status:** pending (step 2).
 
 #### PD-3b — Determinism properties per method
-- **Description:** everything read by rules keeps SCN-20 / property #8. AI-read scanned invoices get a new property: with a stub reader returning arbitrary valid, invalid or hostile output, **no case is Matched and no link is auto without a person's click**. **Tests:** hypothesis test in `backend/tests/property/`. **Deps:** PD-2a, PD-2b, PD-2e. **Status:** pending (step 6).
+- **Description:** everything read by rules keeps SCN-20 / property #8. AI-read scanned invoices get a new property: with a stub reader returning arbitrary valid, invalid or hostile output, **no case is Matched and no link is auto without a person's click**. **Tests:** hypothesis test in `backend/tests/property/`. **Deps:** PD-2a, PD-2b, PD-2e. **Status:** built (D109), not live: `tests/property/test_pd3b_ai_reading.py` (500 examples, zero confidence gate).
 
 #### PD-3c — P1 lump-sum line rule
 - **Description:** amount-based payable when the invoice line and the PO line both have no quantity; engine version and rules hash bump; no tolerance loosened. **Status:** pending the owner's decision.
@@ -1657,17 +1657,17 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 
 #### PD-2e — AI reading for scanned invoices (D103 decision 3; = WI-BE7a/b/c rescoped)
 - **Description:** only **scanned invoices with the switch on AI** (a mixed PDF counts as scanned) are read by the active provider. The general worker turns the validated answer into a new current version (`extraction_method = ai_first`, origin AI from PD-2a) through a pure `merge_readings` with an `arb.llm` policy: the LLM leads; OCR runs as a visible cross-check (disagreement flagged `LLM_DISAGREEMENT` with the OCR value side by side, never substituted). Guards kept: MG-1 (PD-2a), MG-2, MG-3, MG-4, MG-5, MG-6, MG-7 (a manual or verified field is never replaced), MG-8, MG-10 (auto-verify stays empty), MG-11; MG-9 as changed by D103 (PD-2h). WI-V1 validators run on AI values. P3 (`consensus_enqueue_failed TypeError`) fixed here.
-- **Unsafe until** PD-2a and PD-2b are done. **Deps:** PD-1a, PD-1b, PD-2a, PD-2b, PD-2c, WI-V1. **Status:** pending (step 6).
+- **Unsafe until** PD-2a and PD-2b are done. **Deps:** PD-1a, PD-1b, PD-2a, PD-2b, PD-2c, WI-V1. **Status:** built (D109), not live; P3 fixed; WI-V1 here = V-HSN only (V-REFEXIST stays link-time).
 
 #### PD-2f — AI reading failed: "Waiting for reading" (D103 Q3)
-- **Description:** after the provider's own retries the document shows "AI reading failed: <reason in plain words>" and is **"Waiting for reading"**: nothing becomes current until a person picks **Retry** or **Read with rules** (both audited); mapping and reconciliation skip it, so a run never blocks; 0 requests to the other provider. **Status:** pending (step 6).
+- **Description:** after the provider's own retries the document shows "AI reading failed: <reason in plain words>" and is **"Waiting for reading"**: nothing becomes current until a person picks **Retry** or **Read with rules** (both audited); mapping and reconciliation skip it, so a run never blocks; 0 requests to the other provider. **Status:** built (D109), not live (migration 0036).
 
 #### PD-2g — Digital PDF input form for AI reading
 - **Status:** **retired** (D103: digital invoices are never read by AI; Q4 dropped).
 
 #### PD-2h — Handwritten values from the AI reading (D103 decision 4; changes MG-9)
 - **Description:** the AI version keeps `typed_refs` / `annotation_refs` in `extras`. **Handwritten references → link suggestions** through the existing WI-D4 rule plus the self-support guard (the grand total used must be person-verified or agree with the OCR cross-check within ₹1). **Other handwritten values → suggested field values** (accepted by a person with "Use suggested"). Both count in mapping and 3-way matching **only after a person's click**; never automatic.
-- **Tests:** `tests/unit/test_q2_typed_links.py` extended (self-support case); hint links 100 % `suggested`; 0 false suggestions on the v2 pool. **Status:** pending (step 6).
+- **Tests:** `tests/unit/test_q2_typed_links.py` extended (self-support case); hint links 100 % `suggested`; 0 false suggestions on the v2 pool. **Status:** built (D109), not live; the v2-pool count is not measured (needs the owner's local set).
 
 #### PD-4a — Reconciliation screen, like for like (batch PD-B1)
 - **Description:** table: **Invoice taxable | Expected taxable | Variance** (taxable basis), with the grand total in its own labelled column (K15, F3, Q10). Case panel "Why this status": per check the invoice value (actual), the reference value (expected), the difference (variance and %), the rule or tolerance, the result and a one-line plain reason (reason-code catalogue or a plain sentence per code). The data is already stored (F4). UI only: `RULES_HASH` and `ENGINE_VERSION` unchanged.
@@ -1678,7 +1678,7 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 - **Files:** `web/src/pages/MappingPage.tsx`, `backend/reconbench_app/mapping_service.py`, `backend/reconbench_app/api/mapping.py`. **Acceptance:** unlink → undo restores the same pairing; link again on a rejected line → a confirmed link (audited); a duplicate attempt is refused; after a mapping re-run and a reload the state equals the screen; web tests. **Status:** pending (batch PD-B1).
 
 #### PD-4c — Method and provenance on screens and exports
-- **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** partial (D107): method chip "Read by rules / Read by AI" on the document page and a "Reading Method" export column; the provider name and per-field origin come with PD-2e.
+- **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** partial (D107): method chip "Read by rules / Read by AI" on the document page and a "Reading Method" export column; the provider name and per-field origin come with PD-2e. D109: provider on the chip ("Read by AI · Company server"); per-field origin in the export deferred to step 7.
 
 #### PD-4d — Verify AI-read fields (UI part of PD-2b)
 - **Description:** side by side AI value / OCR cross-check / page box; "Verify" per field and "Verify all" only where the AI and OCR values agree (Q8), with a count. **Deps:** PD-2b. **Status:** done (D104; live 29 Oct 2026, tag live-20261029-b3).

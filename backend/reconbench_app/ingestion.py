@@ -53,6 +53,7 @@ from reconbench_core.schema import (
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
+from reconbench_app import reading_state
 from reconbench_app.ai import h1, shadow, vision
 from reconbench_app.ai.contracts import (
     FieldKind,
@@ -2030,14 +2031,20 @@ class IngestionService:
 
     @requires("files.upload")
     def prepare_vision_pages(
-        self, workspace_id: UUID, version_id: UUID, *, job_id: int | None = None
+        self,
+        workspace_id: UUID,
+        version_id: UUID,
+        *,
+        job_id: int | None = None,
+        requested_by: UUID | None = None,
     ) -> str:
         """Render and mask a parsed version's pages, then queue the vision request.
 
         Runs in the general worker (the PDF sandbox has no network). Returns the
         outcome for logging: ``queued``, ``skipped`` (no longer ready, eligible or
         current) or ``failed`` (the pages could not be rendered; a skipped request
-        records why).
+        records why). A waiting document that gets no request says why (PD-2f).
+        ``requested_by`` is a person's Retry.
         """
 
         del job_id
@@ -2048,6 +2055,12 @@ class IngestionService:
             subject = vision.load_subject(connection, workspace_id, version_id)
             targets = hooks.vision_targets(connection, workspace_id, [version_id])
         if subject is None or subject.object_key is None or version_id not in targets:
+            if subject is not None and subject.current:
+                # The switch went back to rules, or AI is no longer available.
+                with self.engine.begin() as connection:
+                    reading_state.mark_version_failed(
+                        connection, workspace_id, version_id, reading_state.NOT_QUEUED
+                    )
             return "skipped"
         content = self._read_object(subject.object_key)
         rendered = vision_pages_isolated(content, subject.pages, languages=self.ocr_languages)
@@ -2070,7 +2083,12 @@ class IngestionService:
                 workspace_id,
                 version_id,
                 subject_version=vision.fingerprint(rendered),
+                requested_by=requested_by,
             )
+            if request_id is None and not vision.live_request(connection, workspace_id, version_id):
+                reading_state.mark_version_failed(
+                    connection, workspace_id, version_id, reading_state.NOT_QUEUED
+                )
         # No new request (not ready any more, or the same one is already live): the AI
         # worker's sweep clears image bytes that no live request uses.
         return "queued" if request_id is not None else "skipped"
@@ -2558,28 +2576,42 @@ class IngestionService:
     ) -> None:
         """Queue vision page preparation for scanned invoices; never blocks parsing.
 
-        Only scanned invoices with the switch on AI are read (``vision_targets``). H1 is
-        never queued (D103, PD-2d): digital invoices, PO/GRN files and scanned invoices
-        with the switch on rules make no LLM call. The H1 code is kept.
+        Only scanned invoices with the switch on AI are read (``scanned_readings``). Each
+        one waits for its reading in this same transaction, so mapping never sees its
+        rules version as ready (PD-2f); one the reader can't take, or that can't be
+        queued, fails at once with the reason (D5). H1 is never queued (D103, PD-2d):
+        digital invoices, PO/GRN files and scanned invoices with the switch on rules make
+        no LLM call. The H1 code is kept.
         """
 
         if self.ai_hooks is None or not version_ids:
             return
         enqueue_vision = getattr(self.queue, "enqueue_vision_pages", None)
-        if enqueue_vision is not None:
-            try:
-                with connection.begin_nested():
-                    for version_id in self.ai_hooks.vision_targets(
-                        connection, workspace_id, version_ids
-                    ):
-                        enqueue_vision(
-                            workspace_id=workspace_id,
-                            document_version_id=version_id,
-                            connection=connection,
-                        )
-            except Exception as exc:  # noqa: BLE001 - AI is optional; rules continue.
-                _LOGGER.warning(
-                    "ai_enqueue_failed hook=h6_vision error_type=%s", type(exc).__name__
+        if enqueue_vision is None:
+            return
+        plan = self.ai_hooks.scanned_readings(connection, workspace_id, version_ids)
+        for document_id in plan.rules:
+            # A fresh rules version replaces a reading that was waiting or failed.
+            reading_state.mark_ready(connection, workspace_id, document_id, new_version=True)
+        for document_id, _code in plan.refused:
+            reading_state.mark_waiting(connection, workspace_id, document_id)
+        for _version_id, document_id in plan.targets:
+            reading_state.mark_waiting(connection, workspace_id, document_id)
+        for document_id, code in plan.refused:
+            reading_state.mark_failed(connection, workspace_id, document_id, code)
+        try:
+            with connection.begin_nested():
+                for version_id, _document_id in plan.targets:
+                    enqueue_vision(
+                        workspace_id=workspace_id,
+                        document_version_id=version_id,
+                        connection=connection,
+                    )
+        except Exception as exc:  # noqa: BLE001 - the reading fails visibly; rules continue.
+            _LOGGER.warning("ai_enqueue_failed hook=h6_vision error_type=%s", type(exc).__name__)
+            for _version_id, document_id in plan.targets:
+                reading_state.mark_failed(
+                    connection, workspace_id, document_id, reading_state.NOT_QUEUED
                 )
 
     @staticmethod
@@ -3095,52 +3127,13 @@ class IngestionService:
         )
         seq = int(latest_seq or 0) + 1
         version_id = new_id()
-        revision = _plain(header_values.get("revision"))
-        po_refs = _reference_values(header_values.get("po_refs"))
-        grn_refs = _reference_values(header_values.get("grn_refs"))
-        payment_terms = _plain(header_values.get("payment_terms"))
         version_values = {
             "id": version_id,
             "workspace_id": workspace_id,
             "document_id": document_id,
             "seq": seq,
-            "revision": revision,
-            "revision_rank": _revision_rank(revision),
             "content_hash": content_hash,
-            "doc_no": doc_no,
-            "canonical_doc_no": canonical_doc_no,
-            "doc_date": doc_date,
-            "po_status": _enum_value(_plain(header_values.get("status"))),
-            "vendor_name": vendor_name,
-            "vendor_name_norm": normalize_vendor_name(vendor_name) if vendor_name else None,
-            "vendor_gstin": gstin,
-            "vendor_pan": gstin[2:12] if gstin and len(gstin) == 15 else None,
-            "vendor_state_code": gstin[:2] if gstin and len(gstin) == 15 else None,
-            "buyer_gstin": _plain(header_values.get("buyer_gstin")),
-            "ship_to": _plain(header_values.get("ship_to")),
-            "place_of_supply": _plain(header_values.get("place_of_supply")),
-            "payment_terms_text": payment_terms,
-            "payment_terms_days": _payment_days(payment_terms),
-            "delivery_date": _plain(header_values.get("delivery_date")),
-            "currency": _plain(header_values.get("currency")) or "INR",
-            "taxable_total": _plain(header_values.get("taxable_total")),
-            "cgst_total": _plain(header_values.get("cgst")),
-            "sgst_total": _plain(header_values.get("sgst")),
-            "igst_total": _plain(header_values.get("igst")),
-            "round_off": _plain(header_values.get("round_off")),
-            "grand_total": _plain(header_values.get("grand_total")),
-            "po_refs": po_refs,
-            "canonical_po_refs": [canonicalize_document_number(ref) for ref in po_refs],
-            "grn_refs": grn_refs,
-            "canonical_grn_refs": [canonicalize_document_number(ref) for ref in grn_refs],
-            "challan_no": _plain(header_values.get("challan_no")),
-            "canonical_challan_no": _canonical_optional(header_values.get("challan_no")),
-            "e_way_bill_no": _plain(header_values.get("e_way_bill_no")),
-            "irn": _plain(header_values.get("irn")),
-            "supplier_invoice_no": _plain(header_values.get("supplier_invoice_no")),
-            "canonical_supplier_invoice_no": _canonical_optional(
-                header_values.get("supplier_invoice_no")
-            ),
+            **_version_header_columns(header_values),
             "extraction_method": extraction_method.value,
             "reading_method": _reading_method(extraction_method),
             "extraction_conf": document.confidence,
@@ -3278,6 +3271,7 @@ class IngestionService:
         extraction_method: ExtractionMethod,
         uom_aliases: Mapping[str, str],
         charge_keywords: tuple[str, ...],
+        ai_call_id: UUID | None = None,
     ) -> None:
         line_table = metadata.tables["doc_line"]
         evidence_table = metadata.tables["field_evidence"]
@@ -3290,6 +3284,12 @@ class IngestionService:
                 "verification": value.verification.value,
                 "verified_by": value.verified_by,
                 "verified_at": value.verified_at,
+                # The call that read an AI value (PD-2a provenance); never on other values.
+                **(
+                    {"ai_call_id": ai_call_id}
+                    if ai_call_id is not None and value.source is FieldSource.AI
+                    else {}
+                ),
             }
 
         for field_name in type(document.header).model_fields:
@@ -3373,6 +3373,114 @@ class IngestionService:
                             snippet=value.evidence.snippet,
                         )
                     )
+
+    @requires("files.upload")
+    def append_ai_version(
+        self,
+        connection: Connection,
+        *,
+        workspace_id: UUID,
+        document_id: UUID,
+        previous_version: Mapping[str, Any],
+        document: Document,
+        ai_call_id: UUID,
+    ) -> UUID:
+        """Append the AI reading of a scanned invoice as its current version (PD-2e).
+
+        Runs in the general worker's consensus transaction. ``extraction_method`` is
+        ``ai_first`` and ``reading_method`` ``ai`` (the database check ties them). Every AI
+        value keeps origin AI and the call that read it, so it counts only after a
+        person's check (PD-2a, PD-2b). The page texts are copied and the rules version
+        stays the earlier version of the same file, the visible cross-check (PD-4d).
+        """
+
+        version_table = metadata.tables["document_version"]
+        document_table = metadata.tables["document"]
+        text_table = metadata.tables["document_text"]
+        hints = parser_hints_from_config(
+            self._active_config_body(workspace_id),
+            zone_type=document.header.doc_type,
+            file_format=FileFormat.PDF,
+            limits=self.limits(workspace_id),
+        )
+        previous_id = cast(UUID, previous_version["id"])
+        latest_seq = connection.scalar(
+            sa.select(sa.func.max(version_table.c.seq)).where(
+                version_table.c.workspace_id == workspace_id,
+                version_table.c.document_id == document_id,
+            )
+        )
+        version_id = new_id()
+        header_values = _header_values(document.header)
+        connection.execute(
+            sa.insert(version_table).values(
+                id=version_id,
+                workspace_id=workspace_id,
+                document_id=document_id,
+                seq=int(latest_seq or 0) + 1,
+                content_hash=_canonical_hash(document.model_dump(mode="json")),
+                **_version_header_columns(header_values),
+                extraction_method=ExtractionMethod.AI_FIRST.value,
+                reading_method=_reading_method(ExtractionMethod.AI_FIRST),
+                extraction_conf=document.confidence,
+                needs_verification=document.needs_verification,
+                verification_reasons=[reason.value for reason in document.reason_codes],
+                extras=_jsonable(
+                    {
+                        "header": document.header.extras,
+                        "document": document.model_dump(mode="json").get("extras", {}),
+                    }
+                ),
+                source_file_id=previous_version["source_file_id"],
+                locator=previous_version["locator"],
+                parser_version=previous_version["parser_version"],
+                layout_signature=previous_version["layout_signature"],
+                derived_from_version_id=previous_id,
+                created_by=None,
+            )
+        )
+        self._insert_lines_and_evidence(
+            connection,
+            workspace_id=workspace_id,
+            version_id=version_id,
+            document=document,
+            extraction_method=ExtractionMethod.AI_FIRST,
+            uom_aliases=hints.uom_aliases,
+            charge_keywords=hints.charge_keywords,
+            ai_call_id=ai_call_id,
+        )
+        for page in connection.execute(
+            sa.select(text_table).where(
+                text_table.c.workspace_id == workspace_id,
+                text_table.c.document_version_id == previous_id,
+            )
+        ).mappings():
+            row = dict(page)
+            row["document_version_id"] = version_id
+            row.pop("created_at", None)
+            connection.execute(sa.insert(text_table).values(**row))
+        gstin = _plain(header_values.get("vendor_gstin"))
+        vendor_name = _plain(header_values.get("vendor_name"))
+        doc_no = _plain(header_values.get("doc_no"))
+        connection.execute(
+            sa.update(document_table)
+            .where(
+                document_table.c.workspace_id == workspace_id,
+                document_table.c.id == document_id,
+            )
+            .values(
+                current_version_id=version_id,
+                vendor_identity=_vendor_identity(gstin, vendor_name),
+                doc_no=doc_no,
+                canonical_doc_no=canonicalize_document_number(doc_no) if doc_no else None,
+                doc_date=_plain(header_values.get("doc_date")),
+                grand_total=_plain(header_values.get("grand_total")),
+                needs_verification=document.needs_verification,
+                updated_at=sa.func.now(),
+                version=document_table.c.version + 1,
+            )
+        )
+        return version_id
 
     @staticmethod
     def _write_warnings(
@@ -3957,12 +4065,18 @@ class IngestionService:
                 .mappings()
                 .all()
             )
+            reading_provider = (
+                _reading_provider(connection, workspace_id, evidences)
+                if header["reading_method"] == "ai"
+                else None
+            )
         return {
             "document": {column.name: header[column] for column in document.c},
             "version": {column.name: header[column] for column in version.c},
             "lines": [dict(row) for row in lines],
             "field_evidence": [dict(row) for row in evidences],
             "ai_values": ai_values,
+            "reading_provider": reading_provider,
             "processing_log": [dict(row) for row in events],
         }
 
@@ -4266,6 +4380,13 @@ class IngestionService:
                 return None
             if int(current_document["version"]) != expected_version:
                 raise BatchVersionConflict("The document changed after it was loaded.")
+            if current_document["reading_state"] != reading_state.READY:
+                # Step 6 D4: the AI answer would land on an outdated version (PD-2f).
+                raise IngestionFailure(
+                    "READING_PENDING",
+                    "This invoice is waiting for its AI reading. "
+                    "Choose Retry or Read with rules first.",
+                )
             doc_type = str(current_document["doc_type"])
             header_columns = _correction_header_columns(doc_type)
             line_columns = _correction_line_columns(doc_type)
@@ -4902,6 +5023,151 @@ class IngestionService:
                 )
         return self.get_document(actor.workspace_id, document_id)
 
+    def _locked_reading_document(
+        self,
+        connection: Connection,
+        actor: ActorContext,
+        document_id: UUID,
+        expected_version: int,
+        *,
+        states: tuple[str, ...],
+    ) -> RowMapping | None:
+        document_table = metadata.tables["document"]
+        current = (
+            connection.execute(
+                sa.select(document_table)
+                .where(
+                    document_table.c.workspace_id == actor.workspace_id,
+                    document_table.c.id == document_id,
+                    document_table.c.withdrawn_at.is_(None),
+                )
+                .with_for_update()
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if current is None:
+            return None
+        if int(current["version"]) != expected_version:
+            raise BatchVersionConflict("The document changed after it was loaded.")
+        if current["reading_state"] not in states:
+            raise IngestionFailure(
+                "READING_STATE_CHANGED", "This invoice's reading changed; reload the page."
+            )
+        return current
+
+    @requires("files.upload")
+    def retry_reading(
+        self, actor: ActorContext, document_id: UUID, *, expected_version: int
+    ) -> dict[str, Any] | None:
+        """A person asks the active provider to read a failed invoice again (PD-2f).
+
+        Only while the switch is on AI and the reader can take the file (D6); the request
+        goes to the active provider only and never replays a cached answer. Audited.
+        """
+
+        hooks = self.ai_hooks
+        enqueue_vision = getattr(self.queue, "enqueue_vision_pages", None)
+        with self.engine.begin() as connection:
+            current = self._locked_reading_document(
+                connection, actor, document_id, expected_version, states=(reading_state.FAILED,)
+            )
+            if current is None:
+                return None
+            version_id = cast(UUID, current["current_version_id"])
+            if (
+                hooks is None
+                or enqueue_vision is None
+                or version_id
+                not in hooks.vision_targets(connection, actor.workspace_id, [version_id])
+            ):
+                raise IngestionFailure(
+                    "READING_RETRY_UNAVAILABLE",
+                    "AI reading is off or can't read this file. Choose Read with rules.",
+                )
+            vision.acknowledge_uncertain(
+                connection, actor.workspace_id, version_id, user_id=actor.actor_id
+            )
+            reading_state.mark_waiting(connection, actor.workspace_id, document_id, retry=True)
+            enqueue_vision(
+                workspace_id=actor.workspace_id,
+                document_version_id=version_id,
+                connection=connection,
+                requested_by=actor.actor_id,
+            )
+            write_audit_event(
+                connection,
+                actor,
+                action="document.reading_retry",
+                target_type="document",
+                target_id=document_id,
+                before_state={
+                    "reading_state": current["reading_state"],
+                    "reading_failure_code": current["reading_failure_code"],
+                    "document_version_id": str(version_id),
+                },
+                after_state={"reading_state": reading_state.WAITING},
+                reason="AI reading retried by user.",
+            )
+        return self.get_document(actor.workspace_id, document_id)
+
+    @requires("files.upload")
+    def read_with_rules(
+        self, actor: ActorContext, document_id: UUID, *, expected_version: int
+    ) -> dict[str, Any] | None:
+        """A person chooses the rules reading of a waiting or failed invoice (PD-2f).
+
+        The version the rules read is already current; from now on mapping, vendor
+        resolution and reconciliation use it, and a late AI answer is ignored. Audited.
+        """
+
+        version_table = metadata.tables["document_version"]
+        with self.engine.begin() as connection:
+            current = self._locked_reading_document(
+                connection,
+                actor,
+                document_id,
+                expected_version,
+                states=(reading_state.WAITING, reading_state.FAILED),
+            )
+            if current is None:
+                return None
+            version_id = cast(UUID, current["current_version_id"])
+            reading_state.mark_ready(connection, actor.workspace_id, document_id, by_person=True)
+            write_audit_event(
+                connection,
+                actor,
+                action="document.reading_use_rules",
+                target_type="document",
+                target_id=document_id,
+                before_state={
+                    "reading_state": current["reading_state"],
+                    "reading_failure_code": current["reading_failure_code"],
+                    "document_version_id": str(version_id),
+                },
+                after_state={"reading_state": reading_state.READY},
+                reason="Invoice read with rules by user choice.",
+            )
+            source_file_id = connection.scalar(
+                sa.select(version_table.c.source_file_id).where(
+                    version_table.c.workspace_id == actor.workspace_id,
+                    version_table.c.id == version_id,
+                )
+            )
+            if source_file_id is not None:
+                # Vendor resolution was skipped while it waited; it queues mapping.
+                self.queue.enqueue(
+                    "resolve_vendors", file_id=cast(UUID, source_file_id), connection=connection
+                )
+            self._mark_dirty_scope(
+                connection,
+                workspace_id=actor.workspace_id,
+                scope_kind="invoice",
+                scope_id=document_id,
+                reason="invoice read with rules by user choice",
+            )
+        return self.get_document(actor.workspace_id, document_id)
+
     @requires("files.upload")
     def verify_ai_values(
         self,
@@ -5355,6 +5621,32 @@ class IngestionService:
                     box_2d=cast(tuple[int, int, int, int], box_2d),
                 )
             )
+        handwritten: set[int] = set()
+        for note in validation.check.annotations:
+            # PD-2h (D103 decision 4): a handwritten PO/GRN number is a suggested value;
+            # it counts in mapping only after a person applies it ("Use suggested").
+            target_field = _HANDWRITTEN_REFERENCE_FIELDS.get(note.looks_like)
+            text = " ".join(note.text.split())
+            if note.kind != "handwritten" or target_field is None or not text:
+                continue
+            pixels, box_2d = boxes(note.page, note.box)
+            handwritten.add(len(accepted))
+            accepted.append(
+                GroundedSuggestion(
+                    scope="header",
+                    line_no=None,
+                    field=target_field,
+                    kind="ref",
+                    value=text,
+                    typed=text,
+                    page=note.page,
+                    quote=note.text,
+                    original_start=-1,
+                    original_end=-1,
+                    bbox=pixels,
+                    box_2d=cast(tuple[int, int, int, int], box_2d),
+                )
+            )
         positions = align_vision_lines(current_lines, validation.check.lines)
         next_no = max((int(row["line_no"]) for row in current_lines), default=0)
         for line, matched in zip(validation.check.lines, positions, strict=True):
@@ -5385,7 +5677,7 @@ class IngestionService:
                 )
         lines_by_no = {int(row["line_no"]): row for row in current_lines}
         suggestions = []
-        for item in accepted:
+        for index, item in enumerate(accepted):
             if item.scope == "header":
                 column = _VISION_COLUMNS.get(item.field, item.field)
                 current = version_row.get(column)
@@ -5408,6 +5700,7 @@ class IngestionService:
                     "start": None,
                     "end": None,
                     "box": list(item.box_2d) if item.box_2d else None,
+                    "handwritten": index in handwritten,
                 }
             )
         view.update(
@@ -5709,6 +6002,12 @@ _VISION_HEADER_COLUMNS: Mapping[str, tuple[str, FieldKind]] = {
     "payment_terms": ("payment_terms", "text"),
     "delivery_date": ("delivery_date", "date"),
 }
+# Handwritten references the AI read that a person may apply as values (PD-2h).
+_HANDWRITTEN_REFERENCE_FIELDS: Mapping[str, str] = {
+    "po_number": "po_refs",
+    "service_po_number": "po_refs",
+    "grn_number": "grn_refs",
+}
 _VISION_COLUMNS: Mapping[str, str] = {
     **INVOICE_HEADER_COLUMNS,
     "supplier_invoice_no": "supplier_invoice_no",
@@ -5809,6 +6108,24 @@ def _extraction_method(file_format: FileFormat | None, *, is_ocr: bool = False) 
     }.get(file_format, ExtractionMethod.SHELL)
 
 
+def _reading_provider(
+    connection: Connection, workspace_id: UUID, evidences: Sequence[RowMapping]
+) -> str | None:
+    """The provider that read an AI version, from its fields' calls (step 6 D2)."""
+
+    call_ids = sorted({row["ai_call_id"] for row in evidences if row["ai_call_id"]}, key=str)
+    if not call_ids:
+        return None
+    calls = metadata.tables["ai_call_log"]
+    provider = connection.scalar(
+        sa.select(calls.c.provider)
+        .where(calls.c.workspace_id == workspace_id, calls.c.id.in_(call_ids))
+        .order_by(calls.c.created_at.desc())
+        .limit(1)
+    )
+    return str(provider) if provider is not None else None
+
+
 def _reading_method(extraction_method: ExtractionMethod) -> str:
     """The method that read a new version (PD-2c): ``ai`` for an AI reading, else ``rules``.
 
@@ -5871,6 +6188,56 @@ def _aggregate_status(statuses: list[str]) -> str:
     if len(successful) != len(statuses) or "partial" in successful:
         return "partial"
     return "parsed"
+
+
+def _version_header_columns(header_values: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``document_version`` columns that come from a document's header values."""
+
+    revision = _plain(header_values.get("revision"))
+    doc_no = _plain(header_values.get("doc_no"))
+    gstin = _plain(header_values.get("vendor_gstin"))
+    vendor_name = _plain(header_values.get("vendor_name"))
+    po_refs = _reference_values(header_values.get("po_refs"))
+    grn_refs = _reference_values(header_values.get("grn_refs"))
+    payment_terms = _plain(header_values.get("payment_terms"))
+    return {
+        "revision": revision,
+        "revision_rank": _revision_rank(revision),
+        "doc_no": doc_no,
+        "canonical_doc_no": canonicalize_document_number(doc_no) if doc_no else None,
+        "doc_date": _plain(header_values.get("doc_date")),
+        "po_status": _enum_value(_plain(header_values.get("status"))),
+        "vendor_name": vendor_name,
+        "vendor_name_norm": normalize_vendor_name(vendor_name) if vendor_name else None,
+        "vendor_gstin": gstin,
+        "vendor_pan": gstin[2:12] if gstin and len(gstin) == 15 else None,
+        "vendor_state_code": gstin[:2] if gstin and len(gstin) == 15 else None,
+        "buyer_gstin": _plain(header_values.get("buyer_gstin")),
+        "ship_to": _plain(header_values.get("ship_to")),
+        "place_of_supply": _plain(header_values.get("place_of_supply")),
+        "payment_terms_text": payment_terms,
+        "payment_terms_days": _payment_days(payment_terms),
+        "delivery_date": _plain(header_values.get("delivery_date")),
+        "currency": _plain(header_values.get("currency")) or "INR",
+        "taxable_total": _plain(header_values.get("taxable_total")),
+        "cgst_total": _plain(header_values.get("cgst")),
+        "sgst_total": _plain(header_values.get("sgst")),
+        "igst_total": _plain(header_values.get("igst")),
+        "round_off": _plain(header_values.get("round_off")),
+        "grand_total": _plain(header_values.get("grand_total")),
+        "po_refs": po_refs,
+        "canonical_po_refs": [canonicalize_document_number(ref) for ref in po_refs],
+        "grn_refs": grn_refs,
+        "canonical_grn_refs": [canonicalize_document_number(ref) for ref in grn_refs],
+        "challan_no": _plain(header_values.get("challan_no")),
+        "canonical_challan_no": _canonical_optional(header_values.get("challan_no")),
+        "e_way_bill_no": _plain(header_values.get("e_way_bill_no")),
+        "irn": _plain(header_values.get("irn")),
+        "supplier_invoice_no": _plain(header_values.get("supplier_invoice_no")),
+        "canonical_supplier_invoice_no": _canonical_optional(
+            header_values.get("supplier_invoice_no")
+        ),
+    }
 
 
 def _header_values(header: Any) -> dict[str, Any]:
