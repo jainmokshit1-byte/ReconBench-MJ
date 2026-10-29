@@ -1,5 +1,5 @@
 # Project status
-Last verified: 2026-10-29, commit e9573e9 + uncommitted PD-2c/PD-2d work (D107; also CODEBASE_CONTEXT.md untracked)
+Last verified: 2026-10-29, commit 41b5546 live as live-20261029-b5 (D108); CODEBASE_CONTEXT.md untracked
 
 ## Components
 Status: working-verified | implemented-untested | partial | stub | broken | not-found | unknown
@@ -8,7 +8,7 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - Digital vs scanned PDF routing — working-verified (unit) — local_hybrid.py:is_scanned; tests/parsers/test_phase4_pdf.py, test_scan_images.py
 - Rules extraction (PDF/XML/CSV/Tally) — working-verified (unit); accuracy target not met — tests/parsers/*; docs/accuracy-plan.md §0
 - AI vision reading (Gemini / vLLM) — implemented, suggestions only; live calls not run — reconbench_app/ai/worker/; tests/unit/test_ai_vision.py
-- Scanned-invoice switch + 0 LLM calls outside AI reading (PD-2c/PD-2d, D107) — working-verified (unit + integration on disposable DB), uncommitted, not deployed — ai/vision.py, ai/settings_service.py, migration 0035; tests/integration/test_pd2c_pd2d_reading.py
+- Scanned-invoice switch + 0 LLM calls outside AI reading (PD-2c/PD-2d, D107) — working-verified (unit + integration on disposable DB); live 29 Oct (D108) — ai/vision.py, ai/settings_service.py, migration 0035; tests/integration/test_pd2c_pd2d_reading.py
 - Validation (arithmetic, GSTIN, confidence) — working-verified (unit) — reconbench_core/extraction/verify.py; tests/property
 - Vendor + link mapping — working-verified (unit) — tests/unit/test_phase4_mapping_links.py, test_phase4_vendor_mapping.py
 - Line alignment — working-verified (unit) — tests/unit/test_phase4_alignment.py
@@ -23,10 +23,10 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - `make accuracy-bench` — not run: needs Docker worker image and owner's local truth set
 
 ## Active task
-- PD-2c + PD-2d (step 5, D107): built and reviewed, uncommitted; next = owner review, commit, deploy (migration 0035)
+- PD-2c + PD-2d (step 5): live 29 Oct 2026 (D107, D108, commit 41b5546, tag live-20261029-b5); owner check pending
 
 ## Next steps (max 5, highest value first)
-1. Commit and deploy PD-2c + PD-2d (D107 deploy notes: switch starts on rules; check no queued H1 request).
+1. Owner check of step 5 on live (Settings "Scanned invoices" panel, "Read by rules" chip); decide when to set the switch to AI.
 2. Step 6: PD-2e + PD-2f + PD-2h (settle `NOT_NEEDED` skip in ai_assisted; provider name on method chip).
 3. Real-sample end-to-end test (extraction → mapping → reconciliation) — owner's stated next step before the Phase 4 exit gate.
 4. Decide on KI-001 (internal server address in tracked files).
