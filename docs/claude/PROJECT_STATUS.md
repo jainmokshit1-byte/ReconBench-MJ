@@ -26,6 +26,7 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 ## Active task
 - Step 6 (PD-2e + PD-2f + PD-2h + PD-3b) live 30 Oct 2026 (D109, D110, commit 493bc9e, tag live-20261030-b6); switch on rules; plan in docs/claude/plan-step6.md
 - Dry run on a throwaway copy of live + one real company-server reading done (D111): no blocker; live switch stays on rules until PD-5c (step 7)
+- Next session: step 7 (PD-5a + PD-5b + PD-5c + step 6 leftovers) — start from docs/claude/handoff-step7.md; don't re-explore the code
 - Owner check of step 5 on live still pending (D108)
 
 ## Next steps (max 5, highest value first)
