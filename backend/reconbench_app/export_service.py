@@ -21,6 +21,8 @@ from reconbench_app.storage import ObjectStore
 
 EXCEL_MAX_ROWS = 1_048_576
 P0_SHEETS = ("Summary", "Invoice Recon", "Line Recon", "Exceptions", "Vendor Summary")
+# How the invoice version in the run was read (PD-2c, Q13).
+READING_METHOD_LABELS = {"rules": "Rules", "ai": "AI reading"}
 _EXCEPTION_STATUSES = {"exception", "pending", "needs_review", "unlinked"}
 
 
@@ -169,6 +171,7 @@ class ExportService:
                 version.c.igst_total,
                 version.c.round_off,
                 version.c.currency,
+                version.c.reading_method,
                 root_vendor.c.canonical_name.label("effective_vendor_name"),
                 effective_vendor_id,
                 effective_status,
@@ -374,6 +377,7 @@ class ExportService:
             "Reason Codes",
             "Override Info",
             "Payment Due Date",
+            "Reading Method",
         ]
         invoice_sheets: list[tuple[Any, str, int]] = []
         invoice_row_info: list[tuple[RowMapping, str, int]] = []
@@ -471,6 +475,13 @@ class ExportService:
             )
             self._write_cell(sheets_invoice, row_index, 18, overlay, text_fmt)
             self._write_cell(sheets_invoice, row_index, 19, record["payment_due_date"], date_fmt)
+            self._write_cell(
+                sheets_invoice,
+                row_index,
+                20,
+                READING_METHOD_LABELS.get(str(record["reading_method"]), record["reading_method"]),
+                text_fmt,
+            )
             row_index += 1
         sheets_invoice.autofilter(0, 0, max(0, row_index - 1), len(invoice_headers) - 1)
         invoice_sheets.append((sheets_invoice, invoice_sheet_name, row_index - 1))

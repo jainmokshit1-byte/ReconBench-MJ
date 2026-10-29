@@ -134,3 +134,12 @@ Validation on a fresh disposable `postgres:16.15-bookworm` at `127.0.0.1:15497`:
 - Additive only: no existing row changes, no backfill. `downgrade()` drops the constraint and the columns.
 
 Validation on a disposable `postgres:16.15-bookworm` at `127.0.0.1:15499`: `check_migration_safety.py` cloned `0033` and upgraded the copy to `0034`; Alembic autogenerate reports no metadata drift; the catalog contract, catalog, index, decision and table-count checks pass (54 tables + 4 Procrastinate tables). Nothing was applied to the live database.
+
+## Revision 0035: scanned-invoice switch and reading method (accuracy plan PD-2c, decision-log D103, 29 Oct 2026)
+
+- `ai_setting` gains `scanned_invoice_reader TEXT NOT NULL DEFAULT 'rules'` (check `ai_setting_scanned_invoice_reader_ck`: `rules` or `ai`): the one switch "Scanned invoices: read with rules / read with AI".
+- `document_version` gains `reading_method TEXT NOT NULL DEFAULT 'rules'`: the method that read the version. Check `document_version_reading_method_ck`: `rules` or `ai`; an `ai_first`/`ai_fallback` version is always `ai`, a parser version (`pdf_text`, `pdf_ocr`, `xml_profile`, `csv_mapping`, `shell`) always `rules`, and only a person's version (`manual`) may carry either, copied from the version it replaces.
+- `document_text` gains `scanned BOOLEAN NOT NULL DEFAULT false`: the per-page scan check of the parse (image coverage), so "scanned" never means "OCR was used" (an OCR assist on a digital page stays digital, D103 decision 1). AI reading looks at this column, not at `extraction_method`. Existing pages stay `false`, so no earlier upload is read by AI.
+- Additive: the backfill sets `ai` only on existing `ai_first`/`ai_fallback` versions, with `document_version_append_only` paused for that one statement inside the migration transaction (as revision 0024 did for `field_evidence`); every other row keeps the default. `downgrade()` drops the checks and the three columns.
+
+Validation on a disposable `postgres:16.15-bookworm` at `127.0.0.1:15499`: `check_migration_safety.py` cloned `0034` and upgraded the copy to `0035`; Alembic autogenerate reports no metadata drift; the catalog contract, catalog, index, decision and table-count checks pass (54 tables + 4 Procrastinate tables); the seed is idempotent. Nothing was applied to the live database.

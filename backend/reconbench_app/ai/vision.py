@@ -72,6 +72,10 @@ WIRED_DOC_TYPES: frozenset[str] = frozenset({"invoice", "po", "grn"})
 # The existing correction endpoint accepts manual saves for each wired document type.
 CORRECTABLE_DOC_TYPES: frozenset[str] = WIRED_DOC_TYPES
 PDF_METHODS = frozenset({"pdf_text", "pdf_ocr"})
+# AI reads only scanned invoices: a PDF with any page the scan check found scanned (D103
+# decisions 1 and 3). Digital invoices, an OCR assist on a digital page included, and PO/GRN
+# files are always read by rules (PD-2d).
+READ_DOC_TYPES: frozenset[str] = frozenset({"invoice"})
 
 SKIP_SOURCE_CHANGED = "SOURCE_CHANGED"
 SKIP_NOT_ELIGIBLE = "NOT_ELIGIBLE"
@@ -95,7 +99,9 @@ CONSENSUS_RUNS = metadata.tables["consensus_run"]
 CONFIG_ACTIVE = metadata.tables["config_active"]
 CONFIG_VERSIONS = metadata.tables["config_version"]
 
-VisionSkipReason = Literal["MODE_OFF", "NOT_PDF", "NOT_NEEDED", "TOO_MANY_PAGES", "NO_PAGES"]
+VisionSkipReason = Literal[
+    "MODE_OFF", "NOT_PDF", "NOT_SCANNED_INVOICE", "NOT_NEEDED", "TOO_MANY_PAGES", "NO_PAGES"
+]
 ReaderPass = Literal["full", "crop:header", "crop:table", "crop:totals"]
 BoxOrder = Literal["yx", "xy"]
 
@@ -137,6 +143,8 @@ class VisionFacts:
     extraction_method: str | None
     needs_verification: bool
     page_count: int
+    scanned: bool = False
+    """Any page of the version was found scanned (``document_text.scanned``)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +164,8 @@ def vision_eligibility(facts: VisionFacts, *, mode: str, max_pages: int) -> Visi
         or facts.extraction_method not in PDF_METHODS
     ):
         return VisionEligibility(False, "NOT_PDF")
+    if facts.doc_type not in READ_DOC_TYPES or not facts.scanned:
+        return VisionEligibility(False, "NOT_SCANNED_INVOICE")
     if facts.page_count < 1:
         return VisionEligibility(False, "NO_PAGES")
     if facts.page_count > max_pages:
@@ -181,15 +191,17 @@ class VisionSubject:
     """The version is still the document's current version and it is not withdrawn."""
 
 
-def _version_pages(connection: Connection, workspace_id: UUID, version_id: UUID) -> tuple[int, ...]:
-    return tuple(
-        int(page)
-        for page in connection.scalars(
-            sa.select(TEXTS.c.page)
-            .where(TEXTS.c.workspace_id == workspace_id, TEXTS.c.document_version_id == version_id)
-            .order_by(TEXTS.c.page)
-        )
-    )
+def _version_pages(
+    connection: Connection, workspace_id: UUID, version_id: UUID
+) -> tuple[tuple[int, ...], bool]:
+    """The version's page numbers, and whether any of them was found scanned."""
+
+    rows = connection.execute(
+        sa.select(TEXTS.c.page, TEXTS.c.scanned)
+        .where(TEXTS.c.workspace_id == workspace_id, TEXTS.c.document_version_id == version_id)
+        .order_by(TEXTS.c.page)
+    ).all()
+    return tuple(int(row.page) for row in rows), any(bool(row.scanned) for row in rows)
 
 
 def load_subject(
@@ -229,13 +241,14 @@ def load_subject(
     row = connection.execute(query).first()
     if row is None:
         return None
-    pages = _version_pages(connection, workspace_id, version_id)
+    pages, scanned = _version_pages(connection, workspace_id, version_id)
     facts = VisionFacts(
         doc_type=str(row.doc_type),
         file_format=str(row.format or ""),
         extraction_method=row.extraction_method,
         needs_verification=bool(row.needs_verification),
         page_count=len(pages),
+        scanned=scanned,
     )
     return VisionSubject(
         document_id=UUID(str(row.document_id)),

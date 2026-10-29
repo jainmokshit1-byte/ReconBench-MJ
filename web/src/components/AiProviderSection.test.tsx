@@ -69,6 +69,7 @@ function view(overrides: Partial<AiSettingsView> = {}, vllm: Partial<AiProviderC
     vllm_endpoints_allowed: [SERVER],
     reader_strategy: "off",
     primary_reader: null,
+    scanned_invoices: { reader: "rules", ai_available: false, ai_reading: false },
     vllm_calls: "enabled",
     providers: [card("gemini", gemini), card("vllm", { base_url: SERVER, ...vllm })],
     version: 3,

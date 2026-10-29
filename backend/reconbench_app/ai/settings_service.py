@@ -294,6 +294,9 @@ class AiSettingsUpdate(BaseModel):
     reader_strategy: Literal["off", "shadow", "single"] | None = None
     primary_reader: Literal["gemini", "vllm"] | None = None
     apply_mode: Literal["suggest", "merge"] | None = None
+    # "Scanned invoices: read with rules / read with AI" (PD-2c); digital invoices and
+    # PO/GRN files are always read by rules, whatever this says.
+    scanned_invoices: Literal["rules", "ai"] | None = None
 
     @field_validator("providers")
     @classmethod
@@ -367,6 +370,28 @@ def _row_strategy(row: Any) -> _Strategy:
     if strategy == "off" and row["vision_enabled"]:
         strategy, primary = "single", "gemini"
     return _Strategy(strategy, primary, str(row["apply_mode"]))
+
+
+def _scanned_ai_allowed(
+    *, mode: str, consent_current: bool, strategy: _Strategy, vllm_card: Any
+) -> bool:
+    """Whether the scanned-invoice switch may be on AI (PD-2c).
+
+    AI on with consent for page images read by the company server, whose Test proved both
+    capabilities (PD-1b). Gemini does not read until the owner re-confirms O-25 (D103 Q11).
+    """
+
+    return bool(
+        mode != "rules_only"
+        and consent_current
+        and strategy.reader_strategy == "single"
+        and strategy.primary_reader == "vllm"
+        and vllm_card is not None
+        and vllm_card["enabled"]
+        and vllm_card["model"]
+        and vllm_card["base_url"]
+        and connection_state.can_read_pages(vllm_card)
+    )
 
 
 def _origin(base_url: str | None) -> str | None:
@@ -494,6 +519,13 @@ class AiSettingsService:
         )
         limits_state = load_limits(self.config.limits_file)
         prices = load_prices(self.config.price_file)
+        consent_current = bool(
+            row and row["consent_given"] and fingerprint == row["consent_fingerprint"]
+        )
+        scanned_reader = str(row["scanned_invoice_reader"]) if row else "rules"
+        scanned_ai_allowed = _scanned_ai_allowed(
+            mode=mode, consent_current=consent_current, strategy=strategy, vllm_card=vllm
+        )
         return {
             # Writes are ai.manage only, so only a manager's view carries endpoints.
             "can_manage": reveal_endpoints,
@@ -505,9 +537,7 @@ class AiSettingsService:
             "key": key,
             "consent": {
                 "given": bool(row and row["consent_given"]),
-                "current": bool(
-                    row and row["consent_given"] and fingerprint == row["consent_fingerprint"]
-                ),
+                "current": consent_current,
                 "at": row["consent_at"] if row else None,
                 "text_version": consent_text_version(auto_verify_field_types=auto_verify_fields),
                 "required_fingerprint": fingerprint,
@@ -540,6 +570,13 @@ class AiSettingsService:
             # Providers are separate alternatives (plan §0.6): never a second reader.
             "secondary_reader": None,
             "apply_mode": strategy.apply_mode,
+            # The switch, whether AI may be chosen now, and whether AI reads scanned invoices
+            # now (stored on AI but no longer allowed, e.g. after a failed Test, reads none).
+            "scanned_invoices": {
+                "reader": scanned_reader,
+                "ai_available": scanned_ai_allowed,
+                "ai_reading": scanned_reader == "ai" and scanned_ai_allowed,
+            },
             "vllm_calls": self.config.gate.vllm_mode,
             "vllm_endpoints_allowed": (
                 list(self.config.gate.vllm_endpoints) if reveal_endpoints else []
@@ -1343,6 +1380,31 @@ class AiSettingsService:
                     "Provider and model required",
                     "Choose Gemini and a model before turning AI on.",
                 )
+            # The scanned-invoice switch (PD-2c). A change that takes AI reading away (AI
+            # off, another reader, a server or model change) puts it back to rules.
+            current_scanned = str(row["scanned_invoice_reader"]) if row else "rules"
+            scanned_reader = body.scanned_invoices or current_scanned
+            if scanned_reader == "ai" and not _scanned_ai_allowed(
+                mode=mode,
+                consent_current=consent_given,
+                strategy=strategy,
+                # The stored card (its proven capabilities) with this update's values.
+                vllm_card=(
+                    {**vllm_row, **(vllm_values or {})}
+                    if vllm_unchanged and vllm_row is not None
+                    else None
+                ),
+            ):
+                if body.scanned_invoices == "ai":
+                    raise AiSettingsError(
+                        422,
+                        "scanned_ai_not_available",
+                        "AI reading is not available",
+                        "Scanned invoices can be read with AI only when AI is on with consent "
+                        "and the company server reads page images: its Test must have "
+                        "proved page images and structured answers.",
+                    )
+                scanned_reader = "rules"
 
             key_values: dict[str, Any] = {}
             old_card_secret = (
@@ -1375,6 +1437,7 @@ class AiSettingsService:
                 "reader_strategy": strategy.reader_strategy,
                 "primary_reader": strategy.primary_reader,
                 "apply_mode": strategy.apply_mode,
+                "scanned_invoice_reader": scanned_reader,
                 "auto_verify_field_types": list(auto_verify_fields),
                 "updated_by": actor.actor_id,
                 "updated_at": now,
@@ -1521,6 +1584,16 @@ class AiSettingsService:
                     target_id=after_row["id"],
                     before_state={"active_provider": before_active_provider},
                     after_state={"active_provider": active_provider},
+                )
+            if scanned_reader != current_scanned:
+                write_audit_event(
+                    connection,
+                    actor,
+                    action="ai.scanned_invoice_reader_change",
+                    target_type="ai_setting",
+                    target_id=after_row["id"],
+                    before_state={"scanned_invoice_reader": current_scanned},
+                    after_state={"scanned_invoice_reader": scanned_reader},
                 )
             if strategy.apply_mode != current.apply_mode:
                 write_audit_event(
@@ -1676,6 +1749,7 @@ class AiSettingsService:
             "reader_strategy": row["reader_strategy"],
             "primary_reader": row["primary_reader"],
             "apply_mode": row["apply_mode"],
+            "scanned_invoice_reader": row["scanned_invoice_reader"],
             "auto_verify_field_types": list(row["auto_verify_field_types"] or ()),
         }
 

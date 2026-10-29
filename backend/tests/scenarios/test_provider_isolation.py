@@ -152,7 +152,11 @@ def _setup_dual_provider_workspace(
     public_key: SealingPublicKey,
     *,
     active_provider: str,
+    scanned_ai: bool = False,
 ) -> tuple[UUID, UUID]:
+    """``scanned_ai``: the switch on AI and a company server whose Test proved both
+    capabilities, so it may read scanned invoices (PD-2c)."""
+
     workspace_id = new_id()
     user_id = new_id()
     secret_id = new_id()
@@ -253,6 +257,8 @@ def _setup_dual_provider_workspace(
             limits={},
             updated_by=user_id,
             updated_at=now,
+            supports_vision=True if scanned_ai else None,
+            supports_json_schema=True if scanned_ai else None,
         )
     )
     # Gemini Provider Config Card
@@ -292,6 +298,7 @@ def _setup_dual_provider_workspace(
             reader_strategy=reader_strategy,
             primary_reader=primary_reader,
             apply_mode="suggest",
+            scanned_invoice_reader="ai" if scanned_ai else "rules",
             key_storage="saved",
             key_secret_id=secret_id,
             updated_by=user_id,
@@ -306,7 +313,12 @@ def _setup_dual_provider_workspace(
 
 
 def _setup_vision_document(
-    conn: Connection, ws_id: UUID, uid: UUID
+    conn: Connection,
+    ws_id: UUID,
+    uid: UUID,
+    *,
+    extraction_method: str = "pdf_text",
+    scanned: bool = False,
 ) -> tuple[UUID, UUID, str]:
     batch_id = new_id()
     doc_id = new_id()
@@ -365,7 +377,7 @@ def _setup_vision_document(
             grand_total=Decimal("123900.00"),
             po_refs=[],
             canonical_po_refs=[],
-            extraction_method="pdf_text",
+            extraction_method=extraction_method,
             extraction_conf=Decimal("0.95"),
             source_file_id=file_id,
             parser_version="1.0",
@@ -379,6 +391,7 @@ def _setup_vision_document(
             page=1,
             content="Synthetic invoice content",
             char_count=len("Synthetic invoice content"),
+            scanned=scanned,
         )
     )
     png_data = (
@@ -418,9 +431,11 @@ def test_inactive_provider_gets_zero_calls_both_directions(
     # --- Direction 1: Active = vLLM, Inactive = Gemini ---
     with engine.begin() as conn:
         ws_vllm, uid1 = _setup_dual_provider_workspace(
-            conn, public_key, active_provider="vllm"
+            conn, public_key, active_provider="vllm", scanned_ai=True
         )
-        _doc1, ver_id1, sub_ver1 = _setup_vision_document(conn, ws_vllm, uid1)
+        _doc1, ver_id1, sub_ver1 = _setup_vision_document(
+            conn, ws_vllm, uid1, extraction_method="pdf_ocr", scanned=True
+        )
 
     vllm_server_1 = MockVllmServer()
     vllm_provider_1 = OpenAICompatProvider(
@@ -530,17 +545,17 @@ def test_inactive_provider_gets_zero_calls_both_directions(
     # --- Direction 2: Active = Gemini, Inactive = vLLM ---
     with engine.begin() as conn:
         ws_gemini, uid2 = _setup_dual_provider_workspace(
-            conn, public_key, active_provider="gemini"
+            conn, public_key, active_provider="gemini", scanned_ai=True
         )
-        _doc2, ver_id2, sub_ver2 = _setup_vision_document(conn, ws_gemini, uid2)
+        _doc2, ver_id2, sub_ver2 = _setup_vision_document(
+            conn, ws_gemini, uid2, extraction_method="pdf_ocr", scanned=True
+        )
 
     vllm_server_2 = MockVllmServer()
     vllm_provider_2 = OpenAICompatProvider(
         VLLM_URL, frozenset({VLLM_URL}), inner_transport=httpx.MockTransport(vllm_server_2)
     )
-    gemini_stub_2 = ScriptedProvider(
-        [json.dumps(recorded_response()), json.dumps({"status": "ok"})]
-    )
+    gemini_stub_2 = ScriptedProvider([json.dumps({"status": "ok"})])
     gemini_stub_2.name = "gemini"
 
     runner_2 = AiRequestRunner(
@@ -586,9 +601,11 @@ def test_inactive_provider_gets_zero_calls_both_directions(
         )
         assert req_id_2_h6 is not None
 
-    # Run real hook request
+    # Gemini never reads scanned invoices until O-25 is re-confirmed (D103 Q11, PD-2c): the
+    # worker skips the page read without a call to either provider.
     res_2_h6 = runner_2.run(req_id_2_h6)
-    assert res_2_h6.state == "succeeded"
+    assert (res_2_h6.state, res_2_h6.code) == ("skipped", "NOT_ELIGIBLE")
+    assert gemini_stub_2.calls == []
 
     # 2. Runner check: execute a provider test request for active provider
     service_2 = AiSettingsService(

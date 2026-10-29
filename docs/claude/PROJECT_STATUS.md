@@ -1,5 +1,5 @@
 # Project status
-Last verified: 2026-10-29, commit a90ee42 (uncommitted changes present: .claude/, CODEBASE_CONTEXT.md, CLAUDE.md, docs/claude/)
+Last verified: 2026-10-29, commit e9573e9 + uncommitted PD-2c/PD-2d work (D107; also CODEBASE_CONTEXT.md untracked)
 
 ## Components
 Status: working-verified | implemented-untested | partial | stub | broken | not-found | unknown
@@ -8,24 +8,26 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - Digital vs scanned PDF routing — working-verified (unit) — local_hybrid.py:is_scanned; tests/parsers/test_phase4_pdf.py, test_scan_images.py
 - Rules extraction (PDF/XML/CSV/Tally) — working-verified (unit); accuracy target not met — tests/parsers/*; docs/accuracy-plan.md §0
 - AI vision reading (Gemini / vLLM) — implemented, suggestions only; live calls not run — reconbench_app/ai/worker/; tests/unit/test_ai_vision.py
+- Scanned-invoice switch + 0 LLM calls outside AI reading (PD-2c/PD-2d, D107) — working-verified (unit + integration on disposable DB), uncommitted, not deployed — ai/vision.py, ai/settings_service.py, migration 0035; tests/integration/test_pd2c_pd2d_reading.py
 - Validation (arithmetic, GSTIN, confidence) — working-verified (unit) — reconbench_core/extraction/verify.py; tests/property
 - Vendor + link mapping — working-verified (unit) — tests/unit/test_phase4_mapping_links.py, test_phase4_vendor_mapping.py
 - Line alignment — working-verified (unit) — tests/unit/test_phase4_alignment.py
 - Reconciliation engine — working-verified (unit) — tests/unit/test_phase4_reconciliation.py, tests/scenarios/test_hard_zero_guards.py
 - Ledger, review, export — implemented-untested here — ledger_service.py, api/review.py, export_service.py; tests/unit/test_export_workbook.py
-- Web app — unknown (not run: Node not on PATH) — web/
+- Web app — vitest 64 passed, lint + typecheck OK (2026-10-29, Node v24.19.0 from nvm, not on PATH) — web/
 
 ## Tests
-- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1427 passed, 0 failed, 22 skipped (all need RB_PHASE2_TEST_DATABASE_URL), 327 s, 2026-10-29
-- `pytest backend/tests/integration` — not run: needs disposable PostgreSQL + MinIO
-- `make check-static`, web vitest, Playwright e2e — not run: Node not on PATH
+- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1460 passed, 0 failed, 22 skipped (all need RB_PHASE2_TEST_DATABASE_URL), 296 s, 2026-10-29 (with D107 changes)
+- `pytest backend/tests/integration` — affected groups run on disposable postgres:16.15 at 127.0.0.1:15499 (D107); 3 failures also fail on HEAD (KNOWN_ISSUES); test_infrastructure_ready needs MinIO/S3; test_phase4_task_411_413 needs a database with no other sessions
+- Web: `npx tsc -b`, `npm run lint`, `npx vitest run` passed with PATH=/c/Users/jainm/AppData/Local/nvm/v24.19.0; Playwright e2e not run
 - `make accuracy-bench` — not run: needs Docker worker image and owner's local truth set
 
 ## Active task
-- none (memory setup done 2026-10-29)
+- PD-2c + PD-2d (step 5, D107): built and reviewed, uncommitted; next = owner review, commit, deploy (migration 0035)
 
 ## Next steps (max 5, highest value first)
-1. Real-sample end-to-end test (extraction → mapping → reconciliation) — owner's stated next step before the Phase 4 exit gate.
-2. Decide on KI-001 (internal server address in tracked files).
-3. Check the 20-page sandbox cap and scan misdetection suspicions (KNOWN_ISSUES) with synthetic PDFs.
-4. Run `make check-static` and web tests once Node is available.
+1. Commit and deploy PD-2c + PD-2d (D107 deploy notes: switch starts on rules; check no queued H1 request).
+2. Step 6: PD-2e + PD-2f + PD-2h (settle `NOT_NEEDED` skip in ai_assisted; provider name on method chip).
+3. Real-sample end-to-end test (extraction → mapping → reconciliation) — owner's stated next step before the Phase 4 exit gate.
+4. Decide on KI-001 (internal server address in tracked files).
+5. Check the 20-page sandbox cap and scan misdetection suspicions (KNOWN_ISSUES) with synthetic PDFs — scan misdetection now decides which invoices AI may read.

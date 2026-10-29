@@ -312,7 +312,9 @@ def make_world(
         client.__exit__(None, None, None)
 
 
-def _upload(world: World, content: bytes, name: str = "h1-invoice.pdf") -> UUID:
+def _upload(
+    world: World, content: bytes, name: str = "h1-invoice.pdf", *, queue_h1: bool = True
+) -> UUID:
     client = world.client
     batch = client.post("/api/v1/batches", json={"label": name}, headers={"X-CSRF-Token": CSRF})
     assert batch.status_code == 201, batch.text
@@ -334,7 +336,18 @@ def _upload(world: World, content: bytes, name: str = "h1-invoice.pdf") -> UUID:
     world.service.parse_file(file_id, job_id=2)
     documents = client.get(f"/api/v1/documents?batch_id={batch_id}").json()
     assert len(documents) == 1, documents
-    return UUID(documents[0]["id"])
+    document_id = UUID(documents[0]["id"])
+    if queue_h1:
+        # PD-2d: ingestion never queues H1 (0 LLM calls outside AI reading of scanned
+        # invoices). The H1 code is kept, so these tests queue it the way ingestion did.
+        hooks = world.service.ai_hooks
+        assert hooks is not None
+        with world.service.engine.begin() as connection:
+            version_id = connection.scalar(
+                sa.select(DOCUMENTS.c.current_version_id).where(DOCUMENTS.c.id == document_id)
+            )
+            hooks.extraction_suggestions(connection, world.workspace_id, [version_id])
+    return document_id
 
 
 def _runner(engine: Engine, keyring: Keyring, provider: ScriptedProvider) -> AiRequestRunner:
@@ -702,6 +715,17 @@ def test_nothing_is_queued_unless_business_data_may_leave(
 ) -> None:
     world = make_world(mode=mode, gate=gate)
     document_id = _upload(world, _pdf(PAGE_ONE, PAGE_TWO))
+    assert world.ai_queue.request_ids == []
+    view, _etag = _view(world, document_id)
+    assert view["state"] == "not_applicable"
+
+
+@pytest.mark.parametrize("mode", ["ai_assisted", "ai_first"])
+def test_an_upload_never_queues_h1(make_world: Any, mode: str) -> None:
+    """PD-2d: parsing a PDF invoice makes no LLM call, whatever the AI mode."""
+
+    world = make_world(mode=mode)
+    document_id = _upload(world, _pdf(PAGE_ONE, PAGE_TWO), queue_h1=False)
     assert world.ai_queue.request_ids == []
     view, _etag = _view(world, document_id)
     assert view["state"] == "not_applicable"

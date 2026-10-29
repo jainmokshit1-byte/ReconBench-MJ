@@ -1649,11 +1649,11 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 
 #### PD-2c — Settings switch for scanned invoices (D103 decision 2; replaces the per-upload method choice)
 - **Description:** one workspace setting "Scanned invoices: read with rules / read with AI", default rules, admin only, audited. Digital vs scanned stays automatic per page; a PDF with any scanned page counts as scanned. The **method actually used is stored per version** in its own column (it survives a person's save, F9) and is shown on the document page and in the Excel export (Q13). PO/GRN files and XML/CSV are always rules (Q5). The switch can be set to AI only when the active provider passed PD-1b.
-- **Files:** `ai/settings_service.py`, `ingestion.py`, `db/metadata.py` + additive migration, `export_service.py`, the Settings screen and the document page. **Tests:** integration (each switch position → stored method per version; a person's save keeps it); export column. **Status:** pending (step 5).
+- **Files:** `ai/settings_service.py`, `ingestion.py`, `db/metadata.py` + additive migration, `export_service.py`, the Settings screen and the document page. **Tests:** integration (each switch position → stored method per version; a person's save keeps it); export column. **Status:** built and tested, not committed or deployed (D107).
 
 #### PD-2d — 0 LLM calls outside AI reading (D103 decisions 1 and 3; replaces Task A)
 - **Description:** 0 LLM calls for **digital invoices, PO/GRN files, and scanned invoices with the switch on rules**: `_queue_extraction_suggestions` and `vision_targets` skip them; no H1 either.
-- **Acceptance:** uploads of a digital invoice, a PO PDF, a GRN PDF and a scanned invoice (switch on rules) ⇒ 0 `ai_request` rows; extraction output identical to today's rules path. **Status:** pending (step 5).
+- **Acceptance:** uploads of a digital invoice, a PO PDF, a GRN PDF and a scanned invoice (switch on rules) ⇒ 0 `ai_request` rows; extraction output identical to today's rules path. **Status:** built and tested, not committed or deployed (D107).
 
 #### PD-2e — AI reading for scanned invoices (D103 decision 3; = WI-BE7a/b/c rescoped)
 - **Description:** only **scanned invoices with the switch on AI** (a mixed PDF counts as scanned) are read by the active provider. The general worker turns the validated answer into a new current version (`extraction_method = ai_first`, origin AI from PD-2a) through a pure `merge_readings` with an `arb.llm` policy: the LLM leads; OCR runs as a visible cross-check (disagreement flagged `LLM_DISAGREEMENT` with the OCR value side by side, never substituted). Guards kept: MG-1 (PD-2a), MG-2, MG-3, MG-4, MG-5, MG-6, MG-7 (a manual or verified field is never replaced), MG-8, MG-10 (auto-verify stays empty), MG-11; MG-9 as changed by D103 (PD-2h). WI-V1 validators run on AI values. P3 (`consensus_enqueue_failed TypeError`) fixed here.
@@ -1678,7 +1678,7 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 - **Files:** `web/src/pages/MappingPage.tsx`, `backend/reconbench_app/mapping_service.py`, `backend/reconbench_app/api/mapping.py`. **Acceptance:** unlink → undo restores the same pairing; link again on a rejected line → a confirmed link (audited); a duplicate attempt is refused; after a mapping re-run and a reload the state equals the screen; web tests. **Status:** pending (batch PD-B1).
 
 #### PD-4c — Method and provenance on screens and exports
-- **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** pending (step 5).
+- **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** partial (D107): method chip "Read by rules / Read by AI" on the document page and a "Reading Method" export column; the provider name and per-field origin come with PD-2e.
 
 #### PD-4d — Verify AI-read fields (UI part of PD-2b)
 - **Description:** side by side AI value / OCR cross-check / page box; "Verify" per field and "Verify all" only where the AI and OCR values agree (Q8), with a count. **Deps:** PD-2b. **Status:** done (D104; live 29 Oct 2026, tag live-20261029-b3).

@@ -2226,6 +2226,7 @@ class IngestionService:
                                     content=page_text.content,
                                     char_count=len(page_text.content),
                                     is_ocr=page_text.is_ocr,
+                                    scanned=page_text.scanned,
                                 )
                             )
                     matching_warnings = [
@@ -2352,7 +2353,7 @@ class IngestionService:
             )
             if documents_new or documents_updated:
                 self.queue.enqueue("resolve_vendors", file_id=file_id, connection=connection)
-            self._queue_extraction_suggestions(connection, workspace_id, pdf_version_ids)
+            self._queue_vision_reading(connection, workspace_id, pdf_version_ids)
         if file_row["parent_file_id"] is not None:
             self._refresh_parent(cast(UUID, file_row["parent_file_id"]))
 
@@ -2552,13 +2553,14 @@ class IngestionService:
             )
         return dict(updated)
 
-    def _queue_extraction_suggestions(
+    def _queue_vision_reading(
         self, connection: Connection, workspace_id: UUID, version_ids: Sequence[UUID]
     ) -> None:
-        """Queue advisory H1 suggestions or vision page preparation; never blocks parsing.
+        """Queue vision page preparation for scanned invoices; never blocks parsing.
 
-        With page images on for the workspace the vision reader replaces H1 (the
-        consented hook list then has no H1), so at most one of them is queued.
+        Only scanned invoices with the switch on AI are read (``vision_targets``). H1 is
+        never queued (D103, PD-2d): digital invoices, PO/GRN files and scanned invoices
+        with the switch on rules make no LLM call. The H1 code is kept.
         """
 
         if self.ai_hooks is None or not version_ids:
@@ -2579,11 +2581,6 @@ class IngestionService:
                 _LOGGER.warning(
                     "ai_enqueue_failed hook=h6_vision error_type=%s", type(exc).__name__
                 )
-        try:
-            with connection.begin_nested():
-                self.ai_hooks.extraction_suggestions(connection, workspace_id, version_ids)
-        except Exception as exc:  # noqa: BLE001 - AI is optional; rules continue.
-            _LOGGER.warning("ai_enqueue_failed hook=h1_extract error_type=%s", type(exc).__name__)
 
     @staticmethod
     def _suggest_batch_label(connection: Connection, workspace_id: UUID, batch_id: UUID) -> None:
@@ -3145,6 +3142,7 @@ class IngestionService:
                 header_values.get("supplier_invoice_no")
             ),
             "extraction_method": extraction_method.value,
+            "reading_method": _reading_method(extraction_method),
             "extraction_conf": document.confidence,
             "needs_verification": document.needs_verification,
             "verification_reasons": [reason.value for reason in document.reason_codes],
@@ -5809,6 +5807,17 @@ def _extraction_method(file_format: FileFormat | None, *, is_ocr: bool = False) 
         FileFormat.CSV: ExtractionMethod.CSV_MAPPING,
         FileFormat.PDF: ExtractionMethod.PDF_TEXT,
     }.get(file_format, ExtractionMethod.SHELL)
+
+
+def _reading_method(extraction_method: ExtractionMethod) -> str:
+    """The method that read a new version (PD-2c): ``ai`` for an AI reading, else ``rules``.
+
+    A person's correction copies the method of the version it replaces instead (F9).
+    """
+
+    if extraction_method in {ExtractionMethod.AI_FALLBACK, ExtractionMethod.AI_FIRST}:
+        return "ai"
+    return "rules"
 
 
 def _field_origin(

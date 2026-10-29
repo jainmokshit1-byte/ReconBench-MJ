@@ -1033,6 +1033,12 @@ _tables["ai_setting"] = sa.Table(
         server_default=sa.text("'suggest'::ai_apply_mode"),
         nullable=False,
     ),
+    sa.Column(
+        "scanned_invoice_reader",
+        sa.Text(),
+        server_default=sa.text("'rules'::text"),
+        nullable=False,
+    ),
     sa.PrimaryKeyConstraint("id", name="ai_setting_pkey"),
     sa.UniqueConstraint("workspace_id", name="ai_setting_workspace_id_key"),
     sa.ForeignKeyConstraint(["consent_by"], ["app_user.id"], name="ai_setting_consent_by_fkey"),
@@ -1065,6 +1071,10 @@ _tables["ai_setting"] = sa.Table(
     sa.CheckConstraint(
         "(reader_strategy = 'off'::ai_reader_strategy) = (primary_reader IS NULL)",
         name="ai_setting_reader_strategy_ck",
+    ),
+    sa.CheckConstraint(
+        "scanned_invoice_reader IN ('rules', 'ai')",
+        name="ai_setting_scanned_invoice_reader_ck",
     ),
 )
 
@@ -2034,6 +2044,9 @@ _tables["document_version"] = sa.Table(
     sa.Column(
         "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
     ),
+    sa.Column(
+        "reading_method", sa.Text(), server_default=sa.text("'rules'::text"), nullable=False
+    ),
     sa.PrimaryKeyConstraint("id", name="document_version_pkey"),
     sa.UniqueConstraint("document_id", "seq", name="document_version_document_id_seq_key"),
     sa.ForeignKeyConstraint(
@@ -2052,6 +2065,11 @@ _tables["document_version"] = sa.Table(
     ),
     sa.ForeignKeyConstraint(
         ["workspace_id"], ["workspace.id"], name="document_version_workspace_id_fkey"
+    ),
+    sa.CheckConstraint(
+        "reading_method IN ('rules', 'ai') AND (extraction_method = 'manual' "
+        "OR (extraction_method IN ('ai_first', 'ai_fallback')) = (reading_method = 'ai'))",
+        name="document_version_reading_method_ck",
     ),
 )
 
@@ -2588,6 +2606,7 @@ _tables["document_text"] = sa.Table(
     sa.Column(
         "created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("now()"), nullable=False
     ),
+    sa.Column("scanned", sa.Boolean(), server_default=sa.text("false"), nullable=False),
     sa.PrimaryKeyConstraint("document_version_id", "page", name="document_text_pkey"),
     sa.ForeignKeyConstraint(
         ["document_version_id"],

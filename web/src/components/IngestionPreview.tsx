@@ -480,6 +480,7 @@ function DocumentCard({
           <h3>{valueText(version["doc_no"])}</h3>
         </div>
         <div className="preview-document-badges">
+          {version["reading_method"] === "ai" || version["reading_method"] === "rules" ? <span className="quiet-badge" aria-label="Reading method">{version["reading_method"] === "ai" ? "Read by AI" : "Read by rules"}</span> : null}
           {version["extraction_method"] === "pdf_ocr" ? <span className="ocr-chip">OCR-assisted</span> : null}
           {needsVerification ? <span className="verification-chip"><AlertTriangle size={13} /> Needs verification</span> : <span className="quiet-badge">Parsed</span>}
         </div>

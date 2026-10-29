@@ -42,6 +42,7 @@ def _case(*, vendor_id: UUID, invoice_no: str = "0142") -> dict[str, Any]:
         "po_nos": ["0007"],
         "grn_nos": ["G-1"],
         "human_touched": False,
+        "reading_method": "rules",
     }
 
 
@@ -171,3 +172,24 @@ def test_summary_counts_needs_review_apart_from_exceptions(tmp_path: Path) -> No
         assert summary["Duplicate"] == 0
     finally:
         values.close()
+
+
+def test_invoice_sheet_names_the_reading_method_in_the_last_column(tmp_path: Path) -> None:
+    """PD-2c / Q13: each invoice row says how its version was read; no column moves."""
+
+    vendor_id = uuid4()
+    path = tmp_path / "reconciliation.xlsx"
+    ai_case = {**_case(vendor_id=vendor_id, invoice_no="0143"), "reading_method": "ai"}
+    _write(path, [_case(vendor_id=vendor_id), ai_case], [vendor_id])
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        sheet = workbook["Invoice Recon"]
+        assert sheet["T1"].value == "Payment Due Date"
+        assert sheet["U1"].value == "Reading Method"
+        assert sheet.max_column == 21
+        assert [sheet["C2"].value, sheet["U2"].value] == ["0142", "Rules"]
+        assert [sheet["C3"].value, sheet["U3"].value] == ["0143", "AI reading"]
+        assert sheet["K2"].value == "=I2+J2"
+    finally:
+        workbook.close()

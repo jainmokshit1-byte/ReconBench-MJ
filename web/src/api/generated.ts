@@ -1318,6 +1318,8 @@ export interface components {
             reader_strategy?: ("off" | "shadow" | "single") | null;
             /** Redaction Enabled */
             redaction_enabled?: boolean | null;
+            /** Scanned Invoices */
+            scanned_invoices?: ("rules" | "ai") | null;
             /** Vision */
             vision?: boolean | null;
             /**

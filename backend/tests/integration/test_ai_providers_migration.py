@@ -30,7 +30,14 @@ ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
 MODEL = "gemini-3.8-flash"
 
 _REWIND = (
-    # 0034 (provider capabilities, PD-1b) is removed first; the upgrade re-applies it.
+    # 0035 (scanned-invoice switch and reading method, PD-2c) is removed first; the upgrade
+    # re-applies it.
+    "ALTER TABLE document_version DROP CONSTRAINT document_version_reading_method_ck, "
+    "DROP COLUMN reading_method",
+    "ALTER TABLE document_text DROP COLUMN scanned",
+    "ALTER TABLE ai_setting DROP CONSTRAINT ai_setting_scanned_invoice_reader_ck, "
+    "DROP COLUMN scanned_invoice_reader",
+    # 0034 (provider capabilities, PD-1b) is removed next; the upgrade re-applies it.
     "ALTER TABLE ai_provider_config DROP CONSTRAINT ai_provider_config_context_window_ck, "
     "DROP COLUMN context_window, DROP COLUMN supports_json_schema, DROP COLUMN supports_vision",
     # 0033 (AI_VALUE_UNVERIFIED reason, PD-2b) is removed next; the upgrade re-applies it.
@@ -88,7 +95,7 @@ def migrated() -> Iterator[tuple[Engine, dict[str, UUID], UUID]]:
     try:
         with engine.begin() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-            assert heads == {"0034"}, heads
+            assert heads == {"0035"}, heads
             for statement in _REWIND:
                 connection.exec_driver_sql(statement)
             user_id = connection.scalar(sa.text("SELECT id FROM app_user LIMIT 1"))

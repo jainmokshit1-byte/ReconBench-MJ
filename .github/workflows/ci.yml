@@ -280,7 +280,7 @@ jobs:
         run: uv sync --project backend --all-groups --locked
 
       - name: Build the previous schema
-        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0033
+        run: uv run --project backend alembic -c backend/alembic.ini upgrade 0034
 
       - name: Test the migration on a copy of the previous schema
         run: uv run --project backend python scripts/check_migration_safety.py

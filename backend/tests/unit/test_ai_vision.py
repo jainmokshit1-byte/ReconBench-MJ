@@ -312,6 +312,7 @@ def _facts(**overrides: Any) -> VisionFacts:
         "extraction_method": "pdf_ocr",
         "needs_verification": True,
         "page_count": 2,
+        "scanned": True,
     }
     values.update(overrides)
     return VisionFacts(**values)
@@ -323,6 +324,13 @@ def _facts(**overrides: Any) -> VisionFacts:
         (_facts(), "rules_only", "MODE_OFF"),
         (_facts(file_format="xml", extraction_method="xml_profile"), "ai_first", "NOT_PDF"),
         (_facts(extraction_method="manual"), "ai_first", "NOT_PDF"),
+        # PD-2d: only scanned invoices; digital invoices and PO/GRN files are rules only.
+        (_facts(extraction_method="pdf_text", scanned=False), "ai_first", "NOT_SCANNED_INVOICE"),
+        # An OCR assist on a digital page is ``pdf_ocr`` but not scanned (D103 decision 1).
+        (_facts(scanned=False), "ai_first", "NOT_SCANNED_INVOICE"),
+        (_facts(doc_type="po"), "ai_first", "NOT_SCANNED_INVOICE"),
+        (_facts(doc_type="grn"), "ai_first", "NOT_SCANNED_INVOICE"),
+        (_facts(doc_type="po", extraction_method="pdf_text"), "ai_first", "NOT_SCANNED_INVOICE"),
         (_facts(page_count=9), "ai_first", "TOO_MANY_PAGES"),
         (_facts(page_count=0), "ai_first", "NO_PAGES"),
         (_facts(needs_verification=False), "ai_assisted", "NOT_NEEDED"),
@@ -332,11 +340,10 @@ def test_ineligible_versions(facts: VisionFacts, mode: str, reason: str) -> None
     assert vision_eligibility(facts, mode=mode, max_pages=8).reason == reason
 
 
-@pytest.mark.parametrize("doc_type", ["invoice", "po", "grn"])
-def test_invoice_po_and_grn_pdfs_are_eligible(doc_type: str) -> None:
-    facts = _facts(doc_type=doc_type, needs_verification=False)
+def test_only_scanned_invoice_pdfs_are_eligible() -> None:
+    facts = _facts(needs_verification=False)
     assert vision_eligibility(facts, mode="ai_first", max_pages=8).eligible
-    assert vision_eligibility(_facts(doc_type=doc_type), mode="ai_assisted", max_pages=8).eligible
+    assert vision_eligibility(_facts(), mode="ai_assisted", max_pages=8).eligible
 
 
 def test_vision_limits_and_image_token_reservation() -> None:

@@ -50,6 +50,7 @@ def _copy_version(
         new_version_id = new_id()
         copy = {**old, "id": new_version_id, "seq": int(old["seq"]) + 1}
         copy["extraction_method"] = method
+        copy["reading_method"] = "ai" if method in {"ai_first", "ai_fallback"} else "rules"
         copy.pop("created_at", None)
         connection.execute(sa.insert(version).values(**copy))
         line_ids: dict[UUID, tuple[UUID, int]] = {}

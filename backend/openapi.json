@@ -203,6 +203,21 @@
             ],
             "title": "Redaction Enabled"
           },
+          "scanned_invoices": {
+            "anyOf": [
+              {
+                "enum": [
+                  "rules",
+                  "ai"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scanned Invoices"
+          },
           "vision": {
             "anyOf": [
               {

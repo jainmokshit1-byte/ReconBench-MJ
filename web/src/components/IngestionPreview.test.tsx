@@ -70,6 +70,7 @@ const originalVersion: Record<string, unknown> = {
     grand_total: "118.00",
     needs_verification: true,
     extraction_method: "pdf_text",
+    reading_method: "rules",
 };
 const originalDetails = {
   document: originalDocument,
@@ -126,6 +127,8 @@ describe("Invoice preview corrections", () => {
     );
 
     expect(await screen.findByRole("heading", { name: "INV-1" })).toBeInTheDocument();
+    // PD-2c: the method that read the version is shown on the document.
+    expect(screen.getByLabelText("Reading method")).toHaveTextContent("Read by rules");
     fireEvent.click(screen.getByRole("button", { name: /Edit extracted invoice/i }));
     fireEvent.change(screen.getByLabelText("Document number"), { target: { value: "INV-1-CORRECTED" } });
     fireEvent.click(screen.getByLabelText(/I reviewed the source PDF/));

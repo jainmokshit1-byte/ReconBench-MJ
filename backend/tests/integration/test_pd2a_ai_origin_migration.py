@@ -65,7 +65,7 @@ def _clone() -> Iterator[Engine]:
     try:
         with engine.connect() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-        assert heads == {"0034"}, heads
+        assert heads == {"0035"}, heads
         os.environ["RB_MIGRATOR_DATABASE_URL"] = clone_url
         yield engine
     finally:
@@ -154,8 +154,8 @@ def _store_ai_first_version(connection: sa.Connection) -> UUID:
     connection.execute(
         sa.text(
             "INSERT INTO document_version (id, workspace_id, document_id, seq, content_hash, "
-            "extraction_method, source_file_id, parser_version) VALUES "
-            "(:id, :w, :d, 1, :hash, 'ai_first', :f, 'synthetic')"
+            "extraction_method, reading_method, source_file_id, parser_version) VALUES "
+            "(:id, :w, :d, 1, :hash, 'ai_first', 'ai', :f, 'synthetic')"
         ),
         {"id": version_id, "w": workspace_id, "d": document_id, "hash": digest, "f": file_id},
     )
@@ -228,7 +228,7 @@ def test_downgrade_restores_the_previous_check_and_upgrade_reapplies_it() -> Non
 
         command.upgrade(_config(), "head")
         with engine.connect() as connection:
-            assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0034"
+            assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0035"
             assert "'ai'::text" in str(connection.scalar(sa.text(_CHECK)))
 
 
@@ -236,7 +236,8 @@ def test_downgrade_is_refused_while_an_ai_value_is_stored() -> None:
     with _clone() as engine:
         with engine.begin() as connection:
             _store_ai_first_version(connection)
-        # Revisions 0034 (PD-1b) and 0033 (PD-2b) go first, so the refused step is 0032's own.
+        # Revisions 0035 (PD-2c), 0034 (PD-1b) and 0033 (PD-2b) go first, so the refused step
+        # is 0032's own.
         command.downgrade(_config(), "0032")
         with pytest.raises(sa.exc.IntegrityError, match="field_evidence_origin_ck"):
             command.downgrade(_config(), "0031")

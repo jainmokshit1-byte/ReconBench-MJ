@@ -236,12 +236,17 @@ class AiHookEnqueuer:
     def vision_targets(
         self, connection: Connection, workspace_id: UUID, version_ids: Sequence[UUID]
     ) -> list[UUID]:
-        """Freshly parsed PDF versions whose pages should be prepared for the vision reader."""
+        """Freshly parsed scanned invoices whose pages should be prepared for the vision reader.
+
+        Only with the scanned-invoice switch on AI (PD-2c); every other version gets no call.
+        """
 
         ready = self.ready(connection, workspace_id, vision.HOOK)
         if ready is None:
             return []
         settings, limits = ready
+        if not settings.reads_scanned_invoices:
+            return []
         targets: list[UUID] = []
         for version_id in version_ids:
             if len(targets) >= limits.per_operation_calls:

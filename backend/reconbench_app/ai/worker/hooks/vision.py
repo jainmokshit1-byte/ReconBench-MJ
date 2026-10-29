@@ -23,6 +23,7 @@ from reconbench_app.ai.consensus import ConsensusEnqueuer
 from reconbench_app.ai.contracts import VisionOutput
 from reconbench_app.ai.limits import AiLimits
 from reconbench_app.ai.prompts import PromptPayload
+from reconbench_app.ai.runtime_checks import load_settings
 from reconbench_app.ai.vision_bands import header_band
 from reconbench_app.ai.worker.handlers import Prepared, Skip
 from reconbench_app.extraction.vision import (
@@ -88,6 +89,9 @@ class VisionReadHandler:
         if not vision.eligibility(subject, mode=str(request["mode"]), limits=limits).eligible:
             return Skip(vision.SKIP_NOT_ELIGIBLE)
         workspace_id = request["workspace_id"]
+        settings = load_settings(connection, workspace_id)
+        if settings is None or not settings.reads_scanned_invoices:
+            return Skip(vision.SKIP_NOT_ELIGIBLE)
         pages = vision.load_pages(connection, workspace_id, subject.version_id, with_bytes=True)
         payload = vision.prompt_for(subject.doc_type, pages, reader)
         parts = vision.page_prompts(subject.doc_type, pages, reader)

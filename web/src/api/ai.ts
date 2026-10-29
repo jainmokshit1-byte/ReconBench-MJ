@@ -242,6 +242,17 @@ export interface AiProviderCard {
   connection: { state: string; reason_code: string | null; checked_at: string | null; connected_at: string | null };
 }
 
+/** "Scanned invoices: read with rules / read with AI" (PD-2c); digital invoices and PO/GRN files are always rules. */
+export type AiScannedReader = "rules" | "ai";
+
+export interface AiScannedInvoices {
+  reader: AiScannedReader;
+  /** Whether AI may be chosen now: AI on with consent and a company server whose Test proved page images and structured answers. */
+  ai_available: boolean;
+  /** Whether scanned invoices are read with AI now (stored on AI but no longer available reads none). */
+  ai_reading: boolean;
+}
+
 /** `GET /ai/settings`; the key is never part of it, only a four-character hint. */
 export interface AiSettingsView {
   /** True when the signed-in person may change AI settings (`ai.manage`). */
@@ -251,6 +262,7 @@ export interface AiSettingsView {
   /** Which provider reads page images (`single`), or none (`off`). */
   reader_strategy: AiReaderStrategy;
   primary_reader: AiProviderName | null;
+  scanned_invoices: AiScannedInvoices;
   vllm_calls: string;
   providers: AiProviderCard[];
   version: number;
@@ -321,6 +333,7 @@ export interface AiSettingsUpdate {
   auto_verify_field_types?: AiAutoVerifyFieldType[];
   reader_strategy?: AiReaderStrategy;
   primary_reader?: AiProviderName;
+  scanned_invoices?: AiScannedReader;
 }
 
 export class AiApiError extends Error {
@@ -434,6 +447,7 @@ function parseSettings(value: unknown): AiSettingsView {
     : [];
   const readerStrategy = value["reader_strategy"];
   const primaryReader = value["primary_reader"];
+  const scanned = isObject(value["scanned_invoices"]) ? value["scanned_invoices"] : {};
   const providers = Array.isArray(value["providers"]) ? value["providers"].flatMap(parseProviderCard) : [];
   const endpoints = Array.isArray(value["vllm_endpoints_allowed"])
     ? value["vllm_endpoints_allowed"].filter((item): item is string => typeof item === "string")
@@ -443,6 +457,11 @@ function parseSettings(value: unknown): AiSettingsView {
     vllm_endpoints_allowed: endpoints,
     reader_strategy: readerStrategy === "shadow" || readerStrategy === "single" ? readerStrategy : "off",
     primary_reader: primaryReader === "gemini" || primaryReader === "vllm" ? primaryReader : null,
+    scanned_invoices: {
+      reader: scanned["reader"] === "ai" ? "ai" : "rules",
+      ai_available: scanned["ai_available"] === true,
+      ai_reading: scanned["ai_reading"] === true,
+    },
     vllm_calls: text(value["vllm_calls"]) ?? "disabled",
     providers,
     version: value["version"],

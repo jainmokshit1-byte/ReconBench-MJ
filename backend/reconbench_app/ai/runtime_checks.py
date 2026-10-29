@@ -51,6 +51,9 @@ class ProviderConfig:
     version: int
     pending_key_secret_id: UUID | None = None
     key_tier: str = "free"
+    # What the card's Test proved (PD-1b); None = not checked.
+    supports_vision: bool | None = None
+    supports_json_schema: bool | None = None
 
 
 def fingerprint_for(
@@ -98,6 +101,8 @@ class SettingsSnapshot:
     reader_strategy: str = "off"
     primary_reader: str | None = None
     apply_mode: str = "suggest"
+    # "Scanned invoices: read with rules / read with AI" (PD-2c); default rules.
+    scanned_invoice_reader: str = "rules"
     vllm: ProviderConfig | None = None
     # The Gemini card; its key (when set) is the Gemini key, else ``ai_setting.key_secret_id``.
     gemini: ProviderConfig | None = None
@@ -146,6 +151,23 @@ class SettingsSnapshot:
 
     def target(self, hook: str | None = None) -> tuple[str | None, str | None]:
         return (self.active_provider, self.active_model)
+
+    @property
+    def reads_scanned_invoices(self) -> bool:
+        """The scanned-invoice switch is on AI and AI reading may use the active provider.
+
+        Only the company server, with both PD-1b capabilities proven; Gemini does not read
+        until the owner re-confirms O-25 (D103 Q11).
+        """
+
+        return (
+            self.scanned_invoice_reader == "ai"
+            and self.active_provider == "vllm"
+            and self.vllm is not None
+            and self.vllm.enabled
+            and self.vllm.supports_vision is True
+            and self.vllm.supports_json_schema is True
+        )
 
     @property
     def hooks(self) -> tuple[str, ...]:
@@ -216,6 +238,8 @@ def load_provider_config(
         version=int(row["version"]),
         pending_key_secret_id=row["pending_key_secret_id"],
         key_tier=str(row["key_tier"]),
+        supports_vision=row["supports_vision"],
+        supports_json_schema=row["supports_json_schema"],
     )
 
 
@@ -256,6 +280,7 @@ def load_settings(
         reader_strategy=str(row["reader_strategy"]),
         primary_reader=row["primary_reader"],
         apply_mode=str(row["apply_mode"]),
+        scanned_invoice_reader=str(row["scanned_invoice_reader"]),
         vllm=load_provider_config(connection, workspace_id, "vllm"),
         gemini=gemini,
     )

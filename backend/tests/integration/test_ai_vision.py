@@ -3,6 +3,11 @@
 PDF parse → vision page preparation (PDF sandbox) → AI worker runner with the
 offline ``ScriptedProvider`` replaying a recorded answer → review view →
 correction save. Synthetic documents only; nothing leaves the process.
+
+These tests cover the reader's mechanics with the Gemini stub and a digital invoice
+fixture. Which documents may be read (PD-2c/PD-2d: scanned invoices only, the company
+server only, the switch on AI) is tested unpatched in ``test_pd2c_pd2d_reading.py``;
+``_reader_mechanics_gate`` opens that gate here for invoices only.
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.key_seal import SealingPublicKey, key_hint, seal
 from reconbench_app.ai.limits import AiLimits, LimitsState
 from reconbench_app.ai.provider import ProviderRequest, ProviderResult
-from reconbench_app.ai.runtime_checks import fingerprint_for
+from reconbench_app.ai.runtime_checks import SettingsSnapshot, fingerprint_for
 from reconbench_app.ai.stub import ScriptedProvider
 from reconbench_app.ai.worker.handlers import default_handlers
 from reconbench_app.ai.worker.key_open import Keyring
@@ -80,6 +85,24 @@ DOCUMENTS = metadata.tables["document"]
 LINKS = metadata.tables["link"]
 CONSENSUS_RUNS = metadata.tables["consensus_run"]
 CONSENSUS_DECISIONS = metadata.tables["consensus_decision"]
+
+
+@pytest.fixture(autouse=True)
+def _reader_mechanics_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test-only: the digital fixture counts as scanned and any active reader may read it.
+
+    PO/GRN files stay unreadable (``READ_DOC_TYPES`` is not widened).
+    """
+
+    pages = vision._version_pages
+    monkeypatch.setattr(
+        vision, "_version_pages", lambda *args, **kwargs: (pages(*args, **kwargs)[0], True)
+    )
+    monkeypatch.setattr(
+        SettingsSnapshot,
+        "reads_scanned_invoices",
+        property(lambda self: self.scanned_invoice_reader == "ai"),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -224,6 +247,7 @@ def _seed(
             key_secret_id=secret_id,
             updated_by=user_id,
             vision_enabled=vision_on,
+            scanned_invoice_reader="ai" if vision_on else "rules",
             consent_given=True,
             consent_fingerprint=consent_fingerprint(
                 provider="gemini", model=MODEL, mode=mode, vision=vision_on
@@ -327,41 +351,6 @@ def _grn_pdf() -> bytes:
     pdf.showPage()
     pdf.save()
     return buffer.getvalue()
-
-
-def _grn_answer() -> dict[str, Any]:
-    box = [80, 60, 100, 400]
-    return {
-        "doc_kind": "goods_receipt",
-        "pages": [{"page": 1, "kind": "goods_receipt", "title": "GOODS RECEIPT NOTE"}],
-        "fields": [
-            {"name": "doc_no", "text": GRN_NO, "page": 1, "box_2d": box},
-            {"name": "doc_date", "text": "05/04/2026", "page": 1, "box_2d": [100, 60, 120, 300]},
-            {
-                "name": "supplier_gstin",
-                "text": SUPPLIER_GSTIN,
-                "page": 1,
-                "box_2d": [140, 60, 160, 400],
-            },
-            {
-                "name": "po_ref",
-                "text": GRN_PO,
-                "label": "Reference No. & Date",
-                "page": 1,
-                "box_2d": [160, 60, 180, 500],
-            },
-        ],
-        "lines": [
-            {
-                "page": 1,
-                "box_2d": [180, 40, 200, 600],
-                "description": "Synthetic Laptop Model X1",
-                "quantity": "2 Nos",
-                "amount": "",
-            }
-        ],
-        "annotations": [],
-    }
 
 
 def _upload(world: World, content: bytes, *, name: str, zone: str = "invoice") -> UUID:
@@ -846,26 +835,23 @@ def test_correction_save_records_vision_provenance(
     assert after["state"] == "available"
 
 
-def test_grn_readings_remain_suggestions_on_correctable_documents(
-    engine: Engine, keys: tuple[Keyring, SealingPublicKey], make_world: Any
-) -> None:
+def test_grn_pdfs_are_never_read_by_ai(engine: Engine, make_world: Any) -> None:
+    """PD-2d: PO/GRN files are always read by rules, even with the reader gate open."""
+
     world = make_world()
-    document_id = _upload(world, _grn_pdf(), name="vision-grn.pdf", zone="grn")
-    assert _prepare(world) == ["queued"]
-    [request_id] = world.ai_queue.request_ids
-    result = _runner(engine, keys[0], _Recorder([json.dumps(_grn_answer())])).run(request_id)
-    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
-    view, _etag = _view(world, document_id)
-    assert view["state"] == "available" and view["correctable"] is True
-    by_field = {item["field"]: item["value"] for item in view["suggestions"]}
-    assert by_field["doc_no"] == GRN_NO and by_field["po_refs"] == GRN_PO
+    _upload(world, _grn_pdf(), name="vision-grn.pdf", zone="grn")
+    assert world.queue.vision_versions == []
+    assert world.ai_queue.request_ids == [] and _vision_requests(engine, world) == []
+    assert _page_rows(engine, world) == []
 
 
-def test_without_page_images_h1_runs_as_before(make_world: Any) -> None:
+def test_without_page_images_no_h1_is_queued(make_world: Any) -> None:
+    """PD-2d: H1 is never queued (it used to replace the vision reader here)."""
+
     world = make_world(vision_on=False)
     _upload(world, synthetic_invoice_pdf(), name="vision-off.pdf")
     assert world.queue.vision_versions == []
-    assert len(world.ai_queue.request_ids) == 1  # the H1 text request
+    assert world.ai_queue.request_ids == []
 
 
 @pytest.mark.parametrize(
