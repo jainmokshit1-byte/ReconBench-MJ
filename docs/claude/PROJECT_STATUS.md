@@ -24,6 +24,7 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 
 ## Active task
 - PD-2c + PD-2d (step 5): live 29 Oct 2026 (D107, D108, commit 41b5546, tag live-20261029-b5); owner check pending
+- Next session: step 6 (PD-2e + PD-2f + PD-2h, PD-3b) — start from docs/claude/handoff-step6.md; don't re-explore the code
 
 ## Next steps (max 5, highest value first)
 1. Owner check of step 5 on live (Settings "Scanned invoices" panel, "Read by rules" chip); decide when to set the switch to AI.
