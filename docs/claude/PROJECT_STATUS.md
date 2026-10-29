@@ -7,7 +7,7 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - Ingestion (upload, sniff, ZIP, dedupe by hash) — implemented-untested here (DB integration tests skipped) — reconbench_app/ingestion.py, tests/integration/test_ingestion.py
 - Digital vs scanned PDF routing — working-verified (unit) — local_hybrid.py:is_scanned; tests/parsers/test_phase4_pdf.py, test_scan_images.py
 - Rules extraction (PDF/XML/CSV/Tally) — working-verified (unit); accuracy target not met — tests/parsers/*; docs/accuracy-plan.md §0
-- AI vision reading (Gemini / vLLM) — implemented; with the switch on AI the reading becomes the current version (PD-2e, D109; live D110, switch on rules); live calls not run — reconbench_app/ai/worker/, ai/consensus.py, reconbench_core/extraction/merge.py; tests/unit/test_pd2e_merge.py, tests/integration/test_ai_vision.py
+- AI vision reading (Gemini / vLLM) — implemented; with the switch on AI the reading becomes the current version (PD-2e, D109; live D110, switch on rules); one real company-server reading on a throwaway copy of live passed (D111) — reconbench_app/ai/worker/, ai/consensus.py, reconbench_core/extraction/merge.py; tests/unit/test_pd2e_merge.py, tests/integration/test_ai_vision.py
 - Waiting for reading (PD-2f, D109; live D110) — working-verified (integration, disposable DB) — reconbench_app/reading_state.py, migration 0036; tests/integration/test_pd2f_waiting_for_reading.py
 - Scanned-invoice switch + 0 LLM calls outside AI reading (PD-2c/PD-2d, D107) — working-verified (unit + integration on disposable DB); live 29 Oct (D108) — ai/vision.py, ai/settings_service.py, migration 0035; tests/integration/test_pd2c_pd2d_reading.py
 - Validation (arithmetic, GSTIN, confidence) — working-verified (unit) — reconbench_core/extraction/verify.py; tests/property
@@ -25,11 +25,12 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 
 ## Active task
 - Step 6 (PD-2e + PD-2f + PD-2h + PD-3b) live 30 Oct 2026 (D109, D110, commit 493bc9e, tag live-20261030-b6); switch on rules; plan in docs/claude/plan-step6.md
+- Dry run on a throwaway copy of live + one real company-server reading done (D111): no blocker; live switch stays on rules until PD-5c (step 7)
 - Owner check of step 5 on live still pending (D108)
 
 ## Next steps (max 5, highest value first)
 1. Owner pushes 493bc9e and tag live-20261030-b6 (plus the D110 docs once committed).
-2. Before setting the switch to AI on live: one budgeted company-vLLM reading of a synthetic scan (owner go), and a dry run on a throwaway copy of live.
+2. Step 7 (new session): PD-5 (5a, 5b, 5c) — PD-5c measures both switch positions on the same real scanned invoices before the live switch goes to AI; fix KI-005 there.
 3. Open points from D109: a "Waiting / failed" chip in the documents list; handwritten dates/amounts stay notes; `test_phase4_task_411_413` not run.
-4. Step 7: PD-5 (5a, 5b, 5c) + per-field origin in the export (D7).
+4. Per-field origin in the export (D7), with step 7.
 5. Decide on KI-001 (internal server address in tracked files).
