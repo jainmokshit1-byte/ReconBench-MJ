@@ -1,23 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { createPortal } from "react-dom";
-import { ArrowRight, KeyRound, Sparkles, X } from "lucide-react";
+import { ArrowRight, Sparkles, X } from "lucide-react";
 
 import {
   AI_MODEL_PATTERN,
   AiApiError,
   acknowledgeAiRequest,
   getAiConsentPreview,
-  getAiRequestState,
-  getAiSettings,
   getAiUsage,
-  removeAiKey,
   saveAiSettings,
-  startAiProviderTest,
 } from "../api/ai";
 import { currentReaderPreview } from "../api/ai";
-import type { AiAutoVerifyFieldType, AiConsentPreview, AiKeyStorage, AiMode, AiSettingsUpdate, AiSettingsView, AiUsage } from "../api/ai";
+import type { AiAutoVerifyFieldType, AiConsentPreview, AiMode, AiSettingsUpdate, AiSettingsView, AiUsage } from "../api/ai";
 import { useAuth } from "../auth/useAuth";
+import { useAiProviders } from "./useAiProviders";
 
 type Settings = { view: AiSettingsView; etag: string };
 
@@ -26,10 +23,6 @@ const modeOptions: ReadonlyArray<[AiMode, string, string]> = [
   ["ai_assisted", "AI Assist", "Suggestions only where the rules are unsure."],
   ["ai_first", "AI-first", "Extraction suggestions for every PDF, plus the other hooks."],
 ];
-
-const terminalStates = new Set(["succeeded", "failed", "uncertain", "skipped", "released"]);
-const TEST_POLL_MS = 1000;
-const TEST_POLL_LIMIT = 45;
 
 function when(value: string | null): string {
   if (!value) return "";
@@ -50,14 +43,6 @@ function sameFieldTypes(left: readonly AiAutoVerifyFieldType[], right: readonly 
   return left.length === right.length && left.every((fieldType, index) => fieldType === right[index]);
 }
 
-function testOutcome(state: string, code: string | null): string {
-  if (state === "succeeded") return "The provider test call finished. The status above shows whether it passed.";
-  if (state === "uncertain") return "The outcome is uncertain: the call may have reached Gemini and been billed. Acknowledge it below before testing again.";
-  if (state === "skipped") return `The test was not sent${code ? ` (${code})` : ""}.`;
-  if (state === "released") return "The test was released without a call.";
-  return `The provider test failed${code ? ` (${code})` : ""}. The status above explains what to fix.`;
-}
-
 function externalCallsNotice(mode: string): string | null {
   if (mode === "disabled") return "External calls are disabled on this deployment (RB_AI_EXTERNAL_CALLS). Settings can be saved, but nothing is sent and the provider test is unavailable.";
   if (mode === "synthetic_only") return "This deployment sends only built-in synthetic test fixtures. Uploaded documents are never sent.";
@@ -68,23 +53,8 @@ function externalCallsNotice(mode: string): string | null {
 export function AiAssistCard() {
   const { hasCapability } = useAuth();
   const canManage = hasCapability("ai.manage");
-  const [settings, setSettings] = useState<Settings | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const { settings, loadError, reload: load, setSettings } = useAiProviders();
   const [open, setOpen] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      setSettings(await getAiSettings());
-      setLoadError(null);
-    } catch (cause) {
-      setLoadError(message(cause, "AI Assist status could not be loaded."));
-    }
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timer);
-  }, [load]);
 
   const view = settings?.view;
   const on = view !== undefined && view.mode !== "rules_only";
@@ -121,11 +91,10 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
   const csrf = user?.csrf_token ?? "";
   const { view, etag } = settings;
   const [mode, setMode] = useState<AiMode>(view.mode);
-  const [model, setModel] = useState(view.model ?? "");
+  // The Gemini model comes from the provider section above; this dialog never edits it.
+  const model = view.model ?? "";
   const [vision, setVision] = useState(view.vision.enabled);
   const [autoVerifyFieldTypes, setAutoVerifyFieldTypes] = useState<AiAutoVerifyFieldType[]>(view.auto_verify.field_types);
-  const [keyDraft, setKeyDraft] = useState("");
-  const [storage, setStorage] = useState<AiKeyStorage>(view.key.storage ?? "session");
   const [preview, setPreview] = useState<AiConsentPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [consentChecked, setConsentChecked] = useState(false);
@@ -134,8 +103,6 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [testMessage, setTestMessage] = useState<string | null>(null);
-  const [confirmRemove, setConfirmRemove] = useState(false);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -179,23 +146,17 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
   const activePreview = mode !== "rules_only" && preview?.mode === mode && preview.model === model && preview.vision === vision && sameFieldTypes(preview.auto_verify_field_types, autoVerifyFieldTypes) ? preview : null;
   const consentOnRecord = activePreview !== null && view.consent.current && view.consent.required_fingerprint === activePreview.fingerprint;
   const needsConsent = mode !== "rules_only" && !consentOnRecord;
-  const storageChangeNeedsKey = view.key.set && !keyDraft && view.key.storage !== null && storage !== view.key.storage;
   const autoVerifyChanged = !sameFieldTypes(autoVerifyFieldTypes, view.auto_verify.field_types);
-  const dirty = mode !== view.mode || model !== (view.model ?? "") || vision !== view.vision.enabled || autoVerifyChanged || keyDraft !== "" || storageChangeNeedsKey;
+  const dirty = mode !== view.mode || vision !== view.vision.enabled || autoVerifyChanged;
   const saveBlocked = busy
     || (mode !== "rules_only" && !modelValid)
-    || (model !== "" && !modelValid)
-    || (needsConsent && (!activePreview || !consentChecked))
-    || storageChangeNeedsKey
-    || (keyDraft !== "" && !view.key_storage_available);
+    || (needsConsent && (!activePreview || !consentChecked));
 
   const apply = (next: Settings, text: string) => {
     onChange(next);
     setMode(next.view.mode);
-    setModel(next.view.model ?? "");
     setVision(next.view.vision.enabled);
     setAutoVerifyFieldTypes(next.view.auto_verify.field_types);
-    setStorage(next.view.key.storage ?? storage);
     setConsentChecked(false);
     setNotice(text);
   };
@@ -215,15 +176,10 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
     if (modelValid) { body.provider = "gemini"; body.model = model; }
     if (vision !== view.vision.enabled) body.vision = vision;
     if (autoVerifyChanged) body.auto_verify_field_types = autoVerifyFieldTypes;
-    if (keyDraft) { body.api_key = keyDraft; body.key_storage = storage; }
-    else if (!view.key.set) body.key_storage = storage;
     if (needsConsent && activePreview && consentChecked) body.consent = { accept: true, fingerprint: activePreview.fingerprint };
-    // The key leaves component state the moment it is submitted, whatever the outcome.
-    setKeyDraft("");
     setBusy(true);
     setError(null);
     setNotice(null);
-    setTestMessage(null);
     try {
       const next = await saveAiSettings(body, etag, csrf);
       apply(next, `AI settings saved as version ${next.view.version}. Status: ${next.view.status.label}.`);
@@ -246,46 +202,6 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
     }
   };
 
-  const removeKey = async () => {
-    setBusy(true);
-    setError(null);
-    setConfirmRemove(false);
-    try {
-      apply(await removeAiKey(etag, csrf), "Key removed. AI calls stop until a manager enters a new key.");
-    } catch (cause) {
-      await fail(cause, "The key could not be removed.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runTest = async () => {
-    setBusy(true);
-    setError(null);
-    setNotice(null);
-    setTestMessage("Provider test queued for the AI worker…");
-    try {
-      const requestId = await startAiProviderTest(csrf);
-      let finished = false;
-      for (let attempt = 0; attempt < TEST_POLL_LIMIT && mounted.current; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, TEST_POLL_MS));
-        const state = await getAiRequestState(requestId);
-        if (terminalStates.has(state.request_state)) {
-          if (mounted.current) setTestMessage(testOutcome(state.request_state, state.error_code ?? state.skip_code));
-          finished = true;
-          break;
-        }
-      }
-      if (!finished && mounted.current) setTestMessage("Still waiting for the AI worker. The status above updates when the test finishes.");
-      await onReload();
-      await loadUsage();
-    } catch (cause) {
-      if (mounted.current) { setTestMessage(null); setError(message(cause, "The provider test could not be started.")); }
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
-  };
-
   const acknowledge = async (requestId: string) => {
     setBusy(true);
     setError(null);
@@ -304,7 +220,6 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
   const callsNotice = externalCallsNotice(view.external_calls);
   const perDayCalls = limitNumber(view.limits, "per_day_calls");
   const perDayTokens = limitNumber(view.limits, "per_day_tokens");
-  const testBlocked = busy || dirty || view.external_calls === "disabled" || !view.key.set || !view.model;
 
   return createPortal(
     <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -374,73 +289,12 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
             </fieldset>
           ) : null}
 
-          <fieldset className="ai-card-section">
-            <legend>Provider and model</legend>
-            <div className="ai-card-grid">
-            <label className="ai-card-field">
-              <span id="ai-provider-label">Provider</span>
-              <select value="gemini" disabled aria-labelledby="ai-provider-label" aria-describedby="ai-provider-note"><option value="gemini">Google Gemini</option></select>
-              <small id="ai-provider-note">Gemini runs text assist (item match, PO re-rank, vendor opinion). The page reader (Gemini or Qwen on the company server) is chosen in Settings → AI providers.</small>
-            </label>
-            <label className="ai-card-field">
-              <span id="ai-model-label">Model</span>
-              <input aria-labelledby="ai-model-label" value={model} onChange={(event) => setModel(event.currentTarget.value.trim())} placeholder="gemini-3.8-flash" spellCheck={false} autoCapitalize="off" maxLength={64} aria-invalid={model !== "" && !modelValid} />
-              <small>{model !== "" && !modelValid ? "Enter a Gemini model id such as gemini-3.8-flash. Do not paste the key here." : "The model id from your Google AI Studio project."}</small>
-            </label>
-            </div>
-          </fieldset>
-
-          <fieldset className="ai-card-section">
-            <legend>API key</legend>
-            {!view.key_storage_available ? <div className="ai-card-notice">Key storage is not configured on this server (the AI sealing key is missing), so a key cannot be entered.</div> : null}
-            <label className="ai-card-field">
-              <span id="ai-key-label">Gemini API key</span>
-              <input
-                aria-labelledby="ai-key-label"
-                type="password"
-                autoComplete="off"
-                spellCheck={false}
-                autoCapitalize="off"
-                autoCorrect="off"
-                data-1p-ignore="true"
-                data-lpignore="true"
-                value={keyDraft}
-                disabled={!view.key_storage_available}
-                onChange={(event) => setKeyDraft(event.currentTarget.value)}
-                placeholder={view.key.set ? `Saved key ${view.key.hint ?? ""}; leave blank to keep it` : "Paste the key"}
-                maxLength={256}
-              />
-              <small>Write-only: the key is sealed on receipt for the AI worker and is never shown or returned. Only a four-character hint is kept for display.</small>
-            </label>
-            <div className="ai-card-options" role="radiogroup" aria-label="Where the key is kept">
-              <label className={storage === "session" ? "selected" : undefined}>
-                <input type="radio" name="ai-key-storage" value="session" checked={storage === "session"} onChange={() => setStorage("session")} />
-                <span><strong>This sign-in session only</strong><small>Deleted when you sign out. It stops working when this session ends or reaches its time limit, and must then be entered again.</small></span>
-              </label>
-              <label className={storage === "saved" ? "selected" : undefined}>
-                <input type="radio" name="ai-key-storage" value="saved" checked={storage === "saved"} onChange={() => setStorage("saved")} />
-                <span><strong>Saved for the workspace</strong><small>Kept sealed until a manager removes it. AI calls keep working after you sign out.</small></span>
-              </label>
-            </div>
-            {view.key.set ? (
-              <div className="ai-card-keyline">
-                <KeyRound size={14} aria-hidden="true" />
-                <span>Key {view.key.hint} · {view.key.storage === "session" ? `this session only${view.key.expires_at ? `, expires ${when(view.key.expires_at)}` : ""}` : "saved for the workspace"}</span>
-                {confirmRemove ? (
-                  <>
-                    <button className="button button-danger" type="button" disabled={busy} onClick={() => void removeKey()}>Confirm remove key</button>
-                    <button className="button button-secondary" type="button" onClick={() => setConfirmRemove(false)}>Keep key</button>
-                  </>
-                ) : <button className="button button-secondary" type="button" disabled={busy} onClick={() => setConfirmRemove(true)}>Remove key</button>}
-              </div>
-            ) : null}
-            {storageChangeNeedsKey ? <small className="settings-json-error" role="alert">Changing where the key is kept requires entering the key again.</small> : null}
-          </fieldset>
+          <p className="ai-card-provider-note">{model ? `Text assist runs on Google Gemini (${model}).` : "No Gemini model is set."} Providers, keys and connection tests are managed in the AI providers section.</p>
 
           {mode !== "rules_only" ? (
             <fieldset className="ai-card-section">
               <legend>Consent: what is sent</legend>
-              {!modelValid ? <p>Enter a model to see exactly what would be sent.</p>
+              {!modelValid ? <p>Connect Gemini in the AI providers section to see exactly what would be sent.</p>
                 : previewError ? <div className="inline-error" role="alert">{previewError}</div>
                   : !activePreview ? <p role="status">Loading the consent text…</p> : (
                     <>
@@ -488,11 +342,9 @@ function AiAssistDialog({ settings, onChange, onReload, onClose }: DialogProps) 
             ) : null}
           </section>
 
-          {testMessage ? <div className="mapping-info ai-card-message" role="status" aria-label="Provider test result">{testMessage}</div> : null}
           <div className="dialog-actions">
-            <span>{dirty ? "Unsaved changes. Save before testing." : `Settings version ${view.version}`}</span>
+            <span>{dirty ? "Unsaved changes." : `Settings version ${view.version}`}</span>
             <div>
-              <button className="button button-secondary" type="button" disabled={testBlocked} onClick={() => void runTest()}>Test provider</button>
               <button className="button button-primary" type="submit" disabled={saveBlocked || !dirty}>{busy ? "Working…" : "Save AI settings"}</button>
             </div>
           </div>

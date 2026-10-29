@@ -126,3 +126,11 @@ Validation on a fresh disposable `postgres:16.15-bookworm` at `127.0.0.1:15497`:
 - `downgrade()` drops the trigger and the function.
 
 Validation on a fresh disposable `postgres:16.15-bookworm` at `127.0.0.1:15497`: `check_migration_safety.py` cloned `0029` and upgraded the copy to `0030`; Alembic autogenerate reports no metadata drift; `schema_contract.json` was regenerated from the clean head database before the seed and queue schema (53 tables, 40 enums, 31 triggers, 38 routines, 176 foreign keys, 268 explicit ACLs, 7 default privileges); the drift, catalog, index and decision checks pass; after the seed and queue schema the table-count check passes (53 plus 4 Procrastinate tables). `test_ai_admin_enforcement.py` covers the lock (demote, deactivate, delete, multi-row, swap, concurrent demotions, whole-workspace removal, a workspace without a manager). Nothing was applied to the live database.
+
+## Revision 0034: provider capabilities (accuracy plan PD-1b, decision-log D103, 29 Oct 2026)
+
+- `ai_provider_config` gains three nullable columns: `supports_vision BOOLEAN`, `supports_json_schema BOOLEAN` and `context_window INTEGER` (check `ai_provider_config_context_window_ck`: NULL or > 0). NULL means not checked.
+- The company server's Connect/Test fills them: the synthetic text test proves the strict JSON schema and records `max_model_len` from `GET /models`; the synthetic image test (`provider_image_test.v1`) proves the model reads an image. Any change of server, model or key puts the three back to NULL with the connection state. Switching AI reading on with the company server needs both capabilities.
+- Additive only: no existing row changes, no backfill. `downgrade()` drops the constraint and the columns.
+
+Validation on a disposable `postgres:16.15-bookworm` at `127.0.0.1:15499`: `check_migration_safety.py` cloned `0033` and upgraded the copy to `0034`; Alembic autogenerate reports no metadata drift; the catalog contract, catalog, index, decision and table-count checks pass (54 tables + 4 Procrastinate tables). Nothing was applied to the live database.

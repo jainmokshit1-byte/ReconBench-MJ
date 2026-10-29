@@ -88,6 +88,14 @@ class AiLimits(_Frozen):
         backoff_seconds=30,
     )
     synthetic: CallKindLimits = _kind(max_input_bytes=1_000, max_output_tokens=32)
+    # The synthetic image test (PD-1b): one small generated image, nothing else.
+    synthetic_image: CallKindLimits = _kind(
+        max_input_bytes=1_000,
+        max_output_tokens=32,
+        max_pages=1,
+        max_image_bytes=100_000,
+        image_tokens_estimate=1_000,
+    )
     thought_reserve_tokens: int = Field(default=0, ge=0, le=65_536)
     per_operation_calls: int = Field(default=25, ge=1, le=10_000)
     per_operation_tokens: int = Field(default=150_000, ge=1_000, le=100_000_000)
@@ -118,6 +126,8 @@ class AiLimits(_Frozen):
 
         if kind in {"provider_test", "synthetic_smoke"}:
             return self.synthetic
+        if kind == "provider_image_test":
+            return self.synthetic_image
         if local:
             override = getattr(self, f"{kind}_local", None)
             if isinstance(override, CallKindLimits):

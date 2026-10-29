@@ -180,6 +180,10 @@ def test_fixture_digest_allowlist_is_compiled_and_current() -> None:
             system_instruction=fixture.system_instruction,
             input_text=fixture.input_text,
             response_schema=plain_schema(fixture),
+            images=[
+                (image.caption, image.mime_type, image.sha256, image.resolution)
+                for image in fixture.images
+            ],
         )
 
 

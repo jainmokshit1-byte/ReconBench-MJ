@@ -37,7 +37,7 @@ from reconbench_app.ai.consent import (
 )
 from reconbench_app.ai.contracts import SCHEMA_VERSIONS
 from reconbench_app.ai.endpoint_policy import EndpointNotAllowed, check_allowed
-from reconbench_app.ai.fixtures import PROVIDER_TEST
+from reconbench_app.ai.fixtures import PROVIDER_IMAGE_TEST, PROVIDER_TEST
 from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.key_seal import SealingKeyError, SealingPublicKey, key_hint, seal
 from reconbench_app.ai.limits import (
@@ -425,9 +425,30 @@ class AiSettingsService:
     def view(self, actor: ActorContext) -> dict[str, Any]:
         now = self.clock()
         with self.engine.connect() as connection:
-            return self._view(connection, actor.workspace_id, now)
+            can_manage = self._can_manage(connection, actor)
+            return self._view(connection, actor.workspace_id, now, reveal_endpoints=can_manage)
 
-    def _view(self, connection: Connection, workspace_id: UUID, now: datetime) -> dict[str, Any]:
+    @staticmethod
+    def _can_manage(connection: Connection, actor: ActorContext) -> bool:
+        """Whether the stored role grants ``ai.manage`` (read-only twin of the write check)."""
+
+        user = connection.execute(
+            sa.select(USERS.c.role, USERS.c.is_active).where(
+                USERS.c.workspace_id == actor.workspace_id, USERS.c.id == actor.actor_id
+            )
+        ).one_or_none()
+        return bool(
+            user is not None and user.is_active and stored_role_grants(str(user.role), "ai.manage")
+        )
+
+    def _view(
+        self,
+        connection: Connection,
+        workspace_id: UUID,
+        now: datetime,
+        *,
+        reveal_endpoints: bool = True,
+    ) -> dict[str, Any]:
         row = (
             connection.execute(sa.select(SETTINGS).where(SETTINGS.c.workspace_id == workspace_id))
             .mappings()
@@ -474,6 +495,8 @@ class AiSettingsService:
         limits_state = load_limits(self.config.limits_file)
         prices = load_prices(self.config.price_file)
         return {
+            # Writes are ai.manage only, so only a manager's view carries endpoints.
+            "can_manage": reveal_endpoints,
             "version": int(row["version"]) if row else IMPLICIT_VERSION,
             "mode": mode,
             "mode_label": MODE_LABELS.get(mode, mode),
@@ -495,7 +518,12 @@ class AiSettingsService:
                     reader_strategy=strategy.reader_strategy,
                     vision_provider=strategy.primary_reader,
                     vision_model=(vllm["model"] if vllm else None) if local_reader else model,
-                    vision_base_url=(vllm["base_url"] if vllm else None) if local_reader else None,
+                    # Display text only: the fingerprint above still uses the real URL.
+                    vision_base_url=(
+                        (vllm["base_url"] if vllm else None)
+                        if local_reader and reveal_endpoints
+                        else None
+                    ),
                 ),
                 "hooks": [
                     {"hook": hook, "label": HOOK_LABELS[hook], "data_sent": DATA_SENT[hook]}
@@ -513,8 +541,12 @@ class AiSettingsService:
             "secondary_reader": None,
             "apply_mode": strategy.apply_mode,
             "vllm_calls": self.config.gate.vllm_mode,
-            "vllm_endpoints_allowed": list(self.config.gate.vllm_endpoints),
-            "providers": self._providers_view(connection, row, configs, key, now),
+            "vllm_endpoints_allowed": (
+                list(self.config.gate.vllm_endpoints) if reveal_endpoints else []
+            ),
+            "providers": self._providers_view(
+                connection, row, configs, key, now, reveal_endpoints=reveal_endpoints
+            ),
             "auto_verify": {
                 "field_types": list(auto_verify_fields),
                 "available_field_types": [
@@ -558,8 +590,14 @@ class AiSettingsService:
         configs: dict[str, Any],
         gemini_key: dict[str, Any],
         now: datetime,
+        *,
+        reveal_endpoints: bool = True,
     ) -> list[dict[str, Any]]:
-        """One card per provider; keys appear only as set/hint/storage (write-only)."""
+        """One card per provider; keys appear only as set/hint/storage (write-only).
+
+        Without ``reveal_endpoints`` (a person who cannot manage AI) the company server's URL
+        is withheld everywhere: ``base_url`` is null and the destination text names no host.
+        """
 
         del now
         gemini = configs.get("gemini")
@@ -594,14 +632,18 @@ class AiSettingsService:
                 "provider": "vllm",
                 "enabled": bool(vllm["enabled"]) if vllm is not None else False,
                 "model": vllm["model"] if vllm is not None else None,
-                "base_url": vllm["base_url"] if vllm is not None else None,
+                "base_url": (
+                    vllm["base_url"] if vllm is not None and reveal_endpoints else None
+                ),
                 "key": self._secret_view(
                     connection, vllm["key_secret_id"] if vllm is not None else None
                 ),
                 "limits": dict(vllm["limits"] or {}) if vllm is not None else {},
                 "external": False,
                 "data_destination": data_destination(
-                    "vllm", vllm["base_url"] if vllm is not None else None
+                    "vllm",
+                    vllm["base_url"] if vllm is not None and reveal_endpoints else None,
+                    reveal=reveal_endpoints,
                 ),
                 "last_test": {
                     "at": vllm["last_test_at"] if vllm is not None else None,
@@ -618,6 +660,11 @@ class AiSettingsService:
                         vllm is not None and vllm["enabled"] and vllm["model"] and vllm["base_url"]
                     ),
                 ),
+                # What the last Test proved (PD-1b); AI reading needs vision and JSON schema.
+                "capabilities": {
+                    **connection_state.capabilities(vllm),
+                    "can_read_pages": connection_state.can_read_pages(vllm),
+                },
                 "consent": self._card_consent(vllm, None),
             },
         ]
@@ -745,6 +792,10 @@ class AiSettingsService:
                 .where(
                     requests.c.workspace_id == workspace_id,
                     requests.c.finished_at.is_not(None),
+                    # The image test only records a capability (PD-1b), never the status.
+                    ~requests.c.operation_key.startswith(
+                        connection_state.IMAGE_PREFIX, autoescape=True
+                    ),
                     *(
                         [requests.c.created_at >= key_created_at]
                         if key_created_at is not None
@@ -779,6 +830,9 @@ class AiSettingsService:
             sa.select(sa.func.max(requests.c.finished_at)).where(
                 requests.c.workspace_id == workspace_id,
                 requests.c.call_kind == "provider_test",
+                ~requests.c.operation_key.startswith(
+                    connection_state.IMAGE_PREFIX, autoescape=True
+                ),
                 requests.c.provider == active_provider,
                 requests.c.settings_version == settings.version,
                 requests.c.request_state == "succeeded",
@@ -863,6 +917,9 @@ class AiSettingsService:
         self._check_strategy(
             _Strategy(reader_strategy, primary_reader, apply_mode),
             vllm_ready=bool(vllm_model and vllm_base_url),
+            # The save checks the tested card's capabilities (PD-1b); a preview of unsaved
+            # settings has no tested card to check.
+            vllm_reads_pages=True,
         )
         if reader_strategy == "shadow":
             raise AiSettingsError(
@@ -959,7 +1016,9 @@ class AiSettingsService:
                 "(RB_AI_VLLM_ENDPOINTS) exactly.",
             ) from None
 
-    def _check_strategy(self, strategy: _Strategy, *, vllm_ready: bool) -> None:
+    def _check_strategy(
+        self, strategy: _Strategy, *, vllm_ready: bool, vllm_reads_pages: bool
+    ) -> None:
         if strategy.reader_strategy == "shadow":
             raise AiSettingsError(
                 422,
@@ -998,6 +1057,16 @@ class AiSettingsService:
                 "provider_not_configured",
                 "Company server not set up",
                 "Enable the company server card with a model and an allowed URL first.",
+            )
+        if strategy.primary_reader == "vllm" and not vllm_reads_pages:
+            raise AiSettingsError(
+                422,
+                "provider_capability_missing",
+                "Company server cannot read pages",
+                "AI reading needs a server that reads images and answers in a JSON schema. "
+                "Run Test on the company server card; both checks must pass. A new server or "
+                "model is tested first: turn AI reading off, save it, run Test, then turn "
+                "AI reading on.",
             )
 
     # -- writes --------------------------------------------------------------------------------
@@ -1163,8 +1232,18 @@ class AiSettingsService:
             strategy = _Strategy(
                 reader_strategy, primary_reader, body.apply_mode or current.apply_mode
             )
+            # Capabilities belong to the tested server and model: a change in this update
+            # resets them (``_upsert_config``), so it cannot switch AI reading on (PD-1b).
+            vllm_unchanged = vllm_values is None or (
+                vllm_row is not None
+                and vllm_values["model"] == vllm_row["model"]
+                and vllm_values["base_url"] == vllm_row["base_url"]
+            )
+            vllm_reads_pages = vllm_unchanged and connection_state.can_read_pages(vllm_row)
             if strategy != current or vllm_update is not None:
-                self._check_strategy(strategy, vllm_ready=vllm_ready)
+                self._check_strategy(
+                    strategy, vllm_ready=vllm_ready, vllm_reads_pages=vllm_reads_pages
+                )
             active_provider = active_provider_for(
                 mode=mode,
                 reader_strategy=strategy.reader_strategy,
@@ -1661,20 +1740,22 @@ class AiSettingsService:
         provider: Literal["gemini", "vllm"] = "gemini",
         kind: Literal["text", "image"] = "text",
     ) -> dict[str, Any]:
-        """Queue the synthetic text fixture for one provider; the AI worker sends it.
+        """Queue the synthetic test fixtures for one provider; the AI worker sends them.
 
-        ``{gemini, text}`` is today's test. The vLLM server is tested with the same
-        synthetic fixture, without a key unless one is stored. The synthetic page-image
-        test (``kind=image``) needs an image fixture that does not exist yet.
+        ``{gemini, text}`` is today's test. The vLLM server is tested without a key unless
+        one is stored, and its Test also checks capabilities (PD-1b): the text fixture
+        proves the strict JSON schema (with ``GET /models`` for the context window) and the
+        synthetic image fixture proves it reads an image, one logged request each.
+        ``kind=image`` sends the image test alone; Gemini has no image test.
         """
 
         require_ai_manage(self.engine, actor, attempted="provider_test")
-        if kind == "image":
+        if kind == "image" and provider != "vllm":
             raise AiSettingsError(
                 422,
                 "image_test_not_available",
                 "Image test not available",
-                "The synthetic page-image test is not available yet; run the text test.",
+                "The synthetic image test checks the company server only.",
             )
         now = self.clock()
         events = metadata.tables["rate_limit_event"]
@@ -1769,47 +1850,73 @@ class AiSettingsService:
                     occurred_at=now,
                 )
             )
-            request_id = ledger.create_request(
-                connection,
-                ledger.NewRequest(
-                    workspace_id=actor.workspace_id,
-                    call_kind="provider_test",
-                    hook=None,
-                    mode=settings.mode,
-                    subject_type="fixture",
-                    subject_id=None,
-                    subject_version=str(new_id()),
-                    operation_key=f"provider_test:{now.date().isoformat()}",
-                    settings_version=settings.version,
-                    consent_fingerprint=None,
-                    provider=provider,
-                    model=test_model,
-                    prompt_version=PROVIDER_TEST.fixture_id,
-                    schema_version=SCHEMA_VERSIONS["provider_test"],
-                    redaction_version=REDACTION_VERSION,
-                    requested_by=actor.actor_id,
-                ),
+            tests: tuple[Literal["text", "image"], ...] = (
+                ("image",)
+                if kind == "image"
+                else ("text", "image")
+                if provider == "vllm"
+                else ("text",)
             )
-            assert request_id is not None
-            job_id = self.queue.enqueue_ai_request(ai_request_id=request_id, connection=connection)
-            connection.execute(
-                sa.update(ledger.REQUESTS)
-                .where(ledger.REQUESTS.c.id == request_id)
-                .values(job_id=job_id)
-            )
+            request_ids: dict[str, UUID] = {}
+            for test in tests:
+                image = test == "image"
+                request_id = ledger.create_request(
+                    connection,
+                    ledger.NewRequest(
+                        workspace_id=actor.workspace_id,
+                        call_kind="provider_test",
+                        hook=None,
+                        mode=settings.mode,
+                        subject_type="fixture",
+                        subject_id=None,
+                        subject_version=str(new_id()),
+                        operation_key=(
+                            f"{connection_state.IMAGE_PREFIX}{now.date().isoformat()}"
+                            if image
+                            else f"provider_test:{now.date().isoformat()}"
+                        ),
+                        settings_version=settings.version,
+                        consent_fingerprint=None,
+                        provider=provider,
+                        model=test_model,
+                        prompt_version=(PROVIDER_IMAGE_TEST if image else PROVIDER_TEST).fixture_id,
+                        schema_version=SCHEMA_VERSIONS[
+                            "provider_image_test" if image else "provider_test"
+                        ],
+                        redaction_version=REDACTION_VERSION,
+                        requested_by=actor.actor_id,
+                    ),
+                )
+                assert request_id is not None
+                job_id = self.queue.enqueue_ai_request(
+                    ai_request_id=request_id, connection=connection
+                )
+                connection.execute(
+                    sa.update(ledger.REQUESTS)
+                    .where(ledger.REQUESTS.c.id == request_id)
+                    .values(job_id=job_id)
+                )
+                request_ids[test] = request_id
+            first = request_ids[tests[0]]
             write_audit_event(
                 connection,
                 actor,
                 action="ai.test_requested",
                 target_type="ai_request",
-                target_id=request_id,
+                target_id=first,
                 after_state={
                     "settings_version": settings.version,
                     "provider": provider,
                     "model": test_model,
+                    "tests": list(tests),
+                    "request_ids": {test: str(item) for test, item in request_ids.items()},
                 },
             )
-        return {"request_id": request_id, "state": "queued"}
+        return {
+            "request_id": first,
+            "image_request_id": request_ids.get("image"),
+            "state": "queued",
+        }
 
     @requires("ai.manage")
     def request_state(self, actor: ActorContext, request_id: UUID) -> dict[str, Any]:

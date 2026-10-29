@@ -218,19 +218,36 @@ export interface AiAutoVerifyFieldOption {
 export type AiProviderName = "gemini" | "vllm";
 export type AiReaderStrategy = "off" | "shadow" | "single";
 
+/** What the last Test proved about a provider; `null` means not checked (PD-1b). */
+export interface AiCapabilities {
+  vision: boolean | null;
+  json_schema: boolean | null;
+  context_window: number | null;
+  can_read_pages: boolean;
+}
+
 /** One provider card from `GET /ai/settings` (Gemini or the company vLLM server). */
 export interface AiProviderCard {
   provider: AiProviderName;
   enabled: boolean;
   model: string | null;
+  /** Null for everyone but a manager: the company server address is withheld by the server. */
   base_url: string | null;
   external: boolean;
   data_destination: string;
+  /** Write-only: only whether a key is set and a short hint, never the key. */
+  key: { set: boolean; hint: string | null };
+  /** Only the company server card carries capabilities. */
+  capabilities: AiCapabilities | null;
   connection: { state: string; reason_code: string | null; checked_at: string | null; connected_at: string | null };
 }
 
 /** `GET /ai/settings`; the key is never part of it, only a four-character hint. */
 export interface AiSettingsView {
+  /** True when the signed-in person may change AI settings (`ai.manage`). */
+  can_manage: boolean;
+  /** Company server addresses a manager may choose from; empty for everyone else. */
+  vllm_endpoints_allowed: string[];
   /** Which provider reads page images (`single`), or none (`off`). */
   reader_strategy: AiReaderStrategy;
   primary_reader: AiProviderName | null;
@@ -343,6 +360,19 @@ function parseHooks(value: unknown): AiHookDisclosure[] {
 const aiModes: readonly AiMode[] = ["rules_only", "ai_assisted", "ai_first"];
 const autoVerifyTypes: readonly AiAutoVerifyFieldType[] = ["doc_date", "doc_no", "gstin", "line_amount", "reference"];
 
+function triState(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function parseCapabilities(value: Record<string, unknown>): AiCapabilities {
+  return {
+    vision: triState(value["vision"]),
+    json_schema: triState(value["json_schema"]),
+    context_window: typeof value["context_window"] === "number" ? value["context_window"] : null,
+    can_read_pages: value["can_read_pages"] === true,
+  };
+}
+
 function parseProviderCard(value: unknown): AiProviderCard[] {
   if (!isObject(value) || (value["provider"] !== "gemini" && value["provider"] !== "vllm")) return [];
   const connection = isObject(value["connection"]) ? value["connection"] : {};
@@ -351,6 +381,8 @@ function parseProviderCard(value: unknown): AiProviderCard[] {
     enabled: value["enabled"] === true,
     model: text(value["model"]),
     base_url: text(value["base_url"]),
+    key: { set: isObject(value["key"]) && value["key"]["set"] === true, hint: isObject(value["key"]) ? text(value["key"]["hint"]) : null },
+    capabilities: isObject(value["capabilities"]) ? parseCapabilities(value["capabilities"]) : null,
     external: value["external"] !== false,
     data_destination: text(value["data_destination"]) ?? "",
     connection: {
@@ -403,7 +435,12 @@ function parseSettings(value: unknown): AiSettingsView {
   const readerStrategy = value["reader_strategy"];
   const primaryReader = value["primary_reader"];
   const providers = Array.isArray(value["providers"]) ? value["providers"].flatMap(parseProviderCard) : [];
+  const endpoints = Array.isArray(value["vllm_endpoints_allowed"])
+    ? value["vllm_endpoints_allowed"].filter((item): item is string => typeof item === "string")
+    : [];
   return {
+    can_manage: value["can_manage"] === true,
+    vllm_endpoints_allowed: endpoints,
     reader_strategy: readerStrategy === "shadow" || readerStrategy === "single" ? readerStrategy : "off",
     primary_reader: primaryReader === "gemini" || primaryReader === "vllm" ? primaryReader : null,
     vllm_calls: text(value["vllm_calls"]) ?? "disabled",
@@ -493,13 +530,82 @@ export async function getAiConsentPreview(
   };
 }
 
+/** Request ids of a queued test: the text test, plus the image test for the company server. */
+export interface AiQueuedTests {
+  request_id: string;
+  image_request_id: string | null;
+}
+
+function queuedTests(value: unknown): AiQueuedTests {
+  if (!isObject(value) || typeof value["request_id"] !== "string") throw new Error("The server did not queue the provider test.");
+  return { request_id: value["request_id"], image_request_id: text(value["image_request_id"]) };
+}
+
+export async function startAiProviderTests(csrf: string, provider: AiProviderName): Promise<AiQueuedTests> {
+  const init: RequestInit = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider }) };
+  return queuedTests(await (await aiSend("/ai/test/provider", init, csrf)).json());
+}
+
 export async function startAiProviderTest(csrf: string, provider?: AiProviderName): Promise<string> {
   const init: RequestInit = provider
     ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider }) }
     : { method: "POST" };
-  const value: unknown = await (await aiSend("/ai/test/provider", init, csrf)).json();
-  if (!isObject(value) || typeof value["request_id"] !== "string") throw new Error("The server did not queue the provider test.");
-  return value["request_id"];
+  return queuedTests(await (await aiSend("/ai/test/provider", init, csrf)).json()).request_id;
+}
+
+/** The notice a manager accepts to connect one provider card. */
+export interface AiConnectNotice {
+  provider: AiProviderName;
+  model: string;
+  text: string;
+  data_destination: string;
+  data_use_warning: boolean;
+  fingerprint: string;
+}
+
+export interface AiConnectDraft {
+  tier?: "free" | "paid";
+  model?: string;
+  base_url?: string;
+}
+
+export async function getAiConnectNotice(provider: AiProviderName, draft: AiConnectDraft): Promise<AiConnectNotice> {
+  const query = new URLSearchParams();
+  if (draft.tier) query.set("tier", draft.tier);
+  if (draft.model) query.set("model", draft.model);
+  if (draft.base_url) query.set("base_url", draft.base_url);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const value: unknown = await (await aiSend(`/ai/providers/${provider}/connect-notice${suffix}`)).json();
+  if (!isObject(value) || typeof value["text"] !== "string" || typeof value["fingerprint"] !== "string") {
+    throw new Error("The server returned an invalid provider notice.");
+  }
+  return {
+    provider,
+    model: text(value["model"]) ?? "",
+    text: value["text"],
+    data_destination: text(value["data_destination"]) ?? "",
+    data_use_warning: value["data_use_warning"] === true,
+    fingerprint: value["fingerprint"],
+  };
+}
+
+export interface AiConnectBody extends AiConnectDraft {
+  api_key?: string;
+  key_storage?: AiKeyStorage;
+  consent: { accept: true; fingerprint: string };
+}
+
+/** Saves the card and queues its test; the card is Connected only after the test passes. */
+export async function connectAiProvider(provider: AiProviderName, body: AiConnectBody, csrf: string): Promise<AiQueuedTests & { view: AiSettingsView }> {
+  const response = await aiSend(`/ai/providers/${provider}/connect`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, csrf);
+  const value: unknown = await response.json();
+  const tests = queuedTests(value);
+  if (!isObject(value)) throw new Error("The server did not queue the provider test.");
+  return { ...tests, view: parseSettings(value["settings"]) };
+}
+
+export async function disconnectAiProvider(provider: AiProviderName, csrf: string): Promise<AiSettingsView> {
+  return parseSettings(await (await aiSend(`/ai/providers/${provider}/disconnect`, { method: "POST" }, csrf)).json());
 }
 
 export async function getAiRequestState(requestId: string): Promise<AiRequestState> {

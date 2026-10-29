@@ -33,6 +33,7 @@ SECRETS = metadata.tables["secret"]
 
 ROTATE_PREFIX = "provider_test_rotate:"
 HEALTH_PREFIX = "provider_health:"
+IMAGE_PREFIX = "provider_test_image:"
 # A candidate key that no test settled within this time is dropped (worker restart, skip).
 STALE_ROTATION_AFTER = timedelta(hours=1)
 
@@ -54,9 +55,12 @@ REASON_CODES = frozenset(
         "endpoint_not_allowed",
     }
 )
+# The server answered and could not do what the test asked: the capability is missing.
+# Any other failure (timeout, server down, bad key) leaves the capability unknown.
+CAPABILITY_REFUSALS = frozenset({"INVALID_REQUEST", "invalid_output"})
 
 State = Literal["not_connected", "connected", "error"]
-Kind = Literal["test", "rotate", "health"]
+Kind = Literal["test", "image", "rotate", "health"]
 
 
 def reason_code(code: str | None) -> str:
@@ -71,7 +75,37 @@ def request_kind(request: Any) -> Kind:
         return "rotate"
     if key.startswith(HEALTH_PREFIX):
         return "health"
+    if key.startswith(IMAGE_PREFIX):
+        return "image"
     return "test"
+
+
+def capability(ok: bool, error_code: str | None) -> bool | None:
+    """What one capability test proved: yes, no, or unknown (it did not get an answer)."""
+
+    if ok:
+        return True
+    return False if error_code in CAPABILITY_REFUSALS else None
+
+
+def capabilities(card: Any) -> dict[str, Any]:
+    """The public capability block of one card (PD-1b); ``None`` means not checked."""
+
+    return {
+        "vision": card["supports_vision"] if card is not None else None,
+        "json_schema": card["supports_json_schema"] if card is not None else None,
+        "context_window": card["context_window"] if card is not None else None,
+    }
+
+
+def can_read_pages(card: Any) -> bool:
+    """A company-server card that AI reading may use: both capabilities proven by a test."""
+
+    return bool(
+        card is not None
+        and card["supports_vision"] is True
+        and card["supports_json_schema"] is True
+    )
 
 
 def is_rotation_test(request: Any) -> bool:
@@ -129,6 +163,9 @@ def reset_values() -> dict[str, Any]:
         "last_test_ok": None,
         "last_health_at": None,
         "last_health_ok": None,
+        "supports_vision": None,
+        "supports_json_schema": None,
+        "context_window": None,
     }
 
 
@@ -159,11 +196,15 @@ def record_result(
     *,
     ok: bool,
     error_code: str | None = None,
+    context_window: int | None = None,
 ) -> int:
     """Apply a finished ``provider_test`` request to its card; returns rows changed.
 
     Only for the settings version the request ran under: a stale result changes nothing
     (so a disconnect or any credential change mid-run discards the answer).
+
+    The text test proves the strict JSON schema and records the server's context window;
+    the image test sets only ``supports_vision`` and never changes the connection state.
     """
 
     provider = str(request["provider"])
@@ -199,7 +240,21 @@ def record_result(
                 .values(**health_values(now, ok=ok, code=error_code))
             ).rowcount
         )
-    values: dict[str, Any] = {"last_test_at": now, "last_test_ok": ok}
+    if kind == "image":
+        return int(
+            connection.execute(
+                sa.update(CONFIGS)
+                .where(CONFIGS.c.id == card["id"])
+                .values(supports_vision=capability(ok, error_code))
+            ).rowcount
+        )
+    values: dict[str, Any] = {
+        "last_test_at": now,
+        "last_test_ok": ok,
+        "supports_json_schema": capability(ok, error_code),
+    }
+    if context_window is not None:
+        values["context_window"] = context_window
     if ok:
         values |= {"connected_at": now, "last_error_code": None, "last_error_at": None}
     else:
@@ -289,9 +344,14 @@ def clear_stale_rotations(engine: Engine, *, now: datetime) -> int:
 
 
 __all__ = [
+    "CAPABILITY_REFUSALS",
     "HEALTH_PREFIX",
+    "IMAGE_PREFIX",
     "REASON_CODES",
     "ROTATE_PREFIX",
+    "can_read_pages",
+    "capabilities",
+    "capability",
     "clear_stale_rotations",
     "derive",
     "health_values",

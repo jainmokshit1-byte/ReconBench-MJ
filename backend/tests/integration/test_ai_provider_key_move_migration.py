@@ -35,7 +35,10 @@ VLLM_KEY = "synthetic-vllm-key-pv2-0000"
 TESTED_AT = datetime(2026, 10, 18, 9, 30, tzinfo=UTC)
 
 _REWIND_0029 = (
-    # 0030 (last-manager lock, WI-PV3) is removed first; the upgrade re-applies it.
+    # 0034 (provider capabilities, PD-1b) is removed first; the upgrade re-applies it.
+    "ALTER TABLE ai_provider_config DROP CONSTRAINT ai_provider_config_context_window_ck, "
+    "DROP COLUMN context_window, DROP COLUMN supports_json_schema, DROP COLUMN supports_vision",
+    # 0030 (last-manager lock, WI-PV3) is removed next; the upgrade re-applies it.
     "DROP TRIGGER app_user_last_manager ON app_user",
     "DROP FUNCTION app_user_last_manager_guard()",
     "ALTER TABLE ai_provider_config DROP CONSTRAINT ai_provider_config_pending_key_ck, "
@@ -182,7 +185,7 @@ def _clone_at_0028(public_key: SealingPublicKey, *, conflict: bool = False) -> I
         clone = Clone(engine, clone_url)
         with engine.begin() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-            assert heads == {"0033"}, heads
+            assert heads == {"0034"}, heads
             for statement in _REWIND_0029:
                 connection.exec_driver_sql(statement)
             # Cards of the source database keep no key from other tests.

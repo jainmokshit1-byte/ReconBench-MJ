@@ -28,7 +28,7 @@ from sqlalchemy.engine import Connection
 
 from reconbench_app.ai import connection_state, ledger
 from reconbench_app.ai.contracts import SCHEMA_VERSIONS
-from reconbench_app.ai.fixtures import PROVIDER_TEST
+from reconbench_app.ai.fixtures import PROVIDER_IMAGE_TEST, PROVIDER_TEST
 from reconbench_app.ai.limits import load_prices
 from reconbench_app.ai.provider_notice import Tier, notice, notice_fingerprint
 from reconbench_app.ai.redaction import REDACTION_VERSION
@@ -310,7 +310,10 @@ class ProviderConnectionService:
         provider: Provider,
         model: str,
         operation_key: str,
+        image: bool = False,
     ) -> UUID:
+        """One synthetic test request; ``image`` sends the image fixture (PD-1b)."""
+
         settings = load_settings(connection, actor.workspace_id)
         assert settings is not None
         request_id = ledger.create_request(
@@ -328,8 +331,8 @@ class ProviderConnectionService:
                 consent_fingerprint=None,
                 provider=provider,
                 model=model,
-                prompt_version=PROVIDER_TEST.fixture_id,
-                schema_version=SCHEMA_VERSIONS["provider_test"],
+                prompt_version=(PROVIDER_IMAGE_TEST if image else PROVIDER_TEST).fixture_id,
+                schema_version=SCHEMA_VERSIONS["provider_image_test" if image else "provider_test"],
                 redaction_version=REDACTION_VERSION,
                 requested_by=actor.actor_id,
             ),
@@ -524,6 +527,20 @@ class ProviderConnectionService:
                 model=model,
                 operation_key=f"provider_test:{now.date().isoformat()}",
             )
+            # The company server is also checked for reading an image (PD-1b): one more
+            # logged request, which records only ``supports_vision`` on the card.
+            image_request_id = (
+                self._queue_test(
+                    connection,
+                    actor,
+                    provider=provider,
+                    model=model,
+                    operation_key=f"{connection_state.IMAGE_PREFIX}{now.date().isoformat()}",
+                    image=True,
+                )
+                if provider == "vllm"
+                else None
+            )
             after_card = self._card(connection, actor.workspace_id, provider)
             write_audit_event(
                 connection,
@@ -535,10 +552,20 @@ class ProviderConnectionService:
                 after_state={
                     **(self._public(after_card, None) or {}),
                     "request_id": str(request_id),
+                    **(
+                        {"image_request_id": str(image_request_id)}
+                        if image_request_id is not None
+                        else {}
+                    ),
                 },
             )
             view = self.settings._view(connection, actor.workspace_id, now)
-        return {"request_id": request_id, "state": "queued", "settings": view}
+        return {
+            "request_id": request_id,
+            "image_request_id": image_request_id,
+            "state": "queued",
+            "settings": view,
+        }
 
     # -- rotate --------------------------------------------------------------------------------
 

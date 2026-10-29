@@ -524,7 +524,8 @@ def test_inactive_provider_gets_zero_calls_both_directions(
             ),
             {"w": ws_vllm},
         )
-    assert vllm_rows_1 == 2
+    # The hook request and the company server's Test: its text and image checks (PD-1b).
+    assert vllm_rows_1 == 3
 
     # --- Direction 2: Active = Gemini, Inactive = vLLM ---
     with engine.begin() as conn:

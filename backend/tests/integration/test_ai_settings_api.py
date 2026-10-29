@@ -143,7 +143,7 @@ def _reset(engine: Engine) -> tuple[UUID, UUID, str]:
         connection.execute(
             sa.text(
                 "UPDATE app_user SET password_hash = :hash, failed_logins = 0, "
-                "locked_until = NULL, is_active = true WHERE id = :id"
+                "locked_until = NULL, is_active = true, role = 'manager' WHERE id = :id"
             ),
             {"hash": _HASHER.hash(PASSWORD), "id": user.id},
         )
@@ -752,6 +752,20 @@ def _audit(h: Harness, action: str) -> list[Any]:
         )
 
 
+def _vllm_tested(h: Harness) -> None:
+    """The company server card passed both capability checks of its Test (PD-1b)."""
+
+    with h.engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "UPDATE ai_provider_config SET supports_vision = true, "
+                "supports_json_schema = true, context_window = 8192 "
+                "WHERE workspace_id = :w AND provider = 'vllm'"
+            ),
+            {"w": h.workspace_id},
+        )
+
+
 def _vllm_preview(h: Harness) -> dict[str, Any]:
     response = h.client.get(
         "/api/v1/ai/consent-preview",
@@ -938,6 +952,10 @@ def test_switching_the_reader_to_the_company_server_needs_new_consent(harness: H
     _enable(harness)
     card = harness.put({"providers": [_vllm_card()]})
     assert card.status_code == 200 and card.json()["consent"]["current"] is True
+    untested = harness.put({"reader_strategy": "single", "primary_reader": "vllm"})
+    assert untested.status_code == 422
+    assert untested.json()["code"] == "provider_capability_missing"
+    _vllm_tested(harness)
     refused = harness.put({"reader_strategy": "single", "primary_reader": "vllm"})
     assert refused.status_code == 422 and refused.json()["code"] == "consent_required"
     preview = _vllm_preview(harness)
@@ -960,9 +978,9 @@ def test_switching_the_reader_to_the_company_server_needs_new_consent(harness: H
     assert on["consent"]["current"] is True and on["vision"]["enabled"] is True
     change = _audit(harness, "ai.reader_strategy_change")[-1]
     assert change["before_state"] == {"reader_strategy": "off", "primary_reader": None}
-    # A new model on the server is a new data destination: consent is outdated again.
+    # A new model on the server is untested (PD-1b) and a new data destination.
     moved = harness.put({"providers": [_vllm_card(model="qwen3.5:4b")]})
-    assert moved.status_code == 422 and moved.json()["code"] == "consent_required"
+    assert moved.status_code == 422 and moved.json()["code"] == "provider_capability_missing"
     # Disabling the server card while it is the reader is refused.
     disabled = harness.put({"providers": [_vllm_card(enabled=False)]})
     assert disabled.status_code == 422 and disabled.json()["code"] == "provider_not_configured"
@@ -1007,7 +1025,7 @@ def test_company_server_test_is_keyless_synthetic_and_recorded_on_its_card(
     harness.put({"providers": [_vllm_card()]})
     image = harness.client.post(
         "/api/v1/ai/test/provider",
-        json={"provider": "vllm", "kind": "image"},
+        json={"provider": "gemini", "kind": "image"},
         headers=harness.headers(),
     )
     assert image.status_code == 422 and image.json()["code"] == "image_test_not_available"
@@ -1016,6 +1034,7 @@ def test_company_server_test_is_keyless_synthetic_and_recorded_on_its_card(
     )
     assert queued.status_code == 202, queued.text
     request_id = UUID(queued.json()["request_id"])
+    assert queued.json()["image_request_id"] not in (None, queued.json()["request_id"])
     with harness.engine.connect() as connection:
         row = connection.execute(
             sa.text("SELECT provider, model, call_kind FROM ai_request WHERE id = :id"),
@@ -1099,6 +1118,7 @@ def test_live_like_reconsent_flow(harness: Harness) -> None:
     _enable(harness)
     vllm_resp = harness.put({"providers": [_vllm_card()]})
     assert vllm_resp.status_code == 200, vllm_resp.text
+    _vllm_tested(harness)
     preview = _vllm_preview(harness)
     harness.put(
         {
@@ -1164,6 +1184,7 @@ def test_settings_switch_vllm_gemini_vllm_and_shadow_refused(harness: Harness) -
     _vllm_gate(harness)
     _enable(harness)
     harness.put({"providers": [_vllm_card()]})
+    _vllm_tested(harness)
 
     # Switch to vLLM reader with consent
     vllm_prev = _vllm_preview(harness)
@@ -1229,3 +1250,61 @@ def test_settings_switch_vllm_gemini_vllm_and_shadow_refused(harness: Harness) -
     assert shadow_put.status_code == 422
     assert shadow_put.json()["code"] == "shadow_not_allowed"
 
+
+def test_viewer_without_ai_manage_never_receives_the_company_server_address(
+    harness: Harness,
+) -> None:
+    _vllm_gate(harness)
+    _enable(harness)
+    assert harness.put({"providers": [_vllm_card()]}).status_code == 200
+    _vllm_tested(harness)
+    preview = _vllm_preview(harness)
+    saved = harness.put(
+        {
+            "reader_strategy": "single",
+            "primary_reader": "vllm",
+            "consent": {"accept": True, "fingerprint": preview["fingerprint"]},
+        }
+    )
+    assert saved.status_code == 200, saved.text
+    manager = harness.get()
+    assert manager["can_manage"] is True
+    assert manager["providers"][1]["base_url"] == VLLM_URL
+    assert manager["vllm_endpoints_allowed"] == [VLLM_URL]
+    assert VLLM_URL in manager["consent"]["text"]
+
+    # The workspace must keep one manager, so a second one is added before demoting this user.
+    with harness.engine.begin() as connection:
+        spare = connection.execute(
+            sa.text(
+                "INSERT INTO app_user SELECT (u).* FROM (SELECT jsonb_populate_record("
+                "NULL::app_user, to_jsonb(a) || jsonb_build_object("
+                "'id', gen_random_uuid(), 'email', 'spare-manager@example.test')) AS u "
+                "FROM app_user a WHERE a.id = :id) s RETURNING id"
+            ),
+            {"id": harness.user_id},
+        ).scalar_one()
+        connection.execute(
+            sa.text("UPDATE app_user SET role = 'auditor' WHERE id = :id"),
+            {"id": harness.user_id},
+        )
+    try:
+        viewer = harness.get()
+    finally:
+        with harness.engine.begin() as connection:
+            connection.execute(
+                sa.text("UPDATE app_user SET role = 'manager' WHERE id = :id"),
+                {"id": harness.user_id},
+            )
+            connection.execute(sa.text("DELETE FROM app_user WHERE id = :id"), {"id": spare})
+    assert viewer["can_manage"] is False
+    assert "vllm.example.test" not in json.dumps(viewer)
+    card = viewer["providers"][1]
+    assert card["base_url"] is None and viewer["vllm_endpoints_allowed"] == []
+    assert card["data_destination"].startswith("Company server")
+    assert "company vLLM server at the configured URL" in viewer["consent"]["text"]
+    # The notice a person accepted still matches what a manager is asked to accept.
+    assert viewer["consent"]["required_fingerprint"] == manager["consent"]["required_fingerprint"]
+    assert viewer["consent"]["current"] is manager["consent"]["current"]
+    assert card["capabilities"] == manager["providers"][1]["capabilities"]
+    assert card["connection"] == manager["providers"][1]["connection"]

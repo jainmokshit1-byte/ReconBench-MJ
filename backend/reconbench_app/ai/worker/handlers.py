@@ -17,10 +17,18 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
 from reconbench_app.ai import connection_state
-from reconbench_app.ai.contracts import ProviderTestOutput
-from reconbench_app.ai.fixtures import PROVIDER_TEST
+from reconbench_app.ai.contracts import InvalidOutput, ProviderImageTestOutput, ProviderTestOutput
+from reconbench_app.ai.fixtures import (
+    PROVIDER_IMAGE_TEST,
+    PROVIDER_IMAGE_TEST_NUMBER,
+    PROVIDER_TEST,
+)
 from reconbench_app.ai.limits import AiLimits
-from reconbench_app.ai.prompts import PromptPayload, provider_test_prompt
+from reconbench_app.ai.prompts import (
+    PromptPayload,
+    provider_image_test_prompt,
+    provider_test_prompt,
+)
 from reconbench_app.db.metadata import metadata
 
 
@@ -74,12 +82,26 @@ class Handler(Protocol):
 
 
 class ProviderTestHandler:
-    """Sends the fixed synthetic fixture and records a passing test for this settings version."""
+    """Sends the fixed synthetic fixture and records a passing test for this settings version.
+
+    The image test (PD-1b) sends the synthetic number image instead; its answer must name
+    that number, so a model that cannot see the image does not pass.
+    """
 
     kind = "provider_test"
 
     def prepare(self, connection: Connection, request: Any, limits: AiLimits) -> Prepared | Skip:
-        del connection, request
+        del connection
+        if connection_state.request_kind(request) == "image":
+            return Prepared(
+                payload=provider_image_test_prompt(),
+                output_kind="provider_image_test",
+                max_output_tokens=min(
+                    PROVIDER_IMAGE_TEST.max_output_tokens,
+                    limits.synthetic_image.max_output_tokens,
+                ),
+                fixture_id=PROVIDER_IMAGE_TEST.fixture_id,
+            )
         return Prepared(
             payload=provider_test_prompt(),
             output_kind="provider_test",
@@ -93,8 +115,15 @@ class ProviderTestHandler:
         del connection, request
         return True
 
-    def validate(self, prepared: Prepared, parsed: Any) -> ProviderTestOutput:
-        del prepared
+    def validate(
+        self, prepared: Prepared, parsed: Any
+    ) -> ProviderTestOutput | ProviderImageTestOutput:
+        if prepared.output_kind == "provider_image_test":
+            if not isinstance(parsed, ProviderImageTestOutput):
+                raise TypeError("unexpected provider image test output")
+            if parsed.number.strip() != PROVIDER_IMAGE_TEST_NUMBER:
+                raise InvalidOutput("invalid_output", "image test number not read")
+            return parsed
         if not isinstance(parsed, ProviderTestOutput):
             raise TypeError("unexpected provider test output")
         return parsed
@@ -112,8 +141,15 @@ class ProviderTestHandler:
         call_log_id: UUID | None,
         now: datetime,
     ) -> str:
-        del prepared, validated, call_log_id
-        updated = _record_test(connection, request, now, ok=True)
+        del validated, call_log_id
+        window = prepared.context.get("context_window")
+        updated = _record_test(
+            connection,
+            request,
+            now,
+            ok=True,
+            context_window=window if isinstance(window, int) else None,
+        )
         return "applied" if updated else "discarded_stale"
 
 
@@ -124,6 +160,7 @@ def _record_test(
     *,
     ok: bool,
     error_code: str | None = None,
+    context_window: int | None = None,
 ) -> int:
     """Store a test result for the settings version it ran under.
 
@@ -145,7 +182,9 @@ def _record_test(
                 .values(last_test_at=now, last_test_ok=ok)
             ).rowcount
         )
-    card = connection_state.record_result(connection, request, now, ok=ok, error_code=error_code)
+    card = connection_state.record_result(
+        connection, request, now, ok=ok, error_code=error_code, context_window=context_window
+    )
     return legacy or card
 
 

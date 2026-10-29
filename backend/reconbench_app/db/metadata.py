@@ -1119,6 +1119,9 @@ _tables["ai_provider_config"] = sa.Table(
     sa.Column("breaker_changed_at", sa.TIMESTAMP(timezone=True)),
     sa.Column("key_tier", sa.Text(), server_default=sa.text("'free'::text"), nullable=False),
     sa.Column("pending_key_secret_id", postgresql.UUID(as_uuid=True)),
+    sa.Column("supports_vision", sa.Boolean()),
+    sa.Column("supports_json_schema", sa.Boolean()),
+    sa.Column("context_window", sa.Integer()),
     sa.PrimaryKeyConstraint("id", name="ai_provider_config_pkey"),
     sa.UniqueConstraint(
         "workspace_id", "provider", name="ai_provider_config_workspace_provider_key"
@@ -1155,6 +1158,10 @@ _tables["ai_provider_config"] = sa.Table(
         "jsonb_typeof(limits) = 'object'::text", name="ai_provider_config_limits_ck"
     ),
     sa.CheckConstraint("version >= 1", name="ai_provider_config_version_ck"),
+    sa.CheckConstraint(
+        "context_window IS NULL OR context_window > 0",
+        name="ai_provider_config_context_window_ck",
+    ),
     sa.CheckConstraint(
         "last_error_code IS NULL OR length(last_error_code) >= 1 AND length(last_error_code) <= 64",
         name="ai_provider_config_error_code_ck",

@@ -5,6 +5,7 @@ import { Link } from "react-router";
 import { getReconciliationKpis, getWorkflowStatus, listRecentReconciliationRuns } from "../api/reconciliation";
 import type { RunSummary, WorkflowStatus, WorkflowStep, WorkflowStepKey } from "../api/reconciliation";
 import { AiAssistCard } from "../components/AiAssistCard";
+import { AiProviderSection } from "../components/AiProviderSection";
 import { PageHeader } from "../components/PageHeader";
 import { usePeriod } from "../contexts/usePeriod";
 
@@ -150,6 +151,8 @@ export function HomePage() {
         </div>
         <AiAssistCard />
       </section>
+
+      <AiProviderSection />
 
       <section className="home-lower-grid">
         <div className="panel kpi-placeholder">

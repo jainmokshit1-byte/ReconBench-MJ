@@ -152,7 +152,15 @@ SHADOW_CONSENT_TEXT = (
 )
 
 
-def data_destination(provider: str, base_url: str | None = None) -> str:
+COMPANY_SERVER_DESTINATION = (
+    "Company server (over the company VPN): masked page images "
+    "leave this machine but not the company network"
+)
+
+
+def data_destination(provider: str, base_url: str | None = None, *, reveal: bool = True) -> str:
+    if provider == "vllm" and not reveal:
+        return COMPANY_SERVER_DESTINATION
     return DATA_DESTINATIONS[provider].format(base_url=base_url or "the configured URL")
 
 

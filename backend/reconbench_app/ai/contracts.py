@@ -41,6 +41,7 @@ SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
         "h4_vendor": "h4.schema.v1",
         "h6_vision": "vision.schema.v4",
         "provider_test": "provider_test.schema.v1",
+        "provider_image_test": "provider_image_test.schema.v1",
     }
 )
 MAX_OUTPUT_TEXT_BYTES = 65_536
@@ -204,6 +205,10 @@ class ProviderTestOutput(_Strict):
     status: Literal["ok"]
 
 
+class ProviderImageTestOutput(_Strict):
+    number: str = Field(max_length=16)
+
+
 # A box that is not exactly four integers drops only its own item in the core check
 # (``bad_box``); rejecting the whole answer lost 3 of 39 documents (D41).
 _BOX = Field(min_length=1, max_length=16)
@@ -298,6 +303,7 @@ OUTPUT_MODELS: Mapping[str, type[_Strict]] = MappingProxyType(
         "h4_vendor": H4Output,
         "h6_vision": VisionOutput,
         "provider_test": ProviderTestOutput,
+        "provider_image_test": ProviderImageTestOutput,
     }
 )
 
@@ -679,6 +685,7 @@ __all__ = [
     "H4Output",
     "HookName",
     "InvalidOutput",
+    "ProviderImageTestOutput",
     "ProviderTestOutput",
     "VisionAnnotationItem",
     "VisionFieldItem",

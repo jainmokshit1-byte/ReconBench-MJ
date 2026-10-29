@@ -336,9 +336,15 @@ class OpenAICompatProvider:
         self._context_windows.update(windows)
         return HealthResult(True, latency_ms, tuple(models), MappingProxyType(windows))
 
-    def context_window(self, model: str) -> int | None:
-        """``max_model_len`` of ``model`` (from the last health check, fetched once)."""
+    def context_window(self, model: str, *, refresh: bool = False) -> int | None:
+        """``max_model_len`` of ``model`` (from the last health check, fetched once).
 
+        ``refresh`` asks ``GET /models`` again (a provider test reports what the server
+        serves now, not what an earlier check saw).
+        """
+
+        if refresh:
+            self._context_windows.pop(model, None)
         if model not in self._context_windows:
             self.health()
         return self._context_windows.get(model)

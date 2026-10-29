@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -201,7 +201,8 @@ class AiRequestRunner:
             ledger.skip(self.engine, request_id, prepared.code, now)
             return RunResult("skipped", prepared.code)
 
-        kind = request["hook"] or request["call_kind"]
+        # A provider test names its own limits (the image test is not the text test).
+        kind = request["hook"] or prepared.output_kind
         local = _is_local(provider)
         kind_limits = limits.for_kind(kind, local=local)
         timeout_seconds = limits.timeout_for(kind, local=local)
@@ -260,7 +261,15 @@ class AiRequestRunner:
 
         max_output_tokens = min(prepared.max_output_tokens, kind_limits.max_output_tokens)
         context_window = getattr(provider, "context_window", None) if local else None
-        window = context_window(str(request["model"])) if callable(context_window) else None
+        provider_test = request["call_kind"] == "provider_test"
+        window = (
+            context_window(str(request["model"]), refresh=provider_test)
+            if callable(context_window)
+            else None
+        )
+        if provider_test and isinstance(window, int):
+            # The test records the window the server reports for this model (PD-1b).
+            prepared = replace(prepared, context={**prepared.context, "context_window": window})
         if isinstance(window, int):
             # A self-hosted model's context holds prompt, images and answer (plan §0.5).
             budget = min(

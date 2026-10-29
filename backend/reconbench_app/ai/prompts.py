@@ -30,7 +30,7 @@ from reconbench_app.ai.contracts import (
     vision_response_schema_v3,
     vision_response_schema_v5,
 )
-from reconbench_app.ai.fixtures import PROVIDER_TEST, plain_schema
+from reconbench_app.ai.fixtures import PROVIDER_IMAGE_TEST, PROVIDER_TEST, plain_schema
 from reconbench_app.ai.provider import ProviderImage
 from reconbench_app.extraction.vision import (
     DEFAULT_VISION_READER,
@@ -603,6 +603,15 @@ def provider_test_prompt() -> PromptPayload:
     )
 
 
+def provider_image_test_prompt() -> PromptPayload:
+    return PromptPayload(
+        PROVIDER_IMAGE_TEST.system_instruction,
+        PROVIDER_IMAGE_TEST.input_text,
+        plain_schema(PROVIDER_IMAGE_TEST),
+        PROVIDER_IMAGE_TEST.images,
+    )
+
+
 def payload_bytes(payload: PromptPayload) -> int:
     """Bytes counted against input limits: instruction, input and schema."""
 
@@ -638,6 +647,7 @@ __all__ = [
     "legacy_vision_prompt_v3",
     "payload_bytes",
     "prompt_version",
+    "provider_image_test_prompt",
     "provider_test_prompt",
     "vision_prompt",
     "vision_schema_version",
