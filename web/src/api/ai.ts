@@ -63,6 +63,7 @@ export interface AiFieldSuggestion {
   page: number;
   quote: string;
   box: number[] | null;
+  handwritten?: boolean;
 }
 
 /** A handwritten or stamped mark the vision reader saw; information only. */
@@ -157,6 +158,7 @@ function parseSuggestion(value: unknown): AiFieldSuggestion[] {
     page: typeof value["page"] === "number" ? value["page"] : 0,
     quote: text(value["quote"]) ?? "",
     box: Array.isArray(value["box"]) && value["box"].every((item) => typeof item === "number") ? value["box"] as number[] : null,
+    handwritten: value["handwritten"] === true,
   }];
 }
 

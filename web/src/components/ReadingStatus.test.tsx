@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { DocumentDetails } from "../api/ingestion";
-import { ReadingStatus } from "./ReadingStatus";
+import { ReadingChip, ReadingStatus } from "./ReadingStatus";
 import { readingFailureText } from "./readingFailure";
 
 const retryReading = vi.fn();
@@ -77,5 +77,44 @@ describe("ReadingStatus (PD-2f)", () => {
   it("never shows a raw code without words", () => {
     expect(readingFailureText(null)).toBe("the reason was not recorded");
     expect(readingFailureText("SOMETHING_NEW")).toBe("the reading stopped (SOMETHING_NEW)");
+  });
+});
+
+describe("ReadingChip (Task C)", () => {
+  it("renders chip for waiting, failed, ready, and absent states", () => {
+    // waiting
+    const { container: waiting } = render(
+      <ReadingChip document={{ reading_state: "waiting", reading_failure_code: null }} />
+    );
+    expect(waiting.textContent).toContain("Waiting for reading");
+    expect(waiting.querySelector(".status-chip.status-progress")).toBeTruthy();
+    cleanup();
+
+    // failed
+    const { container: failed } = render(
+      <ReadingChip document={{ reading_state: "failed", reading_failure_code: "AI_READING_ANSWER_INVALID" }} />
+    );
+    expect(failed.textContent).toContain("Reading failed: the answer did not pass the checks");
+    expect(failed.querySelector(".status-chip.status-danger")).toBeTruthy();
+    cleanup();
+
+    // ready: renders nothing
+    const { container: ready } = render(
+      <ReadingChip document={{ reading_state: "ready", reading_failure_code: null }} />
+    );
+    expect(ready.innerHTML).toBe("");
+    cleanup();
+
+    // absent: renders nothing
+    const { container: absent } = render(
+      <ReadingChip document={{}} />
+    );
+    expect(absent.innerHTML).toBe("");
+    cleanup();
+
+    const { container: absentNull } = render(
+      <ReadingChip document={null} />
+    );
+    expect(absentNull.innerHTML).toBe("");
   });
 });

@@ -37,7 +37,11 @@ export interface IngestionFile {
   uploaded_at: string;
 }
 
-export type DocumentRow = Record<string, unknown> & { id: string };
+export type DocumentRow = Record<string, unknown> & {
+  id: string;
+  reading_state?: "ready" | "waiting" | "failed" | string | null;
+  reading_failure_code?: string | null;
+};
 export type DocumentDetails = Record<string, unknown>;
 
 export interface FileListResult {

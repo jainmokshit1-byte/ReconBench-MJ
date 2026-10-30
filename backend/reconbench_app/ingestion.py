@@ -24,8 +24,14 @@ from uuid import UUID
 import sqlalchemy as sa
 from botocore.exceptions import BotoCoreError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from reconbench_core.extraction.extract import accept_date
 from reconbench_core.extraction.pages import split_pages
-from reconbench_core.extraction.vision import align_lines as align_vision_lines
+from reconbench_core.extraction.vision import (
+    align_lines as align_vision_lines,
+)
+from reconbench_core.extraction.vision import (
+    parse_money,
+)
 from reconbench_core.normalize import (
     canonicalize_document_number,
     normalize_item_text,
@@ -5623,12 +5629,42 @@ class IngestionService:
             )
         handwritten: set[int] = set()
         for note in validation.check.annotations:
+            if note.kind != "handwritten":
+                continue
+            text = " ".join(note.text.split())
+            if not text:
+                continue
             # PD-2h (D103 decision 4): a handwritten PO/GRN number is a suggested value;
             # it counts in mapping only after a person applies it ("Use suggested").
-            target_field = _HANDWRITTEN_REFERENCE_FIELDS.get(note.looks_like)
-            text = " ".join(note.text.split())
-            if note.kind != "handwritten" or target_field is None or not text:
+            # Task D (D103 decision 4 / D113): date -> doc_date, amount -> grand_total.
+            target_field: str
+            field_kind: FieldKind
+            field_value: str
+            field_typed: Any
+            if note.looks_like in _HANDWRITTEN_REFERENCE_FIELDS:
+                target_field = _HANDWRITTEN_REFERENCE_FIELDS[note.looks_like]
+                field_kind = "ref"
+                field_value = text
+                field_typed = text
+            elif note.looks_like == "date":
+                parsed_date = accept_date(text)
+                if parsed_date is None:
+                    continue
+                target_field = "doc_date"
+                field_kind = "date"
+                field_value = parsed_date.isoformat()
+                field_typed = parsed_date
+            elif note.looks_like == "amount":
+                parsed_amount = parse_money(text)
+                if parsed_amount is None:
+                    continue
+                target_field = "grand_total"
+                field_kind = "money"
+                field_value = str(parsed_amount)
+                field_typed = parsed_amount
+            else:
                 continue
+
             pixels, box_2d = boxes(note.page, note.box)
             handwritten.add(len(accepted))
             accepted.append(
@@ -5636,9 +5672,9 @@ class IngestionService:
                     scope="header",
                     line_no=None,
                     field=target_field,
-                    kind="ref",
-                    value=text,
-                    typed=text,
+                    kind=field_kind,
+                    value=field_value,
+                    typed=field_typed,
                     page=note.page,
                     quote=note.text,
                     original_start=-1,

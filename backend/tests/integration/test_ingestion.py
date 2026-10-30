@@ -418,6 +418,8 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
         documents = client.get(f"/api/v1/documents?batch_id={batch_id}")
         assert documents.status_code == 200
         assert len(documents.json()) == 1
+        assert documents.json()[0]["reading_state"] == "ready"
+        assert "reading_failure_code" in documents.json()[0]
         source_documents = client.get(
             f"/api/v1/documents?batch_id={batch_id}&source_file_id={file_id}"
         )
@@ -1357,6 +1359,7 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                 "Line Recon",
                 "Exceptions",
                 "Vendor Summary",
+                "Field Origin",
             ]
             assert workbook["Summary"]["B4"].value == api_kpis["invoice_count"]
             # Home KPI cards equal the Excel Summary (App Flow, Home).

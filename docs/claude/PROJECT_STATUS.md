@@ -1,5 +1,5 @@
 # Project status
-Last verified: 2026-10-30, commit 493bc9e live as live-20261030-b6 (D110), switch on rules; CODEBASE_CONTEXT.md untracked
+Last verified: 2026-10-30, commit 493bc9e live as live-20261030-b6 (D110/D112), switch on rules; Step 7 Phase 1 PD-5c measured on beta (D112); CODEBASE_CONTEXT.md untracked
 
 ## Components
 Status: working-verified | implemented-untested | partial | stub | broken | not-found | unknown
@@ -15,23 +15,21 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - Line alignment — working-verified (unit) — tests/unit/test_phase4_alignment.py
 - Reconciliation engine — working-verified (unit) — tests/unit/test_phase4_reconciliation.py, tests/scenarios/test_hard_zero_guards.py
 - Ledger, review, export — implemented-untested here — ledger_service.py, api/review.py, export_service.py; tests/unit/test_export_workbook.py
-- Web app — vitest 70 passed, lint + typecheck OK (2026-10-29, D109, Node v24.19.0 from nvm, not on PATH) — web/
+- Web app — vitest 72 passed, lint + typecheck OK (2026-10-30, D113, Node v24.19.0 from nvm, not on PATH) — web/
 
 ## Tests
-- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1495 passed, 1 failed (test_authorization: fixed and that file re-run, 5 passed), 22 skipped, 460 s, 2026-10-29 (with D109 changes)
-- `pytest backend/tests/integration` — affected groups run on disposable postgres:16.15 at 127.0.0.1:15499 (D109, run from the repo root: some files need it for alembic.ini); a test that stores AI-origin values must remove them (fixture `forget_ai_values`) or the migration rewind tests fail; 3 failures also fail on HEAD (KNOWN_ISSUES); test_infrastructure_ready needs MinIO/S3; test_phase4_task_411_413 needs a database with no other sessions
-- Web: `npx tsc -b`, `npm run lint`, `npx vitest run` (70 passed, D109) with PATH=/c/Users/jainm/AppData/Local/nvm/v24.19.0; Playwright e2e not run
+- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1502 passed, 22 skipped, 361 s, 2026-10-30 (D113)
+- `pytest backend/tests/integration` — run on disposable postgres:16.15 at 127.0.0.1:15499: test_phase4_task_411_413.py (3 passed), test_ai_vision.py (15 passed), test_pd2f_waiting_for_reading.py (11 passed), test_pd2c_pd2d_reading.py (9 passed), test_pd3a_no_ai_calls.py (3 passed), test_ingestion.py (4 passed), test_pd_ledger_scopes.py (3 passed); 3 failures on HEAD (KNOWN_ISSUES: test_ai_h1, test_page_split); test_infrastructure_ready needs MinIO/S3 (D113)
+- Web: `npx tsc -b`, `npm run lint`, `npx vitest run` (72 passed, D113); Playwright e2e not run
 - `make accuracy-bench` — not run: needs Docker worker image and owner's local truth set
 
 ## Active task
-- Step 6 (PD-2e + PD-2f + PD-2h + PD-3b) live 30 Oct 2026 (D109, D110, commit 493bc9e, tag live-20261030-b6); switch on rules; plan in docs/claude/plan-step6.md
-- Dry run on a throwaway copy of live + one real company-server reading done (D111): no blocker; live switch stays on rules until PD-5c (step 7)
-- Next session: step 7 (PD-5a + PD-5b + PD-5c + step 6 leftovers) — start from docs/claude/handoff-step7.md; don't re-explore the code
-- Owner check of step 5 on live still pending (D108)
+- Step 7 Phase 2 complete (D113): Tasks A–D implemented (KI-005 empty OCR as ai_only; Field Origin sheet in export; waiting/failed chip in documents list; handwritten date/amount "Use as..." suggestions); PD-5b regression suite green.
+- Next is Step 7 Phase 3: deploy with the owner's go + PD-5a click-through on beta; owner decides live switch from D112.
 
 ## Next steps (max 5, highest value first)
-1. Owner pushes 493bc9e and tag live-20261030-b6 (plus the D110 docs once committed).
-2. Step 7 (new session): PD-5 (5a, 5b, 5c) — PD-5c measures both switch positions on the same real scanned invoices before the live switch goes to AI; fix KI-005 there.
-3. Open points from D109: a "Waiting / failed" chip in the documents list; handwritten dates/amounts stay notes; `test_phase4_task_411_413` not run.
-4. Per-field origin in the export (D7), with step 7.
-5. Decide on KI-001 (internal server address in tracked files).
+1. Step 7 Phase 3: deploy to beta with owner's go and run PD-5a click-through.
+2. Owner decides live switch from D112 results (test invoices kept on beta, owner's choice; no restore).
+3. Owner pushes 493bc9e and tag live-20261030-b6 (plus the docs once committed).
+4. Decide on KI-001 (internal server address in tracked files).
+5. Address pre-existing test failures (KI-003: test_ai_h1, test_page_split).

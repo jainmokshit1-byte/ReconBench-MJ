@@ -20,7 +20,30 @@ from reconbench_app.db.metadata import metadata
 from reconbench_app.storage import ObjectStore
 
 EXCEL_MAX_ROWS = 1_048_576
-P0_SHEETS = ("Summary", "Invoice Recon", "Line Recon", "Exceptions", "Vendor Summary")
+P0_SHEETS = (
+    "Summary",
+    "Invoice Recon",
+    "Line Recon",
+    "Exceptions",
+    "Vendor Summary",
+    "Field Origin",
+)
+FIELD_ORIGIN_LABELS = {
+    "ocr": "Rules",
+    "ai": "AI",
+    "manual": "Person",
+    "erp_import": "Import",
+}
+EXPORT_HEADER_FIELDS = (
+    "vendor_name",
+    "vendor_gstin",
+    "doc_no",
+    "doc_date",
+    "po_refs",
+    "grn_refs",
+    "taxable_total",
+    "grand_total",
+)
 # How the invoice version in the run was read (PD-2c, Q13).
 READING_METHOD_LABELS = {"rules": "Rules", "ai": "AI reading"}
 _EXCEPTION_STATUSES = {"exception", "pending", "needs_review", "unlinked"}
@@ -290,6 +313,36 @@ class ExportService:
                     .order_by(gstin.c.gstin)
                 ):
                     gstins.setdefault(cast(UUID, vendor_id), []).append(str(value))
+            evidence_by_version: dict[UUID, dict[str, dict[str, Any]]] = {}
+            if cases:
+                version_ids = {
+                    cast(UUID, row["invoice_version_id"])
+                    for row in cases
+                    if row.get("invoice_version_id") is not None
+                }
+                if version_ids:
+                    evidence_table = metadata.tables["field_evidence"]
+                    evidence_rows = connection.execute(
+                        sa.select(
+                            evidence_table.c.document_version_id,
+                            evidence_table.c.field_name,
+                            evidence_table.c.origin,
+                            evidence_table.c.verification,
+                        )
+                        .where(
+                            evidence_table.c.workspace_id == workspace_id,
+                            evidence_table.c.document_version_id.in_(version_ids),
+                            evidence_table.c.field_name.in_(EXPORT_HEADER_FIELDS),
+                        )
+                        .order_by(evidence_table.c.created_at.asc(), evidence_table.c.id.asc())
+                    ).mappings()
+                    for ev in evidence_rows:
+                        evidence_by_version.setdefault(
+                            cast(UUID, ev["document_version_id"]), {}
+                        )[str(ev["field_name"])] = {
+                            "origin": ev["origin"],
+                            "verification": ev["verification"],
+                        }
         context = {
             "workspace_id": workspace_id,
             "run_id": run_id,
@@ -297,6 +350,7 @@ class ExportService:
             "filters": filters,
             "vendor_doc_counts": vendor_doc_counts,
             "gstins": gstins,
+            "field_evidence": evidence_by_version,
         }
         return cases, lines, context
 
@@ -742,6 +796,53 @@ class ExportService:
             vendor_row_index += 1
         vendor_sheet.autofilter(0, 0, max(0, vendor_row_index - 1), len(vendor_headers) - 1)
 
+        origin_headers = ["Invoice No.", "Field", "Origin", "Verified"]
+        origin_sheet = self._new_sheet(workbook, "Field Origin", origin_headers, header_fmt)
+        origin_sheet_name = "Field Origin"
+        origin_sheet_index = 0
+        origin_row_index = 1
+        evidence_by_version = context.get("field_evidence") or {}
+        for record in cases:
+            version_id = record.get("invoice_version_id")
+            ver_evidence = evidence_by_version.get(version_id) if version_id else None
+            if ver_evidence is None and isinstance(record.get("field_evidence"), dict):
+                ver_evidence = record["field_evidence"]
+            reading_method = record.get("reading_method")
+            fallback_origin = "AI" if reading_method == "ai" else "Rules"
+            for field_name in EXPORT_HEADER_FIELDS:
+                if origin_row_index >= EXCEL_MAX_ROWS:
+                    origin_sheet.autofilter(0, 0, origin_row_index - 1, len(origin_headers) - 1)
+                    origin_sheet_index += 1
+                    origin_sheet_name = f"Field Origin {origin_sheet_index + 1}"
+                    origin_sheet = self._new_sheet(
+                        workbook, origin_sheet_name, origin_headers, header_fmt
+                    )
+                    origin_row_index = 1
+                ev = ver_evidence.get(field_name) if ver_evidence else None
+                if ev is not None:
+                    raw_origin = ev.get("origin")
+                    origin = FIELD_ORIGIN_LABELS.get(
+                        str(raw_origin),
+                        "Rules"
+                        if raw_origin == "ocr"
+                        else (str(raw_origin) if raw_origin else fallback_origin),
+                    )
+                    raw_ver = ev.get("verification")
+                    verified = (
+                        "Yes"
+                        if raw_ver in {"user", "system_check"} or ev.get("verified") is True
+                        else "No"
+                    )
+                else:
+                    origin = fallback_origin
+                    verified = "No"
+                _write_text(origin_sheet, origin_row_index, 0, record.get("invoice_no"), text_fmt)
+                _write_text(origin_sheet, origin_row_index, 1, field_name, text_fmt)
+                _write_text(origin_sheet, origin_row_index, 2, origin, text_fmt)
+                _write_text(origin_sheet, origin_row_index, 3, verified, text_fmt)
+                origin_row_index += 1
+        origin_sheet.autofilter(0, 0, max(0, origin_row_index - 1), len(origin_headers) - 1)
+
         statuses = Counter(str(record["effective_status"]) for record in cases)
         run = context["run"]
         tolerance_settings = ""
@@ -835,4 +936,4 @@ class ExportService:
             _write_text(sheet, row, column, value, fmt)
 
 
-__all__ = ["ExportService", "P0_SHEETS"]
+__all__ = ["EXPORT_HEADER_FIELDS", "ExportService", "FIELD_ORIGIN_LABELS", "P0_SHEETS"]

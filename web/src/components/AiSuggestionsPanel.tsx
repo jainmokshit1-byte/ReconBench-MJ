@@ -10,6 +10,10 @@ function shownValue(value: unknown): string {
   return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
+function panelRowKey(item: AiFieldSuggestion): string {
+  return `${suggestionKey(item)}:${item.handwritten ? "handwritten" : "read"}`;
+}
+
 /**
  * Advisory suggestions for one document: H1 (PDF text) or the vision reader (page images).
  * Apply only fills the correction draft; the person still saves (and verifies) through the
@@ -61,7 +65,7 @@ export function AiSuggestionsPanel({
   const vision = view.source === "vision";
   const readOnlyReason = view.correctable ? null : "Corrections are not enabled for this document type";
   const relevant = view.suggestions.filter((item) => isRelevantSuggestion?.(item) ?? true);
-  const visible = relevant.filter((item) => !ignored.has(suggestionKey(item)));
+  const visible = relevant.filter((item) => !ignored.has(panelRowKey(item)));
   const ignoredCount = relevant.length - visible.length;
   const label = (item: AiFieldSuggestion) => {
     const field = fieldLabels[item.field] ?? item.field.replaceAll("_", " ");
@@ -92,8 +96,19 @@ export function AiSuggestionsPanel({
       {visible.length ? (
         <ul className="ai-suggestion-list">
           {visible.map((item) => {
-            const key = suggestionKey(item);
+            const key = panelRowKey(item);
             const blocked = readOnlyReason ?? (versionMismatch ? "Version mismatch" : item.matches_current ? "Same as the current value" : applyBlockedReason(item));
+            const isHandwrittenTarget = item.handwritten === true && (item.field === "doc_date" || item.field === "grand_total");
+            const buttonLabel = item.matches_current
+              ? "Use current"
+              : isHandwrittenTarget
+                ? item.field === "doc_date"
+                  ? "Use as invoice date"
+                  : "Use as invoice total"
+                : "Use suggested";
+            const buttonAriaLabel = isHandwrittenTarget
+              ? buttonLabel
+              : `${item.matches_current ? "Keep" : "Use suggested"} ${label(item)}`;
             return (
               <li key={key} className="ai-suggestion-row">
                 <div className="ai-suggestion-values">
@@ -104,7 +119,24 @@ export function AiSuggestionsPanel({
                   {onFocusSource ? <button className="table-action" type="button" onClick={() => onFocusSource({ page: item.page, bbox: item.box, source: view.source, ai_call_id: view.ai_call_id })}>View source page {item.page}</button> : null}
                 </div>
                 <div className="ai-suggestion-actions">
-                  <button className="table-action" type="button" disabled={blocked !== null || view.ai_call_id === null} title={blocked ?? undefined} aria-label={`${item.matches_current ? "Keep" : "Use suggested"} ${label(item)}`} onClick={() => { if (view.ai_call_id) onApply(item, view.ai_call_id); }}>{item.matches_current ? "Use current" : "Use suggested"}</button>
+                  <button
+                    className="table-action"
+                    type="button"
+                    disabled={blocked !== null || view.ai_call_id === null}
+                    title={blocked ?? undefined}
+                    aria-label={buttonAriaLabel}
+                    onClick={() => {
+                      if (!view.ai_call_id) return;
+                      if (isHandwrittenTarget && item.current_value !== null && item.current_value !== undefined && item.current_value !== "" && !item.matches_current) {
+                        if (!window.confirm(`Replace current ${label(item)} with suggested handwritten value?`)) {
+                          return;
+                        }
+                      }
+                      onApply(item, view.ai_call_id);
+                    }}
+                  >
+                    {buttonLabel}
+                  </button>
                   <button className="table-action" type="button" aria-label={`${item.matches_current ? "Dismiss" : "Keep current for"} ${label(item)}`} onClick={() => { if (!item.matches_current) onKeepCurrent?.(item); setIgnored((current) => new Set(current).add(key)); }}>{item.matches_current ? "Dismiss" : "Keep current"}</button>
                   {blocked && blocked !== "Version mismatch" ? <small>{blocked}</small> : null}
                 </div>

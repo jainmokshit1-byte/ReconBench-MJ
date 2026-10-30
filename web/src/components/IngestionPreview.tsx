@@ -20,7 +20,7 @@ import { useAuth } from "../auth/useAuth";
 import { buildAccuracyCorrectionExport } from "../utils/accuracyCorrectionExport";
 import { AiSuggestionsPanel } from "./AiSuggestionsPanel";
 import { AiValuesVerify } from "./AiValuesVerify";
-import { ReadingStatus } from "./ReadingStatus";
+import { ReadingChip, ReadingStatus } from "./ReadingStatus";
 
 const PdfPreview = lazy(() => import("./PdfPreview").then((module) => ({ default: module.PdfPreview })));
 
@@ -492,6 +492,7 @@ function DocumentCard({
         <div className="preview-document-badges">
           {version["reading_method"] === "ai" || version["reading_method"] === "rules" ? <span className="quiet-badge" aria-label="Reading method">{version["reading_method"] === "ai" ? `Read by AI${readingProviderLabel(details["reading_provider"])}` : "Read by rules"}</span> : null}
           {version["extraction_method"] === "pdf_ocr" ? <span className="ocr-chip">OCR-assisted</span> : null}
+          <ReadingChip document={document} />
           {needsVerification ? <span className="verification-chip"><AlertTriangle size={13} /> Needs verification</span> : <span className="quiet-badge">Parsed</span>}
         </div>
       </div>

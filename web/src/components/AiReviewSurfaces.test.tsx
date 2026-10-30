@@ -201,6 +201,77 @@ describe("H1 AI suggestions in the invoice preview", () => {
     expect(screen.getByRole("button", { name: "Keep current for Document number" })).toBeEnabled();
     expect(screen.queryByText(/Corrections are not enabled/)).not.toBeInTheDocument();
   });
+
+  it("labels handwritten date and total suggestions and confirms replacement when current value differs", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm");
+    installFetch(suggestionsView({
+      source: "vision",
+      correctable: true,
+      suggestions: [
+        { scope: "header", line_no: null, field: "doc_date", value: "2026-04-15", current_value: "2026-04-01", matches_current: false, page: 1, quote: "15/04/2026", start: null, end: null, box: [100, 100, 120, 200], handwritten: true },
+        { scope: "header", line_no: null, field: "grand_total", value: "1250.00", current_value: "118.00", matches_current: false, page: 1, quote: "1,250.00", start: null, end: null, box: [200, 100, 220, 200], handwritten: true },
+      ],
+      annotations: [
+        { kind: "handwritten", text: "15/04/2026", looks_like: "date", page: 1, box: [100, 100, 120, 200] },
+        { kind: "handwritten", text: "1,250.00", looks_like: "amount", page: 1, box: [200, 100, 220, 200] },
+      ],
+    }));
+    renderPreview();
+
+    const dateButton = await screen.findByRole("button", { name: "Use as invoice date" });
+    const totalButton = screen.getByRole("button", { name: "Use as invoice total" });
+    expect(dateButton).toBeInTheDocument();
+    expect(totalButton).toBeInTheDocument();
+
+    // User cancels confirmation -> value is not applied
+    confirmSpy.mockReturnValueOnce(false);
+    fireEvent.click(dateButton);
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByLabelText("Date")).not.toBeInTheDocument();
+
+    // User confirms -> value is applied to draft
+    confirmSpy.mockReturnValueOnce(true);
+    fireEvent.click(dateButton);
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(screen.getByLabelText("Date")).toHaveValue("2026-04-15");
+
+    // Apply total with confirmation
+    confirmSpy.mockReturnValueOnce(true);
+    fireEvent.click(totalButton);
+    expect(confirmSpy).toHaveBeenCalledTimes(3);
+    expect(screen.getByLabelText("Document total")).toHaveValue("1250.00");
+  });
+
+  it("renders printed and handwritten suggestions for the same field with distinct keys and dismisses independently", async () => {
+    installFetch(suggestionsView({
+      source: "vision",
+      correctable: true,
+      suggestions: [
+        { scope: "header", line_no: null, field: "doc_date", value: "2026-04-10", current_value: "2026-04-01", matches_current: false, page: 1, quote: "10/04/2026", start: null, end: null, box: [50, 50, 70, 150], handwritten: false },
+        { scope: "header", line_no: null, field: "doc_date", value: "2026-04-15", current_value: "2026-04-01", matches_current: false, page: 1, quote: "15/04/2026", start: null, end: null, box: [100, 100, 120, 200], handwritten: true },
+      ],
+      annotations: [
+        { kind: "handwritten", text: "15/04/2026", looks_like: "date", page: 1, box: [100, 100, 120, 200] },
+      ],
+    }));
+    renderPreview();
+
+    const printedButton = await screen.findByRole("button", { name: "Use suggested Date" });
+    const handwrittenButton = screen.getByRole("button", { name: "Use as invoice date" });
+    expect(printedButton).toBeInTheDocument();
+    expect(handwrittenButton).toBeInTheDocument();
+
+    const keepButtons = screen.getAllByRole("button", { name: "Keep current for Date" });
+    expect(keepButtons).toHaveLength(2);
+
+    // Dismiss printed suggestion
+    fireEvent.click(keepButtons[0]!);
+
+    // Printed button is dismissed, handwritten button remains
+    expect(screen.queryByRole("button", { name: "Use suggested Date" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Use as invoice date" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show 1 ignored" })).toBeInTheDocument();
+  });
 });
 
 describe("AI external-sharing banner", () => {

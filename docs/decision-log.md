@@ -2180,3 +2180,128 @@ Not departures (checked): the hard zeros (0 false Matched, 0 false links, 0 AI v
 - Checked here afterwards: no `rbcopy` container, volume or network left; repo unchanged; live at 0036, switch on rules (version 24), 113 AI requests, 0 AI-origin values, all 545 documents ready, no live audit event since 29 Oct 18:34 UTC.
 - Found: an empty OCR reference list is shown as a disagreement (`LLM_DISAGREEMENT`, OCR `""`) instead of "AI only" (KI-005; label only, the value still needs its own click). Verifying every AI value clears `AI_VALUE_UNVERIFIED` but not `LOW_CONFIDENCE_DATA` from low-confidence OCR values kept in the AI version; those still need a person's review (MG-4, as designed).
 - Point 4 (switch live to AI): no technical blocker found. It stays on rules: D103 / §15.0 principle 9 and PD-5c keep the switch on rules until PD-5c measures both methods on the same real scanned invoices (step 7).
+
+## D112 — Step 7 Phase 1: PD-5c measurement on beta (rules vs AI on 10 real scanned invoices) (30 Oct 2026)
+- **Budget logged before first call (2026-10-30 08:31:00 UTC):** Company AI server (vLLM) only, up to 10 real scanned invoices, at most 40 chat completions in total, at most 2 `GET /models` from bench tooling, 0 Gemini.
+- **Controlled AI window:**
+  - $T_0$: 2026-10-30 08:44:35 UTC (owner toggled "Scanned invoices" to AI in Settings, `ai_setting` version 27, audited as `ai.scanned_invoice_reader_change` `01a18bfb-767c-7f9d-a5c9-136032371002`).
+  - $T_1$: 2026-10-30 10:35:32 UTC (owner toggled "Scanned invoices" back to Rules in Settings, `ai_setting` version 28, audited as `ai.scanned_invoice_reader_change` `01a18c61-0ad6-7841-8d0c-8f89ca3df7e6`).
+- **Uploads & Readings:** 10 test documents uploaded one by one:
+  - `doc-1` (2 pages): `ready` (cache hit, 0 completions)
+  - `doc-2` (1 page): `ready` (cache hit, 0 completions)
+  - `doc-3` (5 pages): `ready` (fresh call, 6 completions)
+  - `doc-4` (2 pages): `failed` (`invalid_output`, 1 completion)
+  - `doc-5` (3 pages): `ready` (fresh call, 4 completions)
+  - `doc-6` (1 page): `ready` (cache hit, 0 completions)
+  - `doc-7` (2 pages): `ready` (fresh call, 3 completions)
+  - `doc-8` (1 page): `ready` (cache hit, 0 completions)
+  - `doc-9` (1 page): `ready` (fresh call, 2 completions; transient network retry resolved)
+  - `doc-10` (1 page): `ready` (fresh call, 2 completions; transient network retry resolved)
+  Total pages across test documents: 19 pages.
+  Terminal outcomes: 9 `ready`, 1 `failed`.
+- **Resource Usage:**
+  - Chat completions sent: **19 / 40** (21 remaining under budget).
+  - Bench tooling `GET /models`: **0 / 2**.
+  - Gemini calls: **0** (0 database rows, 0 log entries).
+- **Post-checks on Beta (read-only):**
+  - All new `ai_request` (12 rows) and `ai_call_log` (10 rows) belong to test documents and used `vllm`.
+  - 0 open jobs in `procrastinate_jobs` (`todo`/`doing` = 0).
+  - Version 1 exists and is unchanged; version 2 has `derived_from_version_id = version 1` for the 9 ready docs.
+  - 0 `field_evidence` rows with origin `ai` verified without a person.
+  - 0 automatic (non-suggested) links (`state = 'auto'`: 0) and 0 `matched` cases involving test documents since $T_0$.
+  - `alembic_version` is 0036.
+  - Pre-existing documents verification: Restored `live-db-20261030-pd5c.dump` into a throwaway container `rb-throwaway-verify`. Compared pre-existing documents (`doc-1`, `doc-2`, `doc-4`, `doc-6`, `doc-7`, `doc-8`, `doc-9`, `doc-10`) between beta and backup: 100% exact match across all recon case statuses (`matched` 3, `needs_review` 2, `unlinked` 20) and confirmed links (9). Throwaway container removed and verified gone.
+- **Also in the audit log, not in the agent's report (checked here, UTC):** 07:49 four `file.remove` (6 documents withdrawn) so invoices already on beta could be uploaded again; 07:50:35 switch to AI (version 25) and 08:25:59 back to rules (version 26), before the budget go, with 0 AI requests in that span; 10:11 two more `file.remove` (doc-9 and doc-10 uploaded again after `PROVIDER_UNAVAILABLE`, which gave the 2 `released` requests). All were made in the app by the owner (confirmed in chat). AI requests 08:45–10:21: 12 (9 succeeded, 1 failed, 2 released). Window T0–T1: 1 h 51 min (brief: under 45 min).
+- **Backup caveat:** `live-db-20261030-pd5c.dump` was taken at about 07:52 UTC, after the 07:49 removals and with the switch on AI (version 25). After any restore, set the switch back to rules first.
+- **Caveats on the numbers:** doc-1, doc-2, doc-6 and doc-8 reused AI answers stored from earlier readings of the same pages on beta, not new answers from the server; not checked whether the cache key covers the model, prompt and schema version. doc-9's upload had 1 of the invoice's 2 pages. 8 of the 10 test documents already existed on beta; their 3 `matched` cases come from an earlier run and were not re-checked against the new unverified AI versions. Don't run reconciliation on beta before the owner chooses between keeping the test documents and restoring.
+- **Totals over the 12 fields (119 field checks):** rules 94 correct / 10 wrong / 15 missing; AI as used 101 / 3 / 15. The 3 wrong values in AI as used are rules (OCR) values kept where the AI gave none (AI alone has 0 wrong in those fields). AI alone: 72 values given, 0 wrong (Wilson 95% lower bound about 0.95). The AI reading failed on the first try for 3 of 10 documents (1 `invalid_output`, 2 `PROVIDER_UNAVAILABLE`); the doc-4 fields count as missing in both AI arms.
+- **Scoring results against owner's truth (`truth.json`):**
+  - Total readings: 10, Matched documents: 10, Unmatched: 0, Failed: 1 (`doc-4`), Deduplicated: 0, Ambiguous truth: 0, AI/OCR agree both wrong: 0.
+
+```
+ARM: RULES
+Field               Correct    Wrong  Missing    Total   Accuracy    Wilson 95% Interval
+--------------------------------------------------------------------------------------
+buyer_gstin               7        0        0        7     100.0%         [0.646, 1.000]
+cgst                      6        1        1        8      75.0%         [0.409, 0.928]
+doc_date                 10        0        0       10     100.0%         [0.723, 1.000]
+doc_no                    7        3        0       10      70.0%         [0.397, 0.892]
+grand_total               7        1        2       10      70.0%         [0.397, 0.892]
+igst                      0        0        1        1       0.0%         [0.000, 0.793]
+line_amount              28        1        4       33      84.9%         [0.691, 0.933]
+po_refs                   3        1        0        4      75.0%         [0.301, 0.954]
+sgst                      7        1        0        8      87.5%         [0.529, 0.978]
+taxable_total             6        1        2        9      66.7%         [0.354, 0.879]
+vendor_gstin              9        0        0        9     100.0%         [0.701, 1.000]
+vendor_name               4        1        5       10      40.0%         [0.168, 0.687]
+
+ARM: AI_AS_USED
+Field               Correct    Wrong  Missing    Total   Accuracy    Wilson 95% Interval
+--------------------------------------------------------------------------------------
+buyer_gstin               6        0        1        7      85.7%         [0.487, 0.974]
+cgst                      6        1        1        8      75.0%         [0.409, 0.928]
+doc_date                  9        0        1       10      90.0%         [0.596, 0.982]
+doc_no                    9        0        1       10      90.0%         [0.596, 0.982]
+grand_total               7        0        3       10      70.0%         [0.397, 0.892]
+igst                      0        0        1        1       0.0%         [0.000, 0.793]
+line_amount              31        1        1       33      93.9%         [0.804, 0.983]
+po_refs                   4        0        0        4     100.0%         [0.510, 1.000]
+sgst                      7        0        1        8      87.5%         [0.529, 0.978]
+taxable_total             6        1        2        9      66.7%         [0.354, 0.879]
+vendor_gstin              8        0        1        9      88.9%         [0.565, 0.980]
+vendor_name               8        0        2       10      80.0%         [0.490, 0.943]
+
+ARM: AI_ALONE
+Field               Correct    Wrong  Missing    Total   Accuracy    Wilson 95% Interval
+--------------------------------------------------------------------------------------
+buyer_gstin               3        0        4        7      42.9%         [0.158, 0.750]
+cgst                      5        0        3        8      62.5%         [0.306, 0.863]
+doc_date                  9        0        1       10      90.0%         [0.596, 0.982]
+doc_no                    7        0        3       10      70.0%         [0.397, 0.892]
+grand_total               6        0        4       10      60.0%         [0.313, 0.832]
+igst                      0        0        1        1       0.0%         [0.000, 0.793]
+line_amount              14        0       19       33      42.4%         [0.272, 0.592]
+po_refs                   3        0        1        4      75.0%         [0.301, 0.954]
+sgst                      5        0        3        8      62.5%         [0.306, 0.863]
+taxable_total             4        0        5        9      44.4%         [0.189, 0.733]
+vendor_gstin              8        0        1        9      88.9%         [0.565, 0.980]
+vendor_name               8        0        2       10      80.0%         [0.490, 0.943]
+```
+
+- **Assessment & Policy:** With $N=10$ documents and 1 failed document (`doc-4`), per-field sample sizes are small ($N=1$ to 33) and confidence intervals are wide; this measurement is indicative of directional trends (e.g. AI improving vendor name extraction from 40.0% to 80.0% and line amounts from 84.9% to 93.9%, while missing fields on failed `doc-4`), but is not decision-grade without a larger sample.
+- **Current State:** The live switch stays on **rules** (version 28) until the owner decides.
+
+
+## D113 - Step 7 Phase 2: Leftovers and PD-5b regression suite (30 Oct 2026)
+
+- **Scope & Changes:**
+  - **Task A (KI-005):** In `backend/reconbench_core/extraction/merge.py:_merge_field`, treated empty OCR values (`""`, `()`, empty list, or all-whitespace strings) as missing (`ai_only` instead of `LLM_DISAGREEMENT`). Refreshed `backend/reconbench_core/RULES_HASH` to `fc247f74f6e0b7a12d22ee363d7d9a4afdd3863135fddc72c1dd0a9338d69c3b`. Ran `scripts/check_engine_version.py --base-ref 31e08d0`: rule-bearing core modules unchanged, engine version remains `0.1.13`. Added 3 unit tests in `backend/tests/unit/test_pd2e_merge.py` (30 passed).
+  - **Task B (Export provenance):** In `backend/reconbench_app/export_service.py`, added a sixth worksheet "Field Origin" with columns `["Invoice No.", "Field", "Origin", "Verified"]`. Existing 5 sheets remain completely unchanged with identical columns and data. Escaped formula injection on string values. Added unit test in `backend/tests/unit/test_export_workbook.py` (5 passed); updated sheetnames assertion in `backend/tests/integration/test_ingestion.py`.
+  - **Task C (List chip for waiting / failed):** `GET /api/v1/documents` (`api/ingestion.py:get_documents`) already returned both columns, because `list_documents` selects `*document.c` (migration 0036). The rows now name `reading_state` and `reading_failure_code` explicitly, and `DocumentRow` in `web/src/api/ingestion.ts` types them. The endpoint has no response model, so after regenerating (`export_reconciliation_schemas.py`, `export_openapi.py`, `npm run api:generate --prefix web`) `backend/openapi.json`, `web/src/api/generated.ts` and `docs/schemas` are unchanged. Created `ReadingChip` in `web/src/components/ReadingStatus.tsx` and mounted it in `DocumentCard` (`web/src/components/IngestionPreview.tsx`). It shows "Waiting for reading" while a reading is pending, "Reading failed: <plain reason>" on failure, and nothing when ready or absent. It has no actions; retry stays in the existing `ReadingStatus` panel. Added vitest tests in `web/src/components/ReadingStatus.test.tsx` (7 passed); extended backend test in `backend/tests/integration/test_ingestion.py`.
+  - **Task D (Handwritten date or amount):** Rule as approved: in `backend/reconbench_app/ingestion.py:_extract_suggestions`, handwritten page notes with `looks_like == "date"` (parsed via `accept_date`) surface as `doc_date` suggestions (`kind="date"`), and `looks_like == "amount"` (parsed via `parse_money`) surface as `grand_total` suggestions (`kind="money"`). Unparsable notes are ignored. Excluded from auto-verify and AI merge. When user applies the suggestion, it goes through `correct_invoice_document` (`origin="manual"`, audited as `document.correct`, refused with `READING_PENDING` if reading is not `READY`). In `web/src/components/AiSuggestionsPanel.tsx`, rendered with distinct label ("Use as invoice date" / "Use as invoice total") and prompts confirmation if replacing an existing value. Added vitest test in `web/src/components/AiReviewSurfaces.test.tsx` (11 passed) and integration tests in `backend/tests/integration/test_ai_vision.py`.
+- **Validation & Test Results:**
+  - `ruff check`: All checks passed (0 errors) on touched files.
+  - `mypy --strict backend/reconbench_core`: Success (0 issues in 40 source files).
+  - `mypy backend/reconbench_app`: 80 errors in 13 files (0 new errors in touched files, matches baseline).
+  - `lint-imports`: 3 contracts kept, 0 broken.
+  - `check_core_purity.py`: Passed.
+  - `check_rules_hash.py`: Verified `fc247f74f6e0b7a12d22ee363d7d9a4afdd3863135fddc72c1dd0a9338d69c3b`.
+  - `check_engine_version.py --base-ref 31e08d0`: Core modules unchanged; engine version `0.1.13`.
+  - Offline test suite: 1502 passed, 22 skipped in 361.49s.
+  - Golden run: `golden_run.py --self-check` passed (0 false Matched, engine `0.1.13`).
+  - Integration suite (run on disposable Postgres container `rb-test-pg` at port 15499; container destroyed immediately after):
+    - `test_phase4_task_411_413.py`: 3 passed, 0 failed.
+    - `test_ai_vision.py`: 15 passed, 0 failed.
+    - `test_pd2f_waiting_for_reading.py`: 11 passed, 0 failed.
+    - `test_pd2c_pd2d_reading.py`: 9 passed, 0 failed.
+    - `test_pd3a_no_ai_calls.py`: 3 passed, 0 failed.
+    - `test_ingestion.py`: 4 passed, 0 failed.
+    - `test_pd_ledger_scopes.py`: 3 passed, 0 failed.
+    - Pre-existing failures documented on HEAD (KI-003: `test_ai_h1.py`, `test_page_split.py`) not in touched scope.
+  - Web checks: `npx tsc -b` passed (0 errors); `npm run lint` passed (0 errors); `npx vitest run` passed (15 test files passed, 72 tests passed, 0 failed).
+- **Environment & Safety:**
+  - Beta untouched: 0 commands touched `reconbench` containers (ports 15432, 8000, 5173, 9000).
+  - AI calls: 0 calls made to Gemini, company server, or any external LLM provider.
+  - Migrations: 0 Alembic migrations added.
+  - Web changes inert on beta today (backend fields optional, chip renders nothing when fields absent).
+- **Deployment Status:** Not deployed; phase 3 deploys with the owner's go.

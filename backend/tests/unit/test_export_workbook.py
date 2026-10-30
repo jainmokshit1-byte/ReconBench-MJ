@@ -193,3 +193,63 @@ def test_invoice_sheet_names_the_reading_method_in_the_last_column(tmp_path: Pat
         assert sheet["K2"].value == "=I2+J2"
     finally:
         workbook.close()
+
+
+def test_field_origin_sheet_reports_origins_and_verification_with_text_safety(
+    tmp_path: Path,
+) -> None:
+    """PD-4c / D7: per-field origin sheet reports rules, AI, person, and import origins.
+
+    Also tests text safety (formula injection prevention).
+    """
+    vendor_id = uuid4()
+    version_id = uuid4()
+    path = tmp_path / "origins.xlsx"
+    case = _case(vendor_id=vendor_id, invoice_no="=INV-001") | {
+        "invoice_version_id": version_id,
+        "reading_method": "rules",
+    }
+    field_evidence = {
+        version_id: {
+            "doc_no": {"origin": "ocr", "verification": "none"},
+            "doc_date": {"origin": "ai", "verification": "none"},
+            "grand_total": {"origin": "manual", "verification": "user"},
+            "vendor_name": {"origin": "erp_import", "verification": "system_check"},
+        }
+    }
+    context = _context([vendor_id]) | {"field_evidence": field_evidence}
+    ExportService._write_workbook(
+        ExportService.__new__(ExportService),
+        path,
+        cases=[case],
+        lines=[],
+        context=context,
+    )
+
+    formulas = load_workbook(path, data_only=False)
+    try:
+        assert "Field Origin" in formulas.sheetnames
+        sheet = formulas["Field Origin"]
+        headers = [sheet.cell(1, col).value for col in range(1, 5)]
+        assert headers == ["Invoice No.", "Field", "Origin", "Verified"]
+        rows = {
+            sheet.cell(row, 2).value: (
+                sheet.cell(row, 1).value,
+                sheet.cell(row, 3).value,
+                sheet.cell(row, 4).value,
+            )
+            for row in range(2, sheet.max_row + 1)
+        }
+        # Rules field
+        assert rows["doc_no"] == ("=INV-001", "Rules", "No")
+        # Unverified AI field
+        assert rows["doc_date"] == ("=INV-001", "AI", "No")
+        # Person-corrected field
+        assert rows["grand_total"] == ("=INV-001", "Person", "Yes")
+        # Import field
+        assert rows["vendor_name"] == ("=INV-001", "Import", "Yes")
+        # Text safety on invoice_no leading '=': string cell, not formula
+        assert sheet["A2"].value == "=INV-001"
+        assert sheet["A2"].data_type == "s"
+    finally:
+        formulas.close()

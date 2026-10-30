@@ -242,7 +242,7 @@ def _merge_field(
             key, "ocr_kept", None, ocr_text, left_out_reason or "not_read"
         )
     merged = _from_ai(ai, policy)
-    if ocr is None:
+    if ocr is None or not ocr_text:
         return merged, CrossCheck(key, "ai_only", ai_text, None)
     if values_agree(kind, _plain(ocr), _plain(ai)):
         return merged, CrossCheck(key, "agree", ai_text, ocr_text)

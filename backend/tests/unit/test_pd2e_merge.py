@@ -305,3 +305,52 @@ def test_the_merge_is_deterministic() -> None:
         _ai("grand_total", "money", "2.00", Decimal("2.00")),
     )
     assert merge_readings(ocr, check) == merge_readings(ocr, check)
+
+
+def test_empty_ocr_list_and_ai_value_is_ai_only_not_disagreement() -> None:
+    """KI-005: an empty OCR value is treated like a missing one."""
+    result = merge_readings(
+        _ocr({"po_refs": ()}),
+        _check(_ai("po_ref", "po_ref", "PO-100", "PO-100")),
+    )
+    refs = result.document.header.po_refs
+    assert refs is not None and refs.value == ("PO-100",)
+    assert refs.origin is FieldOrigin.AI
+    cross = _cross(result.document, "header:po_refs")
+    assert cross == {
+        "field": "header:po_refs",
+        "outcome": "ai_only",
+        "ai": "PO-100",
+        "ocr": None,
+        "reason": None,
+    }
+    assert not any(item.field == "header:po_refs" for item in result.disagreements)
+
+
+def test_non_empty_different_ocr_list_is_still_disagree() -> None:
+    result = merge_readings(
+        _ocr({"po_refs": ("PO-999",)}),
+        _check(_ai("po_ref", "po_ref", "PO-100", "PO-100")),
+    )
+    refs = result.document.header.po_refs
+    assert refs is not None and refs.value == ("PO-100",)
+    assert refs.origin is FieldOrigin.AI
+    cross = _cross(result.document, "header:po_refs")
+    assert cross["outcome"] == "disagree"
+    assert cross["reason"] == LLM_DISAGREEMENT
+    assert [item.field for item in result.disagreements] == ["header:po_refs"]
+
+
+def test_person_held_empty_value_is_still_person_kept() -> None:
+    held_empty = {**_field(()), "source": "manual"}
+    result = merge_readings(
+        _ocr(po_refs=held_empty),
+        _check(_ai("po_ref", "po_ref", "PO-100", "PO-100")),
+    )
+    refs = result.document.header.po_refs
+    assert refs is not None and refs.value == ()
+    assert refs.source is FieldSource.MANUAL
+    cross = _cross(result.document, "header:po_refs")
+    assert cross["outcome"] == "person_kept"
+    assert cross["ai"] == "PO-100"
+    assert cross["ocr"] == ""

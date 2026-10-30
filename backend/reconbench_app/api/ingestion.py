@@ -859,7 +859,17 @@ def get_documents(
         source_file_id=source_file_id,
         limit=limit,
     )
-    return DecimalJSONResponse(content=to_jsonable(rows), headers={"ETag": _etag_for_payload(rows)})
+    payload = [
+        {
+            **row,
+            "reading_state": row.get("reading_state"),
+            "reading_failure_code": row.get("reading_failure_code"),
+        }
+        for row in rows
+    ]
+    return DecimalJSONResponse(
+        content=to_jsonable(payload), headers={"ETag": _etag_for_payload(payload)}
+    )
 
 
 @router.get("/documents/{document_id}", tags=["Documents"])

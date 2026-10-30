@@ -509,7 +509,38 @@ def test_page_images_are_read_as_suggestions_and_never_change_the_document(
     )
 
     [request_id] = world.ai_queue.request_ids
-    provider = _Recorder([json.dumps(recorded_response())])
+    response_payload = recorded_response()
+    response_payload["annotations"] = [
+        {
+            "kind": "handwritten",
+            "text": HANDWRITTEN_PO,
+            "looks_like": "po_number",
+            "page": 1,
+            "box_2d": [545, 95, 570, 290],
+        },
+        {
+            "kind": "handwritten",
+            "text": "15/04/2026",
+            "looks_like": "date",
+            "page": 1,
+            "box_2d": [500, 100, 520, 250],
+        },
+        {
+            "kind": "handwritten",
+            "text": "1,234.50",
+            "looks_like": "amount",
+            "page": 1,
+            "box_2d": [520, 100, 540, 250],
+        },
+        {
+            "kind": "handwritten",
+            "text": "not a date",
+            "looks_like": "date",
+            "page": 1,
+            "box_2d": [540, 100, 560, 250],
+        },
+    ]
+    provider = _Recorder([json.dumps(response_payload)])
     result = _runner(engine, keys[0], provider).run(request_id)
     assert (result.state, result.apply_outcome) == ("succeeded", "applied")
     [call] = provider.calls
@@ -524,15 +555,66 @@ def test_page_images_are_read_as_suggestions_and_never_change_the_document(
     assert after["image"] is None and after["purged_at"] is not None  # bytes cleared
     assert after["image_sha256"] == row["image_sha256"]  # evidence stays
 
-    view, _etag = _view(world, document_id)
+    view, etag = _view(world, document_id)
     assert view["state"] == "available" and view["source"] == "vision"
     assert view["correctable"] is True
     by_field = {item["field"]: item for item in view["suggestions"] if item["scope"] == "header"}
     assert by_field["doc_no"]["value"] == INVOICE_NO
     assert by_field["vendor_gstin"]["value"] == SUPPLIER_GSTIN
     assert by_field["doc_no"]["box"] and by_field["doc_no"]["start"] is None
-    assert [note["text"] for note in view["annotations"]] == [HANDWRITTEN_PO]
+    # Handwritten date and amount become suggestions; unparsable does not
+    assert by_field["doc_date"]["value"] == "2026-04-15"
+    assert by_field["doc_date"]["handwritten"] is True
+    assert by_field["grand_total"]["value"] == "1234.50"
+    assert by_field["grand_total"]["handwritten"] is True
+    assert not any(item["value"] == "not a date" for item in view["suggestions"])
+    assert len(view["annotations"]) == 4
     assert all(item["page"] == 1 for item in view["suggestions"])
+
+    # Refused while waiting
+    refused = world.client.put(
+        f"/api/v1/documents/{document_id}/correction",
+        json={"doc_date": "2026-04-15"},
+        headers={"If-Match": etag, "X-CSRF-Token": CSRF},
+    )
+    assert refused.status_code == 409 and refused.json()["code"] == "reading_pending"
+
+    # Reading made ready
+    rules = world.client.post(
+        f"/api/v1/documents/{document_id}/reading/use-rules",
+        headers={"If-Match": etag, "X-CSRF-Token": CSRF},
+    )
+    assert rules.status_code == 200
+    etag = rules.headers["etag"]
+
+    # Applying handwritten suggestion records origin person and audit
+    saved = world.client.put(
+        f"/api/v1/documents/{document_id}/correction",
+        json={
+            "doc_date": "2026-04-15",
+            "reason": "Applied handwritten invoice date.",
+            "ai_suggestion_refs": [
+                {"ai_call_id": view["ai_call_id"], "scope": "header", "field": "doc_date"}
+            ],
+        },
+        headers={"If-Match": etag, "X-CSRF-Token": CSRF},
+    )
+    assert saved.status_code == 200, saved.text
+    evidence = {item["field_name"]: item for item in saved.json()["field_evidence"]}
+    assert evidence["doc_date"]["source"] == "manual"
+    assert evidence["doc_date"]["ai_call_id"] == view["ai_call_id"]
+
+    audit_table = metadata.tables["audit_log"]
+    with engine.connect() as connection:
+        events = list(
+            connection.execute(
+                sa.select(audit_table).where(
+                    audit_table.c.workspace_id == world.workspace_id,
+                    audit_table.c.action == "document.correct",
+                )
+            ).mappings()
+        )
+    assert len(events) >= 1
 
 
 @pytest.fixture

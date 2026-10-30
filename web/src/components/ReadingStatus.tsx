@@ -74,3 +74,34 @@ export function ReadingStatus({
     </section>
   );
 }
+
+/**
+ * Small status chip for a document in a documents list or card.
+ * Shows only for 'waiting' and 'failed'; renders nothing for 'ready' or when absent.
+ */
+export function ReadingChip({
+  document,
+  readingState,
+  readingFailureCode,
+}: {
+  document?: Record<string, unknown> | null;
+  readingState?: string | null;
+  readingFailureCode?: string | null;
+}) {
+  const state = readingState ?? document?.["reading_state"];
+  if (state !== "waiting" && state !== "failed") return null;
+  const rawCode = readingFailureCode ?? document?.["reading_failure_code"];
+  const code = typeof rawCode === "string" ? rawCode : null;
+  if (state === "waiting") {
+    return (
+      <span className="status-chip status-progress" aria-label="Reading state">
+        <Clock size={12} /> Waiting for reading
+      </span>
+    );
+  }
+  return (
+    <span className="status-chip status-danger" aria-label="Reading state">
+      <AlertTriangle size={12} /> Reading failed: {readingFailureText(code)}
+    </span>
+  );
+}
