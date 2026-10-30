@@ -2363,3 +2363,47 @@ vendor_name               8        0        2       10      80.0%         [0.490
   - The optional AI block reused a Phase 1 invoice (see above), so the KI-005 label fix is not proven on beta; KI-005 stays open as "fixed in code, deployed, not yet seen on beta".
   - The audit log has 3 more `file.remove` actions during the click-through (13:40:29, 13:44:06, 13:44:09 UTC, role manager) that the Phase 3 report does not mention; all made in the app by the owner (confirmed in chat, 30 Oct).
   - No new defects or regressions discovered.
+
+## D115 - Step 8: diagnosis of the doc-4 AI reading failure (30 Oct 2026)
+
+- **Target & Background:**
+  - In D112, 1 of 10 scanned invoices on beta failed AI reading: doc-4 (`01a10e07-ee44-703c-bbae-3c8383ad8cc3`, version `01a18c22-0d17-7721-a728-cede930cef8f`), reading state `failed`, failure code `invalid_output`.
+  - Request: hook `h6_vision`, provider vllm, model `qwen3.5:9b`, prompt version `vision.prompt.v4.qwen`, schema version `vision.schema.v4` (from `ai_request`, checked by Claude; the agent's D3 report gave other values, which were wrong). One call log row: 3774 tokens in, 3386 tokens out, 78.8s.
+  - Objective: diagnose failure cause across hypotheses H1 (orientation wrong), H2 (output cap / wide page answer size), and H3 (malformed JSON or post-parsing check); log failure detail and failing call for all future AI reading failures; deploy and retry.
+
+- **D1 Findings & Hypotheses Verdicts:**
+  - **Path analysis:** Scanned invoices read with `h6_vision` send requests sequentially: page 1 -> page 2 -> ... -> header-band (for 2-page invoice). Output cap per call is computed as `min(4096, 8192 context_window - ceil(prompt_bytes / 3) - 3500 image_tokens_estimate - 256 margin)` = `3386` tokens for local vLLM. Execution stops at the first bad call (`runner.py`, the call loop returns on the first `ProviderFailure`; `openai_compat.py:358` is the one-page-per-call rule). Every full-page call used exactly 3774 input tokens and every header-band call 2049. This holds exactly for the 1-, 2-, 3- and 5-page requests of 30 Oct (Claude). Failure details were previously discarded (turned into generic `invalid_output`).
+  - **doc-4 request:** Output tokens were exactly 3386, matching the per-call cap of 3386 tokens.
+  - **Orientation check (H1):** Page 1 was scanned sideways (render JSON stored `rotation=270`). The stored upright image is wide (2048 × 1449), which fits a sideways scan turned upright. The agent's D3 report gives a Tesseract re-run: raw `Rotate: 90`, after the upright step `Rotate: 0`, confidence 3.84. **Unverified:** at STOP 1 the same agent reported a re-run impossible (page images purged), no re-run appears in the session log Claude saw, and a raw `Rotate: 90` doesn't match the stored `rotation` 270. Owner confirmed page 1 is sideways in the original PDF (direction not recorded). H1 rests on the stored geometry only. Among the D112 requests, doc-4 is the only document with a rotated or wide page (checked by Claude; the agent's D3 report of two other rotated documents was wrong).
+  - **Verdict H1 (Orientation):** NOT SUPPORTED (page 1 was uprighted correctly to Rotate: 0).
+  - **Verdict H2 (Output cap truncation):** SUPPORTED as leading hypothesis (doc-4 page-1 answer hit the 3386 output token cap exactly, cutting off mid-JSON; documented as KI-006).
+  - **Verdict H3 (Malformed JSON / schema violation):** UNKNOWN / alternative hypothesis.
+  - **Token proposal:** Measured input tokens per page call across all D112 documents were exactly 3774 tokens (prompt ~1050 + image ~2724 tokens). The fixed 3500 image estimate overestimated image tokens by ~776 tokens. Using measured input tokens would give `8192 - 3774 - 256 = 4162` (capped at 4096), granting +710 tokens (+21% output room).
+
+- **D2 Implementation:**
+  - Attached `detail` and `call_name` to `InvalidOutput` in `backend/reconbench_app/ai/contracts.py`.
+  - Added sanitized reason codes to all 7 `openai_compat._result` branches: `body_not_json`, `body_not_object`, `no_message`, `empty_content`, `thinking_leak`, `at_output_cap`, `not_json`.
+  - Added sanitized reason codes to post-parsing: `merge_page_answers` (`missing_page_answer`, `bad_page_answer_type`, `duplicate_line_index`, `line_not_object`, etc.), `validate_vision` (`ungrounded`).
+  - Worker logs WARNING `vision_invalid_output request=<uuid> call=<call> detail=<detail>`.
+  - Fallback label for `InvalidOutput` when failing call isn't known is `"unknown"` (kept index-based for `ProviderFailure`).
+  - 14 unit tests added in `backend/tests/unit/test_ai_openai_compat.py`; all passed. Checks passed (`mypy --strict core`, app mypy <= 80 baseline, ruff clean, purity/rules-hash/engine-version clean, `test_pd3a_no_ai_calls.py` clean on disposable DB).
+
+- **D3 Deploy:**
+  - Backup: `pg_dump -Fc` to `C:\Users\jainm\reconbench-archive\live-db-20261030-b8.dump` (4,928,517 bytes). Test-restored in throwaway container `reconbench-restore-test` with 100% exact table row counts across all 59 tables.
+  - Commit: `3bad341` (`Step 8 D2: log invalid_output failure detail and failing call for AI reading`).
+  - Tags: `:pre-b8` rollback tags added to existing images; built fresh images; ran setup container (0036 verified); recreated `api`, `worker`, `ai-worker`.
+  - Health check: `GET http://127.0.0.1:8000/readyz` returned HTTP 200 `{"status":"ready"}`. Container code verified: `vision_invalid_output` log line present at lines 393 and 434 of `runner.py` in `reconbench-ai-worker-1`.
+  - Local git tag added: `live-20261030-b8`.
+
+- **D3 Retry & UI Bug Discovery (KI-007):**
+  - Controlled AI window:
+    - 16:05:57 UTC: Owner toggled "Scanned invoices" to AI in Settings (`ai_setting` version 31, audited as `ai.scanned_invoice_reader_change` `01a18d96-c637-70cb-b803-fa00ebdc489c`).
+    - Owner clicked **Retry** on doc-4 in the web UI.
+    - Result: Request failed immediately with HTTP 422 `READING_RETRY_UNAVAILABLE` (*"AI reading is off or can't read this file. Choose Read with rules."*).
+    - Root cause diagnosed: `reconbench_app/api/application.py:104` instantiated `IngestionService` without passing `ai_hooks=ai_hooks` (unlike `jobs.py:248` and integration tests). Consequently, `self.ai_hooks` in the API process was `None`, causing `retry_reading` (`ingestion.py:5085`) to unconditionally reject the retry. Documented as **KI-007**.
+    - Agent reports (not checked by Claude) that with an `AiHookEnqueuer` passed, `vision_targets(...)` lists doc-4's version as a vision target. Claude confirmed the defect in code: `application.py:104` passes no `ai_hooks`, and `ingestion.py:5085` refuses whenever `hooks is None`. So Retry on beta has never worked since D110. The PD-2f integration tests build the service with hooks directly, so they don't cover the API wiring.
+    - Owner requested leaving code untouched for now and recording findings in the report.
+    - Resource usage: 0 of 1 budgeted requests used; 0 vLLM completions; 0 Gemini. `ai_request` row count remained at 126 (= $R_0$).
+    - Live switch: **left on AI at the end of D3.** The DB showed `scanned_invoice_reader = 'ai'`, last changed 16:05:57 UTC (version 31), with no later change. The agent's report and PROJECT_STATUS said "rules, version 32", which was wrong. 0 AI requests were made while the switch stayed on AI (count still 126 when Claude checked). The owner set it back to rules at 16:22:33 UTC (version 32; audit `ai.scanned_invoice_reader_change`). `ai_request` was still 126, so 0 AI requests were made while the switch was on AI (16:05:57–16:22:33 UTC). Checked by Claude.
+  - KI-006 (output cap) stays a strong hypothesis, not confirmed: the retry sent nothing, so no detail code was logged.
+

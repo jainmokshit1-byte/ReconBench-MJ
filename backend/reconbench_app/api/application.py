@@ -19,6 +19,7 @@ from reconbench_core.schema import CaseResult, LineResult
 from sqlalchemy import create_engine, text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from reconbench_app.ai.enqueue import AiHookEnqueuer
 from reconbench_app.ai.limits import load_limits
 from reconbench_app.ai.provider_connection import ProviderConnectionService
 from reconbench_app.ai.settings_service import AiServiceConfig, AiSettingsService
@@ -101,12 +102,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(SecurityHeadersMiddleware)
     app.state.auth_service = AuthService(engine, resolved_settings)
     app.state.configuration_service = ConfigurationService(engine)
+    ai_hooks = AiHookEnqueuer(
+        gate=resolved_settings.deployment_gate(),
+        queue=job_queue,
+        limits=lambda: load_limits(resolved_settings.ai_limits_file),
+        vision_reader_name=resolved_settings.vision_reader,
+    )
     app.state.ingestion_service = IngestionService(
         engine,
         file_storage,
         job_queue,
         ocr_languages=tuple(resolved_settings.pdf_ocr_languages.split("+")),
         einvoice_keys=einvoice_keys(resolved_settings.einvoice_public_key_file),
+        ai_hooks=ai_hooks,
         ai_limits=lambda: load_limits(resolved_settings.ai_limits_file),
     )
     app.state.mapping_service = MappingService(engine, job_queue)

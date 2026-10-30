@@ -1,5 +1,5 @@
 # Project status
-Last verified: 2026-10-30, commit fbf6fed live as live-20261030-b7 (D114), switch on rules; Step 7 Phase 3 deploy + PD-5a verified on beta (D114); CODEBASE_CONTEXT.md untracked
+Last verified: 2026-10-30, commit 3bad341 live as live-20261030-b8 (D115, not pushed), switch on rules (version 32, set back by the owner at 16:22:33 UTC); Step 8 diagnosis complete; CODEBASE_CONTEXT.md untracked
 
 ## Components
 Status: working-verified | implemented-untested | partial | stub | broken | not-found | unknown
@@ -24,12 +24,12 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - `make accuracy-bench` — not run: needs Docker worker image and owner's local truth set
 
 ## Active task
-- Step 7 Phase 3 complete (D114): Task 0 duplicate suggestion rows fixed; deployed to beta (tag live-20261030-b7); PD-5a click-through S1–S11 verified on beta with hard zeros intact (0 auto links, 0 false matched); optional AI block on beta (rules + AI versions, waiting state; KI-005 not exercised, stays open); live switch returned to rules (version 30).
-- Hand-off ready for owner review and decision on live switch from D112 / D114.
+- Step 8 complete (D115): doc-4 failure diagnosed; failure detail and failing call logging deployed (tag live-20261030-b8); retry attempt in D3 revealed API service `ai_hooks` wiring omission (KI-007); doc-4 output cap is a strong hypothesis (KI-006, not confirmed: the retry sent nothing); switch back on rules at 16:22:33 UTC (version 32); 0 AI requests in the AI window.
+- Hand-off ready for owner review and decision on live switch from D112 / D114 / D115.
 
 ## Next steps (max 5, highest value first)
-1. Owner decides live switch from D112 / D114 results (currently on rules, version 30).
-2. AI reading: 1 real failure of 10 in D112 (doc-4 `invalid_output`, 2 pages; page 1 scanned sideways, recorded rotation 270 and turned upright by the app (`document_page_image.render`); page 1's answer used exactly the per-call output cap of 3386 tokens (8192 window − prompt − 3500 image estimate), so it was almost certainly cut off; the detail code is not stored). Step 8 diagnosis: docs/claude/handoff-step8-diagnosis.md. The 2 `PROVIDER_UNAVAILABLE` were network errors on the owner's side and succeeded on retry. Diagnose doc-4, then a larger PD-5c run (n=10 is too small for the switch decision).
-3. Decide on KI-001 (internal server address in tracked files).
-4. Address pre-existing test failures (KI-003: test_ai_h1, test_page_split).
-5. KI-005 closes after the next AI reading on beta shows `ai_only` for an empty rules field.
+1. Fix KI-007 (wire `ai_hooks` in `backend/reconbench_app/api/application.py:104` so web UI Retry works) and retry doc-4 with output cap increase (KI-006).
+2. Larger PD-5c run (n=10 is too small for live switch decision).
+3. Owner decides live switch from D112 / D114 / PD-5c results.
+4. Decide on KI-001 (internal server address in tracked files).
+5. Address pre-existing test failures (KI-003: test_ai_h1, test_page_split).

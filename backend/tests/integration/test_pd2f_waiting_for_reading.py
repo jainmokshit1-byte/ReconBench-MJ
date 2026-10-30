@@ -9,6 +9,7 @@ an in-process mock.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -16,6 +17,7 @@ from uuid import UUID
 import httpx
 import pytest
 import sqlalchemy as sa
+from fastapi.testclient import TestClient
 from reconbench_app import reading_state
 from reconbench_app.ai import ledger
 from reconbench_app.ai.gate import DeploymentGate
@@ -23,11 +25,24 @@ from reconbench_app.ai.limits import AiLimits, LimitsState
 from reconbench_app.ai.worker.handlers import default_handlers
 from reconbench_app.ai.worker.openai_compat import OpenAICompatProvider
 from reconbench_app.ai.worker.runner import AiRequestRunner
+from reconbench_app.api.application import create_app
+from reconbench_app.authentication import COOKIE_NAME, AuthContext, AuthenticationCheck
+from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.mapping_service import MappingService
+from reconbench_app.settings import Settings
 from scripts.vision_fixtures import synthetic_invoice_pdf
 from sqlalchemy.engine import Engine
-from tests.integration.test_ai_vision import CSRF, World, _prepare, engine, keys, make_world
+from tests.integration.test_ai_vision import (
+    APPROVAL,
+    CSRF,
+    World,
+    _prepare,
+    engine,
+    forget_ai_values,
+    keys,
+    make_world,
+)
 from tests.integration.test_pd2c_pd2d_reading import (
     BASE_URL,
     LOCAL_MODEL,
@@ -36,7 +51,7 @@ from tests.integration.test_pd2c_pd2d_reading import (
 )
 from tests.support.scan_images import scanned_invoice_pdf
 
-__all__ = ["engine", "keys", "make_world"]
+__all__ = ["engine", "forget_ai_values", "keys", "make_world"]
 
 DOCUMENTS = metadata.tables["document"]
 REQUESTS = metadata.tables["ai_request"]
@@ -312,3 +327,112 @@ def test_an_older_failed_attempt_never_fails_a_retried_reading(
     with engine.begin() as connection:
         assert reading_state.fail_finished_readings(connection) == 0
     assert _reading(engine, document_id) == ("waiting", None)
+
+
+@pytest.fixture
+def api_client(engine: Engine) -> Callable[[World], TestClient]:
+    def _build(world: World, *, gate: str = "enabled") -> TestClient:
+        settings = Settings(
+            _env_file=None,
+            environment="ci",
+            database_url=engine.url.render_as_string(hide_password=False),
+            s3_endpoint_url="http://127.0.0.1:1",
+            s3_region="us-east-1",
+            s3_bucket="synthetic-vision",
+            s3_api_access_key="synthetic-access",
+            s3_api_secret_key="synthetic-secret",
+            public_base_url="https://example.invalid",
+            argon2_time_cost=1,
+            argon2_memory_cost_kib=8192,
+            argon2_parallelism=1,
+            ai_external_calls=gate,
+            ai_external_calls_approval_ref=APPROVAL if gate == "enabled" else None,
+            ai_vllm_calls="enabled",
+            ai_vllm_endpoints=BASE_URL,
+        )
+        app = create_app(settings)
+        context = AuthContext(
+            session_id=new_id(),
+            workspace_id=world.workspace_id,
+            user_id=world.user_id,
+            display_name="Synthetic vision tester",
+            role="manager",
+            csrf_token=CSRF,
+        )
+        app.state.auth_service.authenticate = (
+            lambda *args, **kwargs: AuthenticationCheck(context, True)
+        )
+        client = TestClient(app, base_url="https://testserver")
+        client.cookies.set(COOKIE_NAME, "synthetic-session", path="/api/v1")
+        return client
+
+    return _build
+
+
+def test_create_app_wires_ai_hooks_into_ingestion_service(
+    engine: Engine, forget_ai_values: Any
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="ci",
+        database_url=engine.url.render_as_string(hide_password=False),
+        s3_endpoint_url="http://127.0.0.1:1",
+        s3_region="us-east-1",
+        s3_bucket="synthetic-vision",
+        s3_api_access_key="synthetic-access",
+        s3_api_secret_key="synthetic-secret",
+        public_base_url="https://example.invalid",
+        argon2_time_cost=1,
+        argon2_memory_cost_kib=8192,
+        argon2_parallelism=1,
+    )
+    app = create_app(settings)
+    assert app.state.ingestion_service.ai_hooks is not None
+
+
+def test_api_retry_reading_succeeds_and_queues_vision_job_when_switch_on_ai(
+    engine: Engine, keys: Any, make_world: Any, api_client: Any, forget_ai_values: Any
+) -> None:
+    world = make_world()
+    forget_ai_values(world.workspace_id)
+    document_id = _failed_scan(engine, keys, world)
+    client = api_client(world)
+    response = client.post(
+        f"/api/v1/documents/{document_id}/reading/retry",
+        headers={"If-Match": _etag(world, document_id), "X-CSRF-Token": CSRF},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["document"]["reading_state"] == "waiting"
+    assert _reading(engine, document_id)[0] == "waiting"
+    with engine.connect() as connection:
+        count = connection.scalar(
+            sa.text(
+                "SELECT count(*) FROM procrastinate_jobs "
+                "WHERE task_name = 'reconbench.prepare_vision_pages' "
+                "AND args->>'workspace_id' = :ws"
+            ),
+            {"ws": str(world.workspace_id)},
+        )
+    assert count == 1
+
+
+def test_api_retry_reading_refused_when_switch_on_rules(
+    engine: Engine, keys: Any, make_world: Any, api_client: Any, forget_ai_values: Any
+) -> None:
+    world = make_world()
+    forget_ai_values(world.workspace_id)
+    document_id = _failed_scan(engine, keys, world)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.update(SETTINGS)
+            .where(SETTINGS.c.workspace_id == world.workspace_id)
+            .values(scanned_invoice_reader="rules", version=SETTINGS.c.version + 1)
+        )
+    client = api_client(world)
+    response = client.post(
+        f"/api/v1/documents/{document_id}/reading/retry",
+        headers={"If-Match": _etag(world, document_id), "X-CSRF-Token": CSRF},
+    )
+    assert response.status_code == 422 and response.json()["code"] == "reading_retry_unavailable"
+    assert _reading(engine, document_id)[0] == "failed"
+
