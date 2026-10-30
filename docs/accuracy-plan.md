@@ -1678,19 +1678,19 @@ PD-3b and PD-4c ride with the steps they depend on (PD-3b with step 6; PD-4c wit
 - **Files:** `web/src/pages/MappingPage.tsx`, `backend/reconbench_app/mapping_service.py`, `backend/reconbench_app/api/mapping.py`. **Acceptance:** unlink → undo restores the same pairing; link again on a rejected line → a confirmed link (audited); a duplicate attempt is refused; after a mapping re-run and a reload the state equals the screen; web tests. **Status:** pending (batch PD-B1).
 
 #### PD-4c — Method and provenance on screens and exports
-- **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** done (D107, D109, D113): method chip "Read by rules / Read by AI · <provider>" on the document page, "Reading Method" export column, and Field Origin sheet in export (D113; not deployed).
+- **Description:** method chip (rules / AI reading <provider>) and per-field origin on the document page, review and Excel export (Q13 accepted). **Deps:** PD-2a, PD-2c. **Tests:** export parity test with the new column (MT-12). **Status:** done (D107, D109, D113; deployed in D114): method chip "Read by rules / Read by AI · <provider>" on the document page, "Reading Method" export column, and Field Origin sheet in export.
 
 #### PD-4d — Verify AI-read fields (UI part of PD-2b)
 - **Description:** side by side AI value / OCR cross-check / page box; "Verify" per field and "Verify all" only where the AI and OCR values agree (Q8), with a count. **Deps:** PD-2b. **Status:** done (D104; live 29 Oct 2026, tag live-20261029-b3).
 
 #### PD-5a — End to end on a throwaway copy of live
-- **Description:** every scenario of the audit's §8 by clicking on a throwaway copy; web changes applied in one step after the gate. **Acceptance:** hard zeros 0; 0 `ai_request` for rules-read documents and from mapping/reconciliation; requests only to the active provider. **Status:** pending (step 7).
+- **Description:** every scenario of the audit's §8 by clicking on a throwaway copy; web changes applied in one step after the gate. **Acceptance:** hard zeros 0; 0 `ai_request` for rules-read documents and from mapping/reconciliation; requests only to the active provider. **Status:** done (D114: click-through S1–S11 verified on beta; hard zeros 0, Matched check vacuous: no matched case in the run; optional AI block run with 1 request, reused a Phase 1 invoice, KI-005 not exercised).
 
 #### PD-5b — Regression
-- **Description:** offline suite, integration suites, rules-path golden/bench hash identical, export parity, secret-leak tests, background jobs (PD-0b-1). **Status:** done in step 7 phase 2 (D113: offline suite 1502 passed, golden passed, integration tests on disposable DB passed, web checks clean; not deployed).
+- **Description:** offline suite, integration suites, rules-path golden/bench hash identical, export parity, secret-leak tests, background jobs (PD-0b-1). **Status:** done in step 7 phase 2 (D113: offline suite 1502 passed, golden passed, integration tests on disposable DB passed, web checks clean; deployed in D114).
 
 #### PD-5c — Comparative measurement (folds the WI-D5 truth set)
-- **Description:** the same unique scanned invoices through both switch positions in the app; per-field counts with n (D83); no accuracy claim before this; the switch stays on rules by default until this measures. **Approval:** vLLM budget set by Claude (one go, logged); Gemini only after O-25 is re-confirmed. **Status:** pending (step 7).
+- **Description:** the same unique scanned invoices through both switch positions in the app; per-field counts with n (D83); no accuracy claim before this; the switch stays on rules by default until this measures. **Approval:** vLLM budget set by Claude (one go, logged); Gemini only after O-25 is re-confirmed. **Status:** measured (D112; the live switch decision stays with the owner).
 
 ### 15.3 Existing cards: where they go
 

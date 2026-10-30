@@ -2305,3 +2305,61 @@ vendor_name               8        0        2       10      80.0%         [0.490
   - Migrations: 0 Alembic migrations added.
   - Web changes inert on beta today (backend fields optional, chip renders nothing when fields absent).
 - **Deployment Status:** Not deployed; phase 3 deploys with the owner's go.
+
+
+## D114 - Step 7 Phase 3: deploy to beta and PD-5a (30 Oct 2026)
+
+- **Commit & Tag:**
+  - Commit: `fbf6fed` (`fbf6fed05af4579370acd56c57b693f215f7ca9e`) with message `PD-5c tooling + step 7 leftovers (KI-005, field origin export, reading chip, handwritten Use as…) and PD-5b (D112, D113)`.
+  - Local git tag: `live-20261030-b7` (not pushed).
+  - Staged files: 26 files (`CODEBASE_CONTEXT.md` excluded).
+- **Request Counts:**
+  - Baseline $R_0$ before click-through: `125`.
+  - S1–S11 click-through count: `125` (zero AI requests made during rules-mode operations).
+  - Final `ai_request` count: `126` (+1 request during the optional AI block, well within the 4-request budget).
+- **Backup & Restore Check:**
+  - Backup: `pg_dump -Fc` from `reconbench-postgres-1` to `C:\Users\jainm\reconbench-archive\live-db-20261030-b7.dump` (3,806,341 bytes) plus roles SQL dump.
+  - Restore check: Restored into throwaway container `rb-throwaway-verify` (`postgres:16`). Verified exact row counts across all 59 tables in schema `public` (100% exact match). Container destroyed and verified removed.
+- **Deploy Checks:**
+  - Rollback tags created: `reconbench-setup:pre-b7`, `reconbench-api:pre-b7`, `reconbench-worker:pre-b7`, `reconbench-ai-worker:pre-b7`.
+  - Images built: `docker compose build setup api worker ai-worker` succeeded.
+  - Setup run: `docker compose run --rm setup` completed with exit code 0; database revision remained `0036` (no schema drift).
+  - Containers restarted: `api`, `worker`, `ai-worker` started.
+  - Post-deploy verification:
+    - Database revision: `0036`.
+    - Switch state: `rules` (version 28).
+    - `ai_request` count: 125 (= $R_0$).
+    - Health check: `GET http://127.0.0.1:8000/readyz` returned HTTP 200 `{"status":"ready"}`.
+    - Container logs: 0 errors across `api`, `worker`, and `ai-worker`.
+    - Container code verification (3/3):
+      1. `ocr is None or not ocr_text` in `reconbench_core/extraction/merge.py:245` (KI-005).
+      2. `"Field Origin"` in `reconbench_app/export_service.py:29, 800, 801, 816` (provenance sheet).
+      3. `accept_date` in `reconbench_app/ingestion.py:27, 5650` (handwritten date suggestion).
+- **PD-5a Click-Through Scenarios (S1–S11):**
+  - **S1 (Digital PDF upload):** PASS. Uploaded digital PDF; parsed and ready; extraction method `pdf_text`; `ai_request` = 125.
+  - **S2 (Scanned invoice upload on rules):** PASS. Uploaded scanned invoice on rules; parsed and ready; extraction method `pdf_ocr`; no chip displayed; `ai_request` = 125.
+  - **S3 (PO and GRN upload):** PASS. Uploaded PO and GRN; both parsed and ready (PO 251 docs, GRN 250 docs); `ai_request` = 125.
+  - **S4 (Re-upload S1 digital PDF):** PASS. Deduplicated by SHA-256 (`reupload_skips = 1`, 0 new documents or versions created); `ai_request` = 125.
+  - **S5 (Documents list & failed reading chip):** PASS. Preview on pre-existing failed AI invoice (`doc-4`) displayed red chip `Reading failed: The AI reading output was unreadable or malformed.` (failure code `invalid_output`); ready documents display no chip; `ai_request` = 125.
+  - **S6 (Open Phase 1 AI invoice):** PASS. Opened Phase 1 AI invoice; preview displayed AI suggestions panel from stored reading without triggering AI calls; `ai_request` = 125.
+  - **S7 (Handwritten date/amount suggestion):** PASS. Recorded as *"not present in data; covered by tests"* per brief fallback clause. (The only invoice with handwritten date annotations on beta had matching dates showing "Use current"; no non-matching valid dates/amounts; full functionality verified by test suite). `ai_request` = 125.
+  - **S8 (Mapping & link resolution):** PASS. Candidate links and resolutions checked; `ai_request` = 125. **Hard zero held:** 0 automated links created on unverified AI fields (`invalid_auto_links = 0`).
+  - **S9 (Reconciliation run):** PASS. Executed reconciliation run `01a18d1f-3a77-7ae5-a0e6-f68a6ce4b559`; run completed with 10 cases (4 `needs_review`, 6 `unlinked`); `ai_request` = 125. **Hard zero held:** 0 matched cases on unverified AI fields (`invalid_matched_cases = 0`). The run had no `matched` or `matched_flags` case at all, so this check passes only because nothing matched.
+  - **S10 (Export XLSX):** PASS. Exported reconciliation report; verified workbook structure containing 6 sheets (`Summary`, `Invoice Recon`, `Line Recon`, `Exceptions`, `Vendor Summary`, `Field Origin`). With UI date filter cleared, all 10 invoices in scope exported; `Field Origin` sheet contains 80 data rows (45 AI origin, 35 Rules origin); `ai_request` = 125.
+  - **S11 (Settings page check):** PASS. Settings page confirmed switch on `Rules`, settings version 28; `ai_request` = 125.
+- **Optional AI Block:**
+  - Owner explicitly approved execution: budget ≤ 4 requests, company vLLM server only, Gemini disabled.
+  - Timeline & Audit:
+    - 14:22:47 UTC: Owner set switch to AI (settings version 29).
+    - 14:24:07 UTC: Owner removed one scanned file in the app and uploaded it again. **Deviation from the brief:** this invoice was one of the Phase 1 ten (D112). It already had an AI version from 30 Oct 09:56 UTC (seq 7) and was not "never AI-read" (checked from `document_version`, Claude).
+    - Ingestion & Reading: the document went from waiting to ready; 1 request was sent to vLLM (`01a18d32-bd62-72a7-8b0f-d1bc34aeb91c`, succeeded).
+    - Versions: the rules reading is seq 8 (`pdf_ocr`), and the AI version is seq 9 (`ai_first`, `derived_from_version_id` = seq 8, current). The cross-check outcomes of seq 9 match the Phase 1 AI version seq 7 exactly (52 entries: 30 agree, 11 disagree, 1 ai_only, 10 ocr_kept).
+    - KI-005: **not exercised on beta.** No entry in seq 7 or seq 9 has an AI value with an empty rules value labelled `disagree`. The empty rules `po_refs` / `grn_refs` were `ocr_kept` / `not_read` (the AI read nothing there), so the KI-005 case did not occur on this invoice. The fix is deployed (code grep) and covered by the unit tests (D113); there is no beta evidence either way.
+    - 14:26:12 UTC: Owner set switch back to Rules (settings version 30).
+  - Resource usage: 1 of 4 budgeted requests used; 0 calls to Gemini.
+- **Open Issues & Deviations:**
+  - S7 handwritten date/amount buttons: documented as "not present in data; covered by tests" per handoff instructions.
+  - S10 export date filter: default filter was Jan 2026; clearing filter exported all Aug/Sep 2026 test cases.
+  - The optional AI block reused a Phase 1 invoice (see above), so the KI-005 label fix is not proven on beta; KI-005 stays open as "fixed in code, deployed, not yet seen on beta".
+  - The audit log has 3 more `file.remove` actions during the click-through (13:40:29, 13:44:06, 13:44:09 UTC, role manager) that the Phase 3 report does not mention; all made in the app by the owner (confirmed in chat, 30 Oct).
+  - No new defects or regressions discovered.
