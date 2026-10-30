@@ -49,6 +49,9 @@ class Prepared:
     # (digest, cache key, input limits); empty ``parts`` sends ``payload`` once.
     parts: tuple[PromptPayload, ...] = ()
     merge_outputs: Callable[[Sequence[str]], str] | None = None
+    # Semantic name for each entry in `parts`, e.g. `("page 1", "page 2", "band")`.
+    # Empty means names are not set; the runner logs the 1-based index instead.
+    call_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

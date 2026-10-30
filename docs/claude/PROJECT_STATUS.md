@@ -29,7 +29,7 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 
 ## Next steps (max 5, highest value first)
 1. Owner decides live switch from D112 / D114 results (currently on rules, version 30).
-2. Owner pushes fbf6fed and tag live-20261030-b7 (plus docs commit).
+2. AI reading: 1 real failure of 10 in D112 (doc-4 `invalid_output`, 2 pages; page 1 scanned sideways, recorded rotation 270 and turned upright by the app (`document_page_image.render`); page 1's answer used exactly the per-call output cap of 3386 tokens (8192 window − prompt − 3500 image estimate), so it was almost certainly cut off; the detail code is not stored). Step 8 diagnosis: docs/claude/handoff-step8-diagnosis.md. The 2 `PROVIDER_UNAVAILABLE` were network errors on the owner's side and succeeded on retry. Diagnose doc-4, then a larger PD-5c run (n=10 is too small for the switch decision).
 3. Decide on KI-001 (internal server address in tracked files).
 4. Address pre-existing test failures (KI-003: test_ai_h1, test_page_split).
 5. KI-005 closes after the next AI reading on beta shows `ai_only` for an empty rules field.

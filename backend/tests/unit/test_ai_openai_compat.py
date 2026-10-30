@@ -9,8 +9,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
+import uuid
 from dataclasses import replace
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -38,10 +41,11 @@ from reconbench_app.ai.limits import (
     CallKindLimits,
     local_output_budget,
 )
-from reconbench_app.ai.prompts import vision_prompt
+from reconbench_app.ai.prompts import PromptPayload, vision_prompt
 from reconbench_app.ai.provider import ProviderFailure, ProviderImage, ProviderRequest
 from reconbench_app.ai.worker.config import AiWorkerSettings, AiWorkerStartupError
 from reconbench_app.ai.worker.gemini import GeminiProvider
+from reconbench_app.ai.worker.handlers import Prepared
 from reconbench_app.ai.worker.openai_compat import (
     SAMPLING_PROFILES,
     SEED,
@@ -50,6 +54,7 @@ from reconbench_app.ai.worker.openai_compat import (
     sanitize_detail,
 )
 from reconbench_app.ai.worker.providers import build_providers
+from reconbench_app.ai.worker.runner import AiRequestRunner
 from reconbench_app.extraction.vision import vision_reader
 from reconbench_core.extraction.vision import merge_page_readings
 
@@ -692,3 +697,296 @@ def test_local_reader_gets_one_prompt_per_page() -> None:
     assert vision.page_prompts("invoice", pages, gemini) == ()
     gone = [pages[0], replace(pages[1], data=None)]
     assert vision.page_prompts("invoice", gone, local) is None
+
+
+# ------------------------------------------------ failure detail codes and runner logging
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_detail"),
+    [
+        (httpx.Response(200, content=b"not json"), "body_not_json"),
+        (httpx.Response(200, json=[1, 2]), "body_not_object"),
+        (httpx.Response(200, json={"choices": []}), "no_message"),
+        (httpx.Response(200, json=_completion(content="")), "empty_content"),
+        (httpx.Response(200, json=_completion("Thinking Process:\n1. step")), "thinking_leak"),
+        (
+            httpx.Response(200, json=_completion('{"status":', finish_reason="length")),
+            "at_output_cap",
+        ),
+        (httpx.Response(200, json=_completion("broken json {")), "not_json"),
+    ],
+)
+def test_openai_compat_result_records_detail_code_for_every_invalid_output_branch(
+    response: httpx.Response, expected_detail: str
+) -> None:
+    provider = _provider(_Recorder(response))
+    with pytest.raises(ProviderFailure) as caught:
+        provider.complete(_request(), api_key="")
+    assert caught.value.code == "invalid_output"
+    assert caught.value.detail == expected_detail
+    assert "not json" not in str(caught.value)
+
+
+def _run_vision_harness(
+    responses: list[httpx.Response | Exception],
+    *,
+    pages: tuple[int, ...] = (1,),
+    has_band: bool = False,
+    validate_side_effect: Exception | None = None,
+) -> tuple[uuid.UUID, list[logging.LogRecord]]:
+    rec = _Recorder(*responses)
+    provider = OpenAICompatProvider(BASE_URL, ALLOWED, inner_transport=httpx.MockTransport(rec))
+    provider._context_windows[MODEL] = 8_192
+
+    parts = []
+    call_names = []
+    for p in pages:
+        parts.append(
+            PromptPayload(
+                "sys", f"in {p}", {}, (ProviderImage(f"Page {p}", "image/jpeg", b"x", "h"),)
+            )
+        )
+        call_names.append(f"page {p}")
+    if has_band:
+        parts.append(
+            PromptPayload("sys", "in band", {}, (ProviderImage("Band", "image/jpeg", b"x", "h"),))
+        )
+        call_names.append("band")
+
+    def merge_outputs(output_texts: list[str]) -> str:
+        if has_band:
+            return vision.merge_answers_with_band(output_texts, pages=pages, band_page=pages[0])
+        return vision.merge_page_answers(output_texts, pages=pages)
+
+    prep = Prepared(
+        payload=parts[0],
+        output_kind="h6_vision",
+        max_output_tokens=1_000,
+        parts=tuple(parts),
+        merge_outputs=merge_outputs,
+        call_names=tuple(call_names),
+    )
+
+    mock_handler = MagicMock()
+    mock_handler.prepare.return_value = prep
+    mock_handler.is_current.return_value = True
+    if validate_side_effect:
+        mock_handler.validate.side_effect = validate_side_effect
+    else:
+        mock_handler.validate.return_value = MagicMock(accepted=True)
+
+    req_id = uuid.uuid4()
+    req_row = {
+        "id": req_id,
+        "workspace_id": uuid.uuid4(),
+        "hook": "h6_vision",
+        "call_kind": None,
+        "provider": "vllm",
+        "model": MODEL,
+        "request_state": "queued",
+        "subject_type": "document_version",
+        "reader_params": {},
+    }
+
+    runner = AiRequestRunner(
+        engine=MagicMock(),
+        keyring=MagicMock(),
+        gate=MagicMock(),
+        limits=MagicMock(),
+        prices=MagicMock(return_value=None),
+        providers={"vllm": provider},
+        handlers={"h6_vision": mock_handler},
+    )
+    runner.gate.refusal.return_value = None
+    runner._row = MagicMock(return_value=req_row)
+    runner.limits.return_value = MagicMock(limits=MagicMock())
+    runner.limits.return_value.limits.for_kind.return_value = MagicMock(
+        max_input_bytes=100_000,
+        max_pages=10,
+        max_image_bytes=100_000,
+        max_output_tokens=1_000,
+        max_concurrency=1,
+        backoff_seconds=30,
+        image_tokens_estimate=1_000,
+    )
+    runner.limits.return_value.limits.timeout_for.return_value = 60
+
+    log_records: list[logging.LogRecord] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            log_records.append(record)
+
+    handler = _CaptureHandler()
+    logger = logging.getLogger("reconbench_app.ai.worker.runner")
+    logger.addHandler(handler)
+    old_level = logger.level
+    logger.setLevel(logging.WARNING)
+
+    try:
+        with (
+            patch(
+                "reconbench_app.ai.worker.runner.load_settings",
+                return_value=MagicMock(reads_scanned_invoices=True, vllm=None),
+            ),
+            patch("reconbench_app.ai.worker.runner.load_provider_key", return_value=None),
+            patch("reconbench_app.ai.worker.runner.request_blocker", return_value=None),
+            patch(
+                "reconbench_app.ai.worker.runner.ledger.reserve",
+                return_value=MagicMock(status="reserved"),
+            ),
+            patch("reconbench_app.ai.worker.runner.ledger.mark_sending", return_value=True),
+            patch("reconbench_app.ai.worker.runner.ledger.finish"),
+            patch("reconbench_app.ai.worker.runner.record_test_failure"),
+            patch.object(runner, "_call_log"),
+        ):
+            runner.run(req_id)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+    return req_id, log_records
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_detail"),
+    [
+        (httpx.Response(200, content=b"<html>error 502</html>"), "body_not_json"),
+        (httpx.Response(200, json=[1, 2, 3]), "body_not_object"),
+        (httpx.Response(200, json={"choices": []}), "no_message"),
+        (httpx.Response(200, json=_completion("")), "empty_content"),
+        (httpx.Response(200, json=_completion("Thinking Process:\n1. think")), "thinking_leak"),
+        (httpx.Response(200, json=_completion('{"cut":', finish_reason="length")), "at_output_cap"),
+        (httpx.Response(200, json=_completion("broken json {")), "not_json"),
+    ],
+)
+def test_runner_logs_warning_for_each_provider_result_branch(
+    response: httpx.Response, expected_detail: str
+) -> None:
+    req_id, records = _run_vision_harness([response])
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    msg = vision_logs[0].getMessage()
+    assert msg == f"vision_invalid_output request={req_id} call=page 1 detail={expected_detail}"
+    assert "error 502" not in msg
+
+
+def test_runner_logs_warning_without_leaking_answer_content() -> None:
+    secret_text = "SECRET_INVOICE_DATA_DO_NOT_LOG"
+    broken_json = f'{{"invoice_num": "{secret_text}"'
+    req_id, records = _run_vision_harness([httpx.Response(200, json=_completion(broken_json))])
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    msg = vision_logs[0].getMessage()
+    assert msg == f"vision_invalid_output request={req_id} call=page 1 detail=not_json"
+    assert secret_text not in msg
+
+
+def test_runner_names_failing_page_for_multi_page_document() -> None:
+    valid_page = (
+        '{"doc_kind":"invoice","pages":[{"page":1,"kind":"invoice"}],'
+        '"fields":[],"lines":[],"annotations":[],"unreadable":[]}'
+    )
+    responses = [
+        httpx.Response(200, json=_completion(valid_page)),
+        httpx.Response(200, json=_completion('{"cut":', finish_reason="length")),
+    ]
+    req_id, records = _run_vision_harness(responses, pages=(1, 2))
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    assert (
+        vision_logs[0].getMessage()
+        == f"vision_invalid_output request={req_id} call=page 2 detail=at_output_cap"
+    )
+
+
+def test_runner_names_band_call_when_band_fails() -> None:
+    valid_p1 = (
+        '{"doc_kind":"invoice","pages":[{"page":1,"kind":"invoice"}],'
+        '"fields":[],"lines":[],"annotations":[],"unreadable":[]}'
+    )
+    valid_p2 = (
+        '{"doc_kind":"invoice","pages":[{"page":2,"kind":"invoice"}],'
+        '"fields":[],"lines":[],"annotations":[],"unreadable":[]}'
+    )
+    responses = [
+        httpx.Response(200, json=_completion(valid_p1)),
+        httpx.Response(200, json=_completion(valid_p2)),
+        httpx.Response(200, json=_completion("not json at all")),
+    ]
+    req_id, records = _run_vision_harness(responses, pages=(1, 2), has_band=True)
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    assert (
+        vision_logs[0].getMessage()
+        == f"vision_invalid_output request={req_id} call=band detail=not_json"
+    )
+
+
+def test_runner_logs_schema_violation_after_parsing() -> None:
+    # Missing required doc_kind
+    broken_schema = '{"pages":[],"fields":[],"lines":[],"annotations":[]}'
+    req_id, records = _run_vision_harness([httpx.Response(200, json=_completion(broken_schema))])
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    assert (
+        vision_logs[0].getMessage()
+        == f"vision_invalid_output request={req_id} call=page 1 detail=schema:doc_kind: missing"
+    )
+
+
+def test_runner_logs_ungrounded_after_validation() -> None:
+    valid_page = (
+        '{"doc_kind":"invoice","pages":[{"page":1,"kind":"invoice"}],'
+        '"fields":[],"lines":[],"annotations":[],"unreadable":[]}'
+    )
+    req_id, records = _run_vision_harness(
+        [httpx.Response(200, json=_completion(valid_page))],
+        validate_side_effect=InvalidOutput(
+            "ungrounded", "no reading survived", detail="ungrounded"
+        ),
+    )
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    assert (
+        vision_logs[0].getMessage()
+        == f"vision_invalid_output request={req_id} call=page 1 detail=ungrounded"
+    )
+
+
+def test_runner_logs_transport_failure() -> None:
+    req_id, records = _run_vision_harness([httpx.ReadTimeout("read timeout")])
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    assert (
+        vision_logs[0].getMessage()
+        == f"vision_invalid_output request={req_id} call=page 1 detail=timeout"
+    )
+
+
+def test_runner_logs_unknown_when_failing_call_not_identifiable() -> None:
+    valid_p1 = (
+        '{"doc_kind":"invoice","pages":[{"page":1,"kind":"invoice"}],'
+        '"fields":[],"lines":[],"annotations":[],"unreadable":[]}'
+    )
+    valid_p2 = (
+        '{"doc_kind":"invoice","pages":[{"page":2,"kind":"invoice"}],'
+        '"fields":[],"lines":[],"annotations":[],"unreadable":[]}'
+    )
+    req_id, records = _run_vision_harness(
+        [
+            httpx.Response(200, json=_completion(valid_p1)),
+            httpx.Response(200, json=_completion(valid_p2)),
+        ],
+        pages=(1, 2),
+        validate_side_effect=InvalidOutput(
+            "ungrounded", "no reading survived", detail="ungrounded"
+        ),
+    )
+    vision_logs = [r for r in records if "vision_invalid_output" in r.getMessage()]
+    assert len(vision_logs) == 1
+    assert (
+        vision_logs[0].getMessage()
+        == f"vision_invalid_output request={req_id} call=unknown detail=ungrounded"
+    )

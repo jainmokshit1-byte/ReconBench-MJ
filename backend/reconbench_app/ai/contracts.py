@@ -154,9 +154,18 @@ _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 class InvalidOutput(ValueError):
     """The provider output cannot be used; ``code`` is a sanitized outcome."""
 
-    def __init__(self, code: Literal["invalid_output", "ungrounded"], reason: str) -> None:
+    def __init__(
+        self,
+        code: Literal["invalid_output", "ungrounded"],
+        reason: str,
+        *,
+        detail: str | None = None,
+        call_name: str | None = None,
+    ) -> None:
         self.code = code
         self.reason = reason
+        self.detail = detail or reason
+        self.call_name = call_name
         super().__init__(f"{code}: {reason}")
 
 
@@ -545,22 +554,28 @@ def parse_output(kind: str, output_text: str) -> _Strict:
 
     model = OUTPUT_MODELS.get(kind)
     if model is None:
-        raise InvalidOutput("invalid_output", "unknown output kind")
+        raise InvalidOutput("invalid_output", "unknown output kind", detail="unknown_output_kind")
     if len(output_text.encode("utf-8")) > OUTPUT_BYTE_LIMITS.get(kind, MAX_OUTPUT_TEXT_BYTES):
-        raise InvalidOutput("invalid_output", "output too large")
+        raise InvalidOutput("invalid_output", "output too large", detail="output_too_large")
     try:
         raw = json.loads(output_text, object_pairs_hook=_reject_duplicate_keys)
     except ValueError as exc:
-        raise InvalidOutput("invalid_output", "output is not a single JSON object") from exc
+        raise InvalidOutput(
+            "invalid_output", "output is not a single JSON object", detail="not_json_object"
+        ) from exc
     if not isinstance(raw, dict):
-        raise InvalidOutput("invalid_output", "output is not a JSON object")
+        raise InvalidOutput(
+            "invalid_output", "output is not a JSON object", detail="not_json_object"
+        )
     dropped: Counter[str] = Counter()
     if model is VisionOutput:
         raw = _vision_items(raw, dropped)
     try:
         parsed = model.model_validate(raw)
     except ValidationError as exc:
-        raise InvalidOutput("invalid_output", "output violates the schema") from exc
+        patterns = error_patterns(exc)
+        detail = f"schema:{patterns[0]}" if patterns else "schema_violation"
+        raise InvalidOutput("invalid_output", "output violates the schema", detail=detail) from exc
     if isinstance(parsed, VisionOutput) and dropped:
         parsed._schema_dropped = dict(dropped)
     return parsed

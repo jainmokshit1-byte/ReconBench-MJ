@@ -399,15 +399,19 @@ class OpenAICompatProvider:
         try:
             body = response.json()
         except ValueError:
-            raise ProviderFailure("invalid_output", delivery="responded") from None
+            raise ProviderFailure(
+                "invalid_output", delivery="responded", detail="body_not_json"
+            ) from None
         if not isinstance(body, Mapping):
-            raise ProviderFailure("invalid_output", delivery="responded")
+            raise ProviderFailure("invalid_output", delivery="responded", detail="body_not_object")
         usage = _usage(body)
         choices = body.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices else None
         message = choice.get("message") if isinstance(choice, Mapping) else None
         if not isinstance(message, Mapping):
-            raise ProviderFailure("invalid_output", delivery="responded", usage=usage)
+            raise ProviderFailure(
+                "invalid_output", delivery="responded", usage=usage, detail="no_message"
+            )
         assert isinstance(choice, Mapping)
         finish_reason = choice.get("finish_reason")
         reasoning = message.get("reasoning_content") or message.get("reasoning")
@@ -417,7 +421,9 @@ class OpenAICompatProvider:
             _LOGGER.warning("vllm_reasoning_present count=%d", self.counters["reasoning_present"])
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
-            raise ProviderFailure("invalid_output", delivery="responded", usage=usage)
+            raise ProviderFailure(
+                "invalid_output", delivery="responded", usage=usage, detail="empty_content"
+            )
         if content.lstrip().startswith(THINKING_PREFIXES):
             self.counters["thinking_leak"] += 1
             _LOGGER.warning("vllm_thinking_leak count=%d", self.counters["thinking_leak"])

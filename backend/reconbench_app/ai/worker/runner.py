@@ -9,6 +9,7 @@ discarded and the reason recorded.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -52,6 +53,8 @@ from reconbench_app.ai.worker.handlers import Handler, Prepared, Skip, record_te
 from reconbench_app.ai.worker.key_open import Keyring, KeyUnreadable
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
+
+_LOGGER = logging.getLogger(__name__)
 
 SKIP_NO_HANDLER = "NO_HANDLER"
 SKIP_LIMITS_NOT_CONFIGURED = "LIMITS_NOT_CONFIGURED"
@@ -357,8 +360,10 @@ class AiRequestRunner:
         started = time.monotonic()
         results: list[ProviderResult] = []
         usage: ProviderUsage | None = None
+        failed_call_index: int = 0
         try:
-            for call in calls:
+            for index, call in enumerate(calls):
+                failed_call_index = index
                 result = provider.complete(
                     ProviderRequest(
                         model=str(request["model"]),
@@ -377,6 +382,19 @@ class AiRequestRunner:
         except ProviderFailure as failure:
             del api_key
             failure.usage = _add_usage(usage, failure.usage)
+            if request["hook"] == VISION_HOOK:
+                call_label = (
+                    prepared.call_names[failed_call_index]
+                    if prepared.call_names and failed_call_index < len(prepared.call_names)
+                    else f"page {failed_call_index + 1}"
+                )
+                detail = failure.detail or failure.code
+                _LOGGER.warning(
+                    "vision_invalid_output request=%s call=%s detail=%s",
+                    request["id"],
+                    call_label,
+                    detail,
+                )
             return self._record_failure(request, prepared, failure, digest, started, job_id, prices)
         del api_key
         latency_ms = int((time.monotonic() - started) * 1_000)
@@ -400,6 +418,24 @@ class AiRequestRunner:
             invalid: InvalidOutput | None = None
         except InvalidOutput as exc:
             invalid, parsed, validated = exc, None, None
+            if request["hook"] == VISION_HOOK:
+                raw_call = cast(str | None, getattr(exc, "call_name", None))
+                call_label = (
+                    raw_call
+                    if raw_call
+                    else (
+                        prepared.call_names[0]
+                        if prepared.call_names and len(prepared.call_names) == 1
+                        else "unknown"
+                    )
+                )
+                detail = cast(str | None, getattr(exc, "detail", None)) or exc.reason
+                _LOGGER.warning(
+                    "vision_invalid_output request=%s call=%s detail=%s",
+                    request["id"],
+                    call_label,
+                    detail,
+                )
 
         with self.engine.begin() as connection:
             ledger_usage = (

@@ -535,10 +535,20 @@ def merge_page_answers(output_texts: Sequence[str], *, pages: Sequence[int]) -> 
     """
 
     if len(output_texts) != len(pages):
-        raise InvalidOutput("invalid_output", "one answer per page is required")
+        raise InvalidOutput(
+            "invalid_output", "one answer per page is required", detail="page_count_mismatch"
+        )
     answers = []
     for page, text in zip(pages, output_texts, strict=True):
-        parse_output(HOOK, text)
+        try:
+            parse_output(HOOK, text)
+        except InvalidOutput as exc:
+            raise InvalidOutput(
+                exc.code,
+                exc.reason,
+                detail=exc.detail,
+                call_name=f"page {page}",
+            ) from exc
         answers.append((page, json.loads(text)))
     merged = merge_page_readings(answers)
     if merged.dropped_off_page:
@@ -710,7 +720,9 @@ def validate_vision(output: VisionOutput, context: VisionContext) -> VisionValid
         dropped.update(output.schema_dropped)
         check = replace(check, dropped=MappingProxyType(dict(dropped)))
     if reading.item_count and not check.accepted_count:
-        raise InvalidOutput("ungrounded", "no reading survived the page, box and rule checks")
+        raise InvalidOutput(
+            "ungrounded", "no reading survived the page, box and rule checks", detail="ungrounded"
+        )
     document = vision_document(
         check,
         DocType(context.doc_type),

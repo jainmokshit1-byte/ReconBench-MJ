@@ -101,6 +101,8 @@ class VisionReadHandler:
         page_numbers = [page.page for page in pages]
         merge_outputs = partial(vision.merge_page_answers, pages=page_numbers) if parts else None
         band = _band_part(subject.doc_type, pages, reader) if parts else None
+        # Names for the runner's WARNING log (vision_invalid_output call=<name>).
+        call_names: tuple[str, ...] = tuple(f"page {p}" for p in page_numbers)
         if band is not None:
             # The band answer adds annotations only; the full-page fields are unchanged.
             parts = (*parts, band)
@@ -111,6 +113,7 @@ class VisionReadHandler:
                 band_top=BAND_TOP,
                 box_order=reader.box_order,
             )
+            call_names = (*call_names, "band")
         local = not reader.external
         return Prepared(
             payload=payload,
@@ -134,6 +137,7 @@ class VisionReadHandler:
             },
             parts=parts,
             merge_outputs=merge_outputs,
+            call_names=call_names,
         )
 
     def is_current(self, connection: Connection, request: Any) -> bool:
