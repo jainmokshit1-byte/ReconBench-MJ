@@ -597,11 +597,13 @@ def send(
         call_cap = cap
         window = context_window(model) if context_window is not None else None
         if arm.local and isinstance(window, int):
+            from reconbench_app.ai.worker.runner import _local_image_tokens
+
             budget = min(
                 local_output_budget(
                     context_window=window,
                     prompt_bytes=_prompt_bytes(call),
-                    image_tokens=len(call.images) * (kind.image_tokens_estimate or 0),
+                    image_tokens=_local_image_tokens(call, kind),
                 )
                 for call in calls
             )

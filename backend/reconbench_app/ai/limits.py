@@ -42,6 +42,8 @@ class CallKindLimits(_Frozen):
     # image is *estimated* to cost (no local tokenizer; the owner probe measures it).
     max_image_bytes: int | None = Field(default=None, ge=10_000, le=20_000_000)
     image_tokens_estimate: int | None = Field(default=None, ge=1, le=20_000)
+    # Self-hosted vision server: one image token per image_token_px x image_token_px pixels.
+    image_token_px: int | None = Field(default=None, ge=8, le=128)
     # Overrides the global call timeout for this kind. Only ``*_local`` kinds may go
     # above 120 s (the Gemini transport guard caps it there).
     call_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
@@ -83,6 +85,9 @@ class AiLimits(_Frozen):
         max_image_bytes=4_000_000,
         # About 3-4k tokens per full page image (inferred, plan §0.5; the smoke test measures it).
         image_tokens_estimate=3_500,
+        # Measured on beta (D118): round(w/32)·round(h/32) tokens per image;
+        # ceil is used as an upper bound.
+        image_token_px=32,
         call_timeout_seconds=300,
         max_concurrency=1,
         backoff_seconds=30,
@@ -217,6 +222,13 @@ def estimate_reservation(
     )
 
 
+def local_image_tokens(width: int, height: int, *, token_px: int) -> int:
+    """Image tokens a self-hosted vision server spends on one image: one per
+    ``token_px`` x ``token_px`` block, each side rounded up (an upper bound of the
+    server's own rounding; measured on beta, D118)."""
+    return -(-width // token_px) * -(-height // token_px)
+
+
 def local_output_budget(*, context_window: int, prompt_bytes: int, image_tokens: int) -> int:
     """Answer tokens left in a self-hosted model's context window (plan §0.5).
 
@@ -260,6 +272,7 @@ __all__ = [
     "estimate_reservation",
     "load_limits",
     "load_prices",
+    "local_image_tokens",
     "local_output_budget",
     "usd_cap_offered",
 ]

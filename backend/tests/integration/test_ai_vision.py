@@ -43,7 +43,12 @@ from reconbench_app.ai.contracts import vision_response_schema, vision_response_
 from reconbench_app.ai.enqueue import AiHookEnqueuer
 from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.key_seal import SealingPublicKey, key_hint, seal
-from reconbench_app.ai.limits import AiLimits, LimitsState
+from reconbench_app.ai.limits import (
+    AiLimits,
+    LimitsState,
+    local_image_tokens,
+    local_output_budget,
+)
 from reconbench_app.ai.provider import ProviderRequest, ProviderResult
 from reconbench_app.ai.runtime_checks import SettingsSnapshot, fingerprint_for
 from reconbench_app.ai.stub import ScriptedProvider
@@ -1282,7 +1287,20 @@ def test_vllm_reader_reads_one_page_per_call_and_feeds_the_same_pipeline(
     content = body["messages"][1]["content"]
     assert [part["type"] for part in content] == ["text", "text", "image_url"]
     assert content[1]["text"] == "Page 1"
-    assert 1_024 <= body["max_tokens"] <= AiLimits().h6_vision_local.max_output_tokens
+    # Sized from the real pixel size (KI-006): > 3386 and equals the computed budget
+    # (capped at 4096).
+    expected_image_tokens = local_image_tokens(page.width, page.height, token_px=32)
+    prompt_bytes = len(
+        (body["messages"][0]["content"] + content[0]["text"] + content[1]["text"]).encode("utf-8")
+    )
+    expected_budget = local_output_budget(
+        context_window=8_192,
+        prompt_bytes=prompt_bytes,
+        image_tokens=expected_image_tokens,
+    )
+    expected_cap = min(AiLimits().h6_vision_local.max_output_tokens, expected_budget)
+    assert body["max_tokens"] == expected_cap
+    assert body["max_tokens"] > 3386
     assert INVOICE_NO not in json.dumps(body["messages"][:1]) + content[0]["text"]
     band = json.loads(sent[2].read())
     assert band["response_format"]["json_schema"]["schema"] == vision_response_schema_v5(

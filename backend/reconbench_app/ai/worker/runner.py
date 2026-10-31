@@ -9,6 +9,7 @@ discarded and the reason recorded.
 
 from __future__ import annotations
 
+import io
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -18,6 +19,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import sqlalchemy as sa
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy.engine import Connection, Engine
 
 from reconbench_app.ai import cache as ai_cache
@@ -28,10 +30,12 @@ from reconbench_app.ai.endpoint_policy import EndpointNotAllowed
 from reconbench_app.ai.gate import SKIP_ENDPOINT_NOT_ALLOWED, DeploymentGate, payload_digest
 from reconbench_app.ai.limits import (
     MIN_LOCAL_OUTPUT_TOKENS,
+    CallKindLimits,
     LimitsState,
     PriceFile,
     cost_usd,
     estimate_reservation,
+    local_image_tokens,
     local_output_budget,
 )
 from reconbench_app.ai.prompts import PromptPayload, payload_bytes
@@ -53,6 +57,7 @@ from reconbench_app.ai.worker.handlers import Handler, Prepared, Skip, record_te
 from reconbench_app.ai.worker.key_open import Keyring, KeyUnreadable
 from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
+from reconbench_app.extraction.vision import VISION_RENDER
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +109,24 @@ def _prompt_bytes(payload: PromptPayload) -> int:
     text = payload.system_instruction + payload.input_text
     text += "".join(image.caption for image in payload.images)
     return len(text.encode("utf-8"))
+
+
+def _local_image_tokens(call: PromptPayload, kind_limits: CallKindLimits) -> int:
+    token_px = getattr(kind_limits, "image_token_px", None)
+    if not isinstance(token_px, int):
+        return len(call.images) * (kind_limits.image_tokens_estimate or 0)
+    total = 0
+    for image in call.images:
+        try:
+            with Image.open(io.BytesIO(image.data)) as im:
+                width, height = im.size
+        except (UnidentifiedImageError, OSError, ValueError):
+            total += local_image_tokens(
+                VISION_RENDER.max_side, VISION_RENDER.max_side, token_px=token_px
+            )
+        else:
+            total += local_image_tokens(width, height, token_px=token_px)
+    return total
 
 
 def _add_usage(total: ProviderUsage | None, usage: ProviderUsage | None) -> ProviderUsage | None:
@@ -291,7 +314,7 @@ class AiRequestRunner:
                 local_output_budget(
                     context_window=window,
                     prompt_bytes=_prompt_bytes(call),
-                    image_tokens=len(call.images) * (kind_limits.image_tokens_estimate or 0),
+                    image_tokens=_local_image_tokens(call, kind_limits),
                 )
                 for call in calls
             )

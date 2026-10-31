@@ -2493,3 +2493,89 @@ vendor_name               8        0        2       10      80.0%         [0.490
       - At 19:07 the stale consensus run's `mark_version_failed` changed nothing (`only_from=(WAITING,)`).
   - **Deviation:** the executing agent opened `.env` (twice) while looking for DB access, against CLAUDE.md and the brief. Its contents are not recorded here. Reported to the owner.
 
+
+
+## D117 - Step 9: Retry reaches consensus (KI-008) and the sweep gap (KI-009) (31 Oct 2026)
+
+- **Target & Fixes:**
+  - **Fix A (KI-008):**
+    - `backend/reconbench_app/ai/cache.py:120–125`: added `retry_cache_key(content_key: str, request_id: UUID) -> str`. It digests `{"content_key", "key_version": "retry-1", "request_id"}` and is listed in `__all__`.
+    - `backend/reconbench_app/ai/worker/runner.py:264–275`: a new `elif request["hook"] == VISION_HOOK and request.get("requested_by") is not None:` after the cacheable branch. It sets `cache_key = ai_cache.retry_cache_key(ai_cache.request_cache_key(request, digest), request_id)` and writes it to the request row, with no cache lookup. Automatic reads keep `request_cache_key` and the lookup. The existing store at `runner.py` (`cache_key is not None and parsed is not None`) then saves the Retry's answer under its own key. `consensus.py` and `ingestion.py` are unchanged.
+    - (Corrected by Claude from `git show 24e11ff`. The executing agent's STOP 2 report and its first D117 draft described a different signature and a `compute_cache_key` function that don't exist.)
+  - **Fix B (KI-009):**
+    - `backend/reconbench_app/reading_state.py:185–196`: `fail_finished_readings(connection, *, request_id: UUID)` now requires `request_id` and always appends `AND r.id = :request_id` to `_FAIL_FINISHED`. The no-filter form that re-checked every finished request is gone.
+    - `backend/reconbench_app/ai/ledger.py:532-573`: updated `sweep_requests` to return swept IDs via `.returning(REQUESTS.c.id)` and call `fail_finished_readings(connection, request_id=req_id)` for each swept request. All final-state writers (`_skip`, `release`, `finish`, `sweep_requests`) now pass `request_id`.
+
+- **Fail-on-HEAD Proof (T1, T3):**
+  - T1: `assert service._process(world.workspace_id, consensus_run_id) == "succeeded"` -> `AssertionError: assert 'stale' == 'succeeded'`
+  - T3: `assert _reading(engine, document_id) == ("waiting", None)` -> `AssertionError: assert ('failed', 'error') == ('waiting', None)`
+
+- **Tests & Counts:**
+  - New integration tests (4 in `backend/tests/integration/test_pd2f_waiting_for_reading.py`):
+    1. T1: `test_retry_finishes_and_consensus_creates_new_version`
+    2. T2: `test_retry_never_uses_cached_answer_and_consensus_reads_fresh`
+    3. T3: `test_sweep_in_gap_does_not_fail_retried_document`
+    4. T4: `test_sweep_fails_document_for_stuck_request_it_finishes`
+  - Changed existing tests (2):
+    - `test_retry_asks_the_active_provider_again_without_the_cache`: asserted attempt 2 `cache_key` is not None and differs from attempt 1.
+    - `test_an_older_failed_attempt_never_fails_a_retried_reading`: updated to call `ledger.sweep_requests(...)`.
+  - Integration per-file results on disposable DB (`rb-test-pg`, 127.0.0.1:15499):
+    - `test_pd2f_waiting_for_reading.py`: 18 passed, 0 failed (168.09s)
+    - `test_ai_vision.py`: 15 passed, 0 failed (62.31s)
+    - `test_ai_runner.py`: 32 passed, 0 failed (6.23s)
+    - `test_pd2c_pd2d_reading.py`: 9 passed, 0 failed (47.18s)
+    - `test_pd3a_no_ai_calls.py`: 3 passed, 0 failed (2.81s)
+    - `test_ai_h2.py`, `test_ai_h3.py`, `test_ai_h4.py`: 48 passed, 0 failed (11.44s)
+    - `test_ai_h1.py`: 15 passed, 1 failed (known KI-003: `test_ai_first_suggests_for_a_clean_pdf_and_leaves_the_rules_output_unchanged`)
+  - Offline suite: 1523 passed, 22 skipped in 277s.
+  - Disposable DB container removed: yes (`rb-test-pg` stopped and removed).
+
+- **Hygiene & Verification Checks:**
+  - `ruff check`: passed (0 errors).
+  - `ruff format --check`: passed (5 files checked).
+  - `mypy --strict core`: passed (40 files).
+  - app `mypy`: 80 errors in 13 files (matched 80-error baseline; 0 errors in touched files).
+  - `lint-imports`: 3 kept, 0 broken.
+  - Core purity: passed.
+  - Rules hash: `fc247f74f6e0b7a12d22ee363d7d9a4afdd3863135fddc72c1dd0a9338d69c3b` (verified unchanged).
+  - Engine version: passed (core unchanged from HEAD).
+
+- **Pre-deploy Checks & Backup:**
+  - Revision: `0036`, switch `rules` version `34`, open `ai_request`: 0, waiting jobs: 0, $R_0 = 127$. doc-4 state: `reading_state='failed'`, `reading_failure_code='invalid_output'`.
+  - Backup: `C:\Users\jainm\reconbench-archive\live-db-20261031-b10.dump` (4,929,977 bytes) and `live-db-20261031-b10-roles.sql` (1,543 bytes).
+  - Test-restore: Restored into `reconbench-restore-test`; exact 100% row count match across all 59 tables. Throwaway container removed.
+
+- **Commit & Deploy:**
+  - Commit hash: `24e11ff89916291412e13296c867e8708ab386df` (`24e11ff`).
+  - Rollback tags added: `reconbench-setup:pre-b10`, `reconbench-api:pre-b10`, `reconbench-worker:pre-b10`, `reconbench-ai-worker:pre-b10`.
+  - Rebuilt & restarted: `docker compose build setup api worker ai-worker`, `docker compose run --rm --no-deps setup` (revision remained `0036`), `docker compose up -d --no-deps api worker ai-worker`.
+  - Verification: revision `0036`, switch `rules` version `34`, `ai_request` = 127 ($R_0$), `/readyz` 200 OK (`{"status":"ready"}`), 0 errors in logs.
+  - Container greps: verified `retry_cache_key` in `runner.py:267` and `request_id: UUID)` in `reading_state.py:185` inside `reconbench-ai-worker-1`.
+  - Tag: `live-20261031-b10` created locally (not pushed).
+
+- **Step 4: doc-4 Retry Execution & Switch Timeline:**
+  - Budget: 1 `ai_request`, company vLLM only. **Requests used: 2 (budget exceeded by 1)**, both vLLM, 0 Gemini. The `ai_request` count went 127 → 129. The executing agent's report listed only the second request. (Checked by Claude in `ai_request` and `audit_log`.)
+  - Audit log timeline (all actions by the same manager account):
+    - `15:34:11.36 UTC`: `ai.scanned_invoice_reader_change` to `ai` (version 35).
+    - `15:34:24.44 UTC`: `document.reading_retry` on doc-4 (Retry 1).
+    - `15:34:35.75 UTC`: request `01a19299-31ff-71b3-a578-3d7bf9edef55` created. It finished at `15:35:52.83`: `failed` / `invalid_output`, 3774 in / 3386 out, non-null `cache_key`, null `ai_cache_id`. Log line: `call=page 1 detail=at_output_cap`.
+    - `15:37:28.11 UTC`: switch to `rules` (version 36).
+    - `15:37:29.34 UTC`: switch back to `ai` (version 37), 1.2 s later.
+    - `2026-10-31 15:37:36 UTC`: `document.reading_retry` on doc-4 (Retry 2); `reading_state` set to `waiting`.
+    - `2026-10-31 15:37:48.140115+00`: New `ai_request` `01a1929c-218b-70c4-a92d-ed0645f5a32b` created (`h6_vision`, provider `vllm`).
+    - `2026-10-31 15:38:15 UTC`: KI-009 live check read 1: doc-4 `reading_state = 'waiting'`.
+    - `2026-10-31 15:38:34 UTC`: KI-009 live check read 2: doc-4 `reading_state = 'waiting'`.
+    - `2026-10-31 15:39:06 UTC`: Request finished; AI worker logged `vision_invalid_output request=01a1929c-218b-70c4-a92d-ed0645f5a32b call=page 1 detail=at_output_cap`.
+  - Results:
+    - (a) `ai_request`: `id=01a1929c-218b-70c4-a92d-ed0645f5a32b`, `request_state='failed'`, `error_code='invalid_output'`, `apply_outcome='not_applicable'`, `tokens_input=3774`, `tokens_output=3386`, `reserved_output_tokens=10158`, `cache_key IS NULL` = false, `ai_cache_id IS NULL` = true, `requested_by IS NULL` = false.
+    - (b) `consensus_run`: 0 rows (request failed before consensus stage; consensus was not triggered).
+    - (c) doc-4: `reading_state='failed'`, `reading_failure_code='invalid_output'`, `current_version_id` unchanged (`01a18c22-0d17-7721-a728-cede930cef8f`).
+    - (d) Log line: `vision_invalid_output request=01a1929c-218b-70c4-a92d-ed0645f5a32b call=page 1 detail=at_output_cap`.
+  - KI-009 live check: Read 1 (`15:38:15 UTC`) and Read 2 (`15:38:34 UTC`) both observed `reading_state='waiting'` while Retry 2's request was in flight. doc-4's `updated_at` (`15:39:05.853`) is 3 ms after that request's `finished_at` (`15:39:05.850`). So the document was failed by the request's own finish, not earlier by the sweep. KI-009 is fixed on beta.
+  - Both requests stopped after page 1: the runner stops at the first failure (input 3774 = one full-page call). So the band call and page 2 were not sent.
+  - Hard-zero: N/A (doc-4 not ready; 0 consensus runs since 15:00).
+  - Verdicts:
+    - KI-008: partly seen on beta. Both Retry requests got their own non-null `cache_key`, and neither used the cache (`ai_cache_id` null). But no answer reached consensus, so the end-to-end fix is not yet seen on beta.
+    - KI-009: fixed on beta.
+    - KI-006: **confirmed**, twice. Both requests logged `call=page 1 detail=at_output_cap` with output = the 3386-token cap.
+  - Switch at end: still `ai` (version 37) at 15:49 UTC, 10 minutes after the last request finished. The owner set it to `rules` at 15:52:00 UTC (version 38). Claude checked this in `ai_setting` and `audit_log`: `ai_request` still 129, none open. AI window: 15:34:11–15:52:00 UTC, 2 requests.
