@@ -182,18 +182,18 @@ WHERE d.workspace_id = r.workspace_id
   )"""
 
 
-def fail_finished_readings(connection: Connection, *, request_id: UUID | None = None) -> int:
+def fail_finished_readings(connection: Connection, *, request_id: UUID) -> int:
     """Waiting documents whose latest AI reading ended without an answer become ``failed``.
 
     Called by every writer of a final request state (skip, release, finish, the lease
     sweep), in its transaction; the provider's own retries are over by then. An older
-    request never fails a document a person retried, and a stale one (the version is no
+    request never fails a document a person retried, including in the gap before the
+    page job creates the new request (KI-009), and a stale one (the version is no
     longer current) never touches it. Idempotent.
     """
 
-    statement = _FAIL_FINISHED + (" AND r.id = :request_id" if request_id is not None else "")
-    params = {"request_id": request_id} if request_id is not None else {}
-    return int(connection.execute(sa.text(statement), params).rowcount or 0)
+    statement = _FAIL_FINISHED + " AND r.id = :request_id"
+    return int(connection.execute(sa.text(statement), {"request_id": request_id}).rowcount or 0)
 
 
 STALLED: Final = "AI_READING_STALLED"

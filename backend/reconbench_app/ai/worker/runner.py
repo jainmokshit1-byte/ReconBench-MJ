@@ -261,6 +261,18 @@ class AiRequestRunner:
                     return self._apply_cache_hit(
                         connection, request, handler, prepared, hit, digest, now
                     )
+        elif request["hook"] == VISION_HOOK and request.get("requested_by") is not None:
+            # KI-008: a person's Retry never reads the cache (D109)
+            # but keeps its answer for consensus
+            cache_key = ai_cache.retry_cache_key(
+                ai_cache.request_cache_key(request, digest), request_id
+            )
+            with self.engine.begin() as connection:
+                connection.execute(
+                    sa.update(ledger.REQUESTS)
+                    .where(ledger.REQUESTS.c.id == request_id)
+                    .values(cache_key=cache_key)
+                )
 
         max_output_tokens = min(prepared.max_output_tokens, kind_limits.max_output_tokens)
         context_window = getattr(provider, "context_window", None) if local else None

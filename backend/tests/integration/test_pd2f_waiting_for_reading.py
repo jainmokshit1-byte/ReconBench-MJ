@@ -9,8 +9,10 @@ an in-process mock.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -19,7 +21,9 @@ import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from reconbench_app import reading_state
+from reconbench_app.ai import consensus as consensus_app
 from reconbench_app.ai import ledger
+from reconbench_app.ai.consensus import ConsensusService, enqueue_consensus_run
 from reconbench_app.ai.gate import DeploymentGate
 from reconbench_app.ai.limits import AiLimits, LimitsState
 from reconbench_app.ai.worker.handlers import default_handlers
@@ -31,8 +35,8 @@ from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.mapping_service import MappingService
 from reconbench_app.settings import Settings
-from scripts.vision_fixtures import synthetic_invoice_pdf
-from sqlalchemy.engine import Engine
+from scripts.vision_fixtures import recorded_response, synthetic_invoice_pdf
+from sqlalchemy.engine import Connection, Engine
 from tests.integration.test_ai_vision import (
     APPROVAL,
     CSRF,
@@ -235,10 +239,27 @@ def test_retry_asks_the_active_provider_again_without_the_cache(
     ]
     _runner(engine, keys[0], _down).run(world.ai_queue.request_ids[-1])
     with engine.connect() as connection:
-        cache_key = connection.scalar(
-            sa.select(REQUESTS.c.cache_key).where(REQUESTS.c.id == world.ai_queue.request_ids[-1])
+        attempt1 = (
+            connection.execute(
+                sa.select(REQUESTS.c.cache_key, REQUESTS.c.ai_cache_id).where(
+                    REQUESTS.c.id == world.ai_queue.request_ids[0]
+                )
+            )
+            .mappings()
+            .one()
         )
-    assert cache_key is None
+        attempt2 = (
+            connection.execute(
+                sa.select(REQUESTS.c.cache_key, REQUESTS.c.ai_cache_id).where(
+                    REQUESTS.c.id == world.ai_queue.request_ids[-1]
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert attempt2["cache_key"] is not None
+    assert attempt2["cache_key"] != attempt1["cache_key"]
+    assert attempt2["ai_cache_id"] is None
     assert _reading(engine, document_id)[0] == "failed"
 
 
@@ -324,8 +345,7 @@ def test_an_older_failed_attempt_never_fails_a_retried_reading(
     world.service.prepare_vision_pages(
         world.workspace_id, world.queue.vision_versions[-1], requested_by=world.user_id
     )
-    with engine.begin() as connection:
-        assert reading_state.fail_finished_readings(connection) == 0
+    ledger.sweep_requests(engine, now=datetime.now(UTC), queue_timeout_seconds=3600)
     assert _reading(engine, document_id) == ("waiting", None)
 
 
@@ -359,8 +379,8 @@ def api_client(engine: Engine) -> Callable[[World], TestClient]:
             role="manager",
             csrf_token=CSRF,
         )
-        app.state.auth_service.authenticate = (
-            lambda *args, **kwargs: AuthenticationCheck(context, True)
+        app.state.auth_service.authenticate = lambda *args, **kwargs: AuthenticationCheck(
+            context, True
         )
         client = TestClient(app, base_url="https://testserver")
         client.cookies.set(COOKIE_NAME, "synthetic-session", path="/api/v1")
@@ -436,3 +456,349 @@ def test_api_retry_reading_refused_when_switch_on_rules(
     assert response.status_code == 422 and response.json()["code"] == "reading_retry_unavailable"
     assert _reading(engine, document_id)[0] == "failed"
 
+
+def test_retry_finishes_and_consensus_creates_new_version(
+    engine: Engine,
+    keys: Any,
+    make_world: Any,
+    api_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    forget_ai_values: Any,
+) -> None:
+    world = make_world()
+    forget_ai_values(world.workspace_id)
+    document_id = _failed_scan(engine, keys, world)
+    with engine.connect() as connection:
+        before_version_id = connection.scalar(
+            sa.select(DOCUMENTS.c.current_version_id).where(DOCUMENTS.c.id == document_id)
+        )
+    client = api_client(world)
+    retried = client.post(
+        f"/api/v1/documents/{document_id}/reading/retry",
+        headers={"If-Match": _etag(world, document_id), "X-CSRF-Token": CSRF},
+    )
+    assert retried.status_code == 200, retried.text
+    assert _reading(engine, document_id) == ("waiting", None)
+
+    version_id = world.queue.vision_versions[-1]
+    assert (
+        world.service.prepare_vision_pages(
+            world.workspace_id, version_id, requested_by=world.user_id
+        )
+        == "queued"
+    )
+    retry_request_id = world.ai_queue.request_ids[-1]
+
+    run_ids: list[UUID] = []
+
+    def defer_job(_connection: Connection, _workspace_id: UUID, run_id: UUID) -> None:
+        run_ids.append(run_id)
+
+    def enqueue(
+        connection: Connection,
+        workspace_id: UUID,
+        v_id: UUID,
+        ai_request_id: UUID,
+        ai_call_id: UUID,
+    ) -> bool:
+        return enqueue_consensus_run(
+            connection,
+            workspace_id=workspace_id,
+            document_version_id=v_id,
+            ai_request_id=ai_request_id,
+            ai_call_id=ai_call_id,
+            defer_job=defer_job,
+        )
+
+    runner = _runner(
+        engine,
+        keys[0],
+        _answer(json.dumps(recorded_response())),
+        consensus=enqueue,
+    )
+    result = runner.run(retry_request_id)
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
+    [consensus_run_id] = run_ids
+
+    def recorded_crop_reads(
+        _pages: Any, needs: Any, *, languages: tuple[str, ...], round_no: int
+    ) -> dict[str, str]:
+        del languages, round_no
+        return {need.key.text(): "" for need in needs}
+
+    monkeypatch.setattr(consensus_app, "reread_vision_crops_isolated", recorded_crop_reads)
+
+    service = ConsensusService(
+        engine,
+        enqueue_followup=lambda _c, _w, _d, _f, _t: None,
+        append_ai_version=world.service.append_ai_version,
+    )
+    assert service._process(world.workspace_id, consensus_run_id) == "succeeded"
+
+    assert _reading(engine, document_id) == ("ready", None)
+    with engine.connect() as connection:
+        after_version_id = connection.scalar(
+            sa.select(DOCUMENTS.c.current_version_id).where(DOCUMENTS.c.id == document_id)
+        )
+    assert after_version_id != before_version_id
+
+    with engine.connect() as connection:
+        run = (
+            connection.execute(
+                sa.select(metadata.tables["consensus_run"]).where(
+                    metadata.tables["consensus_run"].c.id == consensus_run_id
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert run["result_version_id"] is not None
+    assert run["result_version_id"] == after_version_id
+
+    with engine.connect() as connection:
+        req = (
+            connection.execute(sa.select(REQUESTS).where(REQUESTS.c.id == retry_request_id))
+            .mappings()
+            .one()
+        )
+    assert req["cache_key"] is not None
+    assert req["ai_cache_id"] is None
+
+    with engine.connect() as connection:
+        cache_row = (
+            connection.execute(
+                sa.select(metadata.tables["ai_cache"]).where(
+                    metadata.tables["ai_cache"].c.workspace_id == world.workspace_id,
+                    metadata.tables["ai_cache"].c.cache_key == req["cache_key"],
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    assert cache_row is not None
+
+    with engine.connect() as connection:
+        version = (
+            connection.execute(
+                sa.select(metadata.tables["document_version"]).where(
+                    metadata.tables["document_version"].c.id == after_version_id
+                )
+            )
+            .mappings()
+            .one()
+        )
+        ai_evidence = (
+            connection.execute(
+                sa.select(metadata.tables["field_evidence"]).where(
+                    metadata.tables["field_evidence"].c.document_version_id == after_version_id,
+                    metadata.tables["field_evidence"].c.origin == "ai",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert (version["extraction_method"], version["reading_method"]) == ("ai_first", "ai")
+    assert version["derived_from_version_id"] == before_version_id
+    assert version["needs_verification"] is True
+    assert version["extras"]["header"]["reading_policy"] == "arb.llm"
+    assert version["extras"]["header"]["cross_check"]
+    assert ai_evidence
+    assert all(row["ai_call_id"] is not None for row in ai_evidence)
+    assert all(row["verification"] == "none" for row in ai_evidence)
+    assert all(row["confidence"] < Decimal("0.70") for row in ai_evidence)
+    page = world.client.get(f"/api/v1/documents/{document_id}").json()
+    assert page["reading_provider"] == "vllm"
+    assert page["ai_values"] and all(item["verified"] is False for item in page["ai_values"])
+
+
+def test_retry_never_uses_cached_answer_and_consensus_reads_fresh(
+    engine: Engine,
+    keys: Any,
+    make_world: Any,
+    api_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    forget_ai_values: Any,
+) -> None:
+    world = make_world()
+    forget_ai_values(world.workspace_id)
+    document_id = _failed_scan(engine, keys, world)
+    first_request_id = world.ai_queue.request_ids[0]
+    with engine.connect() as connection:
+        k = connection.scalar(
+            sa.select(REQUESTS.c.cache_key).where(REQUESTS.c.id == first_request_id)
+        )
+    assert k is not None
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(metadata.tables["ai_cache"]).values(
+                id=new_id(),
+                workspace_id=world.workspace_id,
+                cache_key=k,
+                hook="h6_vision",
+                model=LOCAL_MODEL,
+                prompt_version="1",
+                document_hash="0" * 64,
+                response={"synthetic_cached": True},
+                provider="vllm",
+                schema_version="1",
+                hit_count=0,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+    client = api_client(world)
+    retried = client.post(
+        f"/api/v1/documents/{document_id}/reading/retry",
+        headers={"If-Match": _etag(world, document_id), "X-CSRF-Token": CSRF},
+    )
+    assert retried.status_code == 200, retried.text
+
+    version_id = world.queue.vision_versions[-1]
+    assert (
+        world.service.prepare_vision_pages(
+            world.workspace_id, version_id, requested_by=world.user_id
+        )
+        == "queued"
+    )
+    retry_request_id = world.ai_queue.request_ids[-1]
+
+    run_ids: list[UUID] = []
+
+    def defer_job(_connection: Connection, _workspace_id: UUID, run_id: UUID) -> None:
+        run_ids.append(run_id)
+
+    def enqueue(
+        connection: Connection,
+        workspace_id: UUID,
+        v_id: UUID,
+        ai_request_id: UUID,
+        ai_call_id: UUID,
+    ) -> bool:
+        return enqueue_consensus_run(
+            connection,
+            workspace_id=workspace_id,
+            document_version_id=v_id,
+            ai_request_id=ai_request_id,
+            ai_call_id=ai_call_id,
+            defer_job=defer_job,
+        )
+
+    server_calls: list[httpx.Request] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        server_calls.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": LOCAL_MODEL, "max_model_len": 8192}]})
+        return httpx.Response(
+            200,
+            json={
+                "model": LOCAL_MODEL,
+                "choices": [
+                    {
+                        "message": {"content": json.dumps(recorded_response())},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+            },
+        )
+
+    runner = _runner(engine, keys[0], server, consensus=enqueue)
+    result = runner.run(retry_request_id)
+    assert (result.state, result.apply_outcome) == ("succeeded", "applied"), result
+    [consensus_run_id] = run_ids
+
+    assert len(server_calls) == 3
+
+    with engine.connect() as connection:
+        req = (
+            connection.execute(sa.select(REQUESTS).where(REQUESTS.c.id == retry_request_id))
+            .mappings()
+            .one()
+        )
+        seeded_row = (
+            connection.execute(
+                sa.select(metadata.tables["ai_cache"]).where(
+                    metadata.tables["ai_cache"].c.workspace_id == world.workspace_id,
+                    metadata.tables["ai_cache"].c.cache_key == k,
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+    assert req["ai_cache_id"] is None
+    assert req["cache_key"] is not None
+    assert req["cache_key"] != k
+    assert seeded_row["hit_count"] == 0
+
+    def recorded_crop_reads(
+        _pages: Any, needs: Any, *, languages: tuple[str, ...], round_no: int
+    ) -> dict[str, str]:
+        del languages, round_no
+        return {need.key.text(): "" for need in needs}
+
+    monkeypatch.setattr(consensus_app, "reread_vision_crops_isolated", recorded_crop_reads)
+
+    service = ConsensusService(
+        engine,
+        enqueue_followup=lambda _c, _w, _d, _f, _t: None,
+        append_ai_version=world.service.append_ai_version,
+    )
+    assert service._process(world.workspace_id, consensus_run_id) == "succeeded"
+    assert _reading(engine, document_id) == ("ready", None)
+
+
+def test_sweep_in_gap_does_not_fail_retried_document(
+    engine: Engine, keys: Any, make_world: Any, api_client: Any, forget_ai_values: Any
+) -> None:
+    world = make_world()
+    forget_ai_values(world.workspace_id)
+    document_id = _failed_scan(engine, keys, world)
+    client = api_client(world)
+    response = client.post(
+        f"/api/v1/documents/{document_id}/reading/retry",
+        headers={"If-Match": _etag(world, document_id), "X-CSRF-Token": CSRF},
+    )
+    assert response.status_code == 200, response.text
+    assert _reading(engine, document_id) == ("waiting", None)
+
+    ledger.sweep_requests(engine, now=datetime.now(UTC), queue_timeout_seconds=3600)
+    assert _reading(engine, document_id) == ("waiting", None)
+
+
+def test_sweep_fails_document_for_stuck_request_it_finishes(
+    engine: Engine, keys: Any, make_world: Any, forget_ai_values: Any
+) -> None:
+    world = make_world()
+    forget_ai_values(world.workspace_id)
+    _company_server(engine, world, capable=True, scanned="ai")
+    [document_id] = _upload(world, scanned_invoice_pdf(), name="scan-stuck.pdf")
+    assert _prepare(world) == ["queued"]
+    [request_id] = world.ai_queue.request_ids
+    assert _reading(engine, document_id) == ("waiting", None)
+
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.update(REQUESTS)
+            .where(REQUESTS.c.id == request_id)
+            .values(
+                request_state="sending",
+                reserved_at=now - timedelta(minutes=10),
+                sent_at=now - timedelta(minutes=10),
+                lease_expires_at=now - timedelta(minutes=5),
+            )
+        )
+    swept = ledger.sweep_requests(engine, now=now, queue_timeout_seconds=3600)
+    assert swept.uncertain == 1
+    with engine.connect() as connection:
+        req = (
+            connection.execute(sa.select(REQUESTS).where(REQUESTS.c.id == request_id))
+            .mappings()
+            .one()
+        )
+    assert req["request_state"] == "uncertain"
+    assert req["error_code"] == ledger.ERROR_LEASE_EXPIRED
+    assert _reading(engine, document_id) == ("failed", ledger.ERROR_LEASE_EXPIRED)

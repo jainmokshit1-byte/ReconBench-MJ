@@ -531,46 +531,60 @@ class SweepCounts:
 
 def sweep_requests(engine: Engine, *, now: datetime, queue_timeout_seconds: int) -> SweepCounts:
     with engine.begin() as connection:
-        uncertain = connection.execute(
-            sa.update(REQUESTS)
-            .where(REQUESTS.c.request_state == "sending", REQUESTS.c.lease_expires_at < now)
-            .values(
-                request_state="uncertain",
-                error_code=ERROR_LEASE_EXPIRED,
-                finished_at=now,
-                lease_expires_at=None,
-                apply_outcome="not_applicable",
+        uncertain_ids = list(
+            connection.scalars(
+                sa.update(REQUESTS)
+                .where(REQUESTS.c.request_state == "sending", REQUESTS.c.lease_expires_at < now)
+                .values(
+                    request_state="uncertain",
+                    error_code=ERROR_LEASE_EXPIRED,
+                    finished_at=now,
+                    lease_expires_at=None,
+                    apply_outcome="not_applicable",
+                )
+                .returning(REQUESTS.c.id)
             )
-        ).rowcount
-        released = connection.execute(
-            sa.update(REQUESTS)
-            .where(REQUESTS.c.request_state == "reserved", REQUESTS.c.lease_expires_at < now)
-            .values(
-                request_state="released",
-                error_code=ERROR_LEASE_EXPIRED,
-                finished_at=now,
-                lease_expires_at=None,
-                apply_outcome="not_applicable",
+        )
+        for req_id in uncertain_ids:
+            reading_state.fail_finished_readings(connection, request_id=req_id)
+        released_ids = list(
+            connection.scalars(
+                sa.update(REQUESTS)
+                .where(REQUESTS.c.request_state == "reserved", REQUESTS.c.lease_expires_at < now)
+                .values(
+                    request_state="released",
+                    error_code=ERROR_LEASE_EXPIRED,
+                    finished_at=now,
+                    lease_expires_at=None,
+                    apply_outcome="not_applicable",
+                )
+                .returning(REQUESTS.c.id)
             )
-        ).rowcount
-        skipped = connection.execute(
-            sa.update(REQUESTS)
-            .where(
-                REQUESTS.c.request_state == "queued",
-                REQUESTS.c.created_at < now - timedelta(seconds=queue_timeout_seconds),
+        )
+        for req_id in released_ids:
+            reading_state.fail_finished_readings(connection, request_id=req_id)
+        skipped_ids = list(
+            connection.scalars(
+                sa.update(REQUESTS)
+                .where(
+                    REQUESTS.c.request_state == "queued",
+                    REQUESTS.c.created_at < now - timedelta(seconds=queue_timeout_seconds),
+                )
+                .values(
+                    request_state="skipped",
+                    skip_code=SKIP_QUEUE_TIMEOUT,
+                    finished_at=now,
+                    apply_outcome="not_applicable",
+                )
+                .returning(REQUESTS.c.id)
             )
-            .values(
-                request_state="skipped",
-                skip_code=SKIP_QUEUE_TIMEOUT,
-                finished_at=now,
-                apply_outcome="not_applicable",
-            )
-        ).rowcount
-        reading_state.fail_finished_readings(connection)
+        )
+        for req_id in skipped_ids:
+            reading_state.fail_finished_readings(connection, request_id=req_id)
         reading_state.fail_stalled_readings(
             connection, cutoff=now - timedelta(seconds=queue_timeout_seconds)
         )
-    return SweepCounts(int(uncertain or 0), int(released or 0), int(skipped or 0))
+    return SweepCounts(len(uncertain_ids), len(released_ids), len(skipped_ids))
 
 
 def sweep_expired_secrets(engine: Engine, *, now: datetime) -> int:

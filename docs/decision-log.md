@@ -2407,3 +2407,89 @@ vendor_name               8        0        2       10      80.0%         [0.490
     - Live switch: **left on AI at the end of D3.** The DB showed `scanned_invoice_reader = 'ai'`, last changed 16:05:57 UTC (version 31), with no later change. The agent's report and PROJECT_STATUS said "rules, version 32", which was wrong. 0 AI requests were made while the switch stayed on AI (count still 126 when Claude checked). The owner set it back to rules at 16:22:33 UTC (version 32; audit `ai.scanned_invoice_reader_change`). `ai_request` was still 126, so 0 AI requests were made while the switch was on AI (16:05:57–16:22:33 UTC). Checked by Claude.
   - KI-006 (output cap) stays a strong hypothesis, not confirmed: the retry sent nothing, so no detail code was logged.
 
+## D116 - Step 8b: Retry wiring fix (KI-007) and doc-4 retry (30 Oct 2026)
+
+- **Target & Fix:**
+  - Fix the API `ai_hooks` wiring omission (KI-007) diagnosed in D115: `reconbench_app/api/application.py:104` instantiated `IngestionService` without passing `ai_hooks=ai_hooks`.
+  - Added a new `AiHookEnqueuer(gate=…, queue=job_queue, limits=…, vision_reader_name=…)` at `application.py:105` (built as in `jobs.py:235`) and passed it as `ai_hooks=ai_hooks` at line 117 (checked by Claude).
+  - Verified `job_queue` defines `enqueue_vision_pages` at `backend/reconbench_app/jobs.py:166-181`.
+
+- **Tests Added & Fail-on-HEAD Proof:**
+  - Added 3 HTTP API integration tests in `backend/tests/integration/test_pd2f_waiting_for_reading.py`:
+    1. `test_create_app_wires_ai_hooks_into_ingestion_service`
+    2. `test_api_retry_reading_succeeds_and_queues_vision_job_when_switch_on_ai`
+    3. `test_api_retry_reading_refused_when_switch_on_rules`
+  - Added reusable `api_client` fixture using `starlette.testclient.TestClient(create_app())`.
+  - **Fail-on-HEAD proof:** Ran the tests with the wiring line commented out (HEAD behaviour, `3bad341`):
+    - `test_create_app_wires_ai_hooks_into_ingestion_service` failed: `AssertionError: assert None is not None`.
+    - `test_api_retry_reading_succeeds_and_queues_vision_job_when_switch_on_ai` failed: `AssertionError: assert 422 == 200` with response detail `reading_retry_unavailable`.
+    - Proved the tests fail precisely because of the KI-007 wiring omission.
+  - Re-ran on disposable DB after applying the fix: all 3 tests passed.
+
+- **Pre-commit Checks & Integration Results:**
+  - Disposable PostgreSQL container (`rb-test-pg`, port 15499) launched for integration testing; removed and verified absent afterwards.
+  - Integration suite:
+    - `backend/tests/integration/test_pd2f_waiting_for_reading.py`: 14 passed (11 baseline + 3 new).
+    - `backend/tests/integration/test_pd2c_pd2d_reading.py`: 9 passed.
+    - `backend/tests/integration/test_pd3a_no_ai_calls.py`: 3 passed.
+    - `backend/tests/integration/test_ai_vision.py`: 15 passed.
+  - Code hygiene and purity checks:
+    - `ruff check`: clean (0 errors).
+    - `mypy --strict core`: 40 source files passed.
+    - `mypy` on full app: 80 errors, matching existing pre-deploy baseline.
+    - `lint-imports`: 3 kept contracts verified.
+    - Core purity check: passed.
+    - Rules hash: `fc247f74f6e0b7a12d22ee363d7d9a4afdd3863135fddc72c1dd0a9338d69c3b` (unchanged).
+    - Engine version check: `python scripts/check_engine_version.py --base-ref 3bad341` passed (core unchanged).
+
+- **Pre-deploy Checks & Backup:**
+  - Live DB pre-checks: revision `0036`, switch `rules` version `32`, open `ai_request` `0`, waiting procrastinate jobs `0`, $R_0 = 126$.
+  - Backup: `pg_dump -Fc` to `C:\Users\jainm\reconbench-archive\live-db-20261030-b9.dump` (4,928,840 bytes) and roles to `live-db-20261030-b9-roles.sql` (1,835 bytes).
+  - Test-restore: Restored into throwaway container `reconbench-restore-test` using `pg_restore --clean --if-exists`. Verified exact 100% row count match across all 59 tables in `public` schema. Throwaway container stopped and verified absent.
+
+- **Commit & Deploy:**
+  - Commit hash: `501dd4eaf39b1cb7083503496af03b0b55ce0b27` (`KI-007: wire ai_hooks into the API ingestion service so Retry works; D115 record corrections`, 6 files).
+  - Rollback tags added to existing images: `setup:pre-b9` (`cdc2a70d8b6d`), `api:pre-b9` (`4587828a31e6`), `worker:pre-b9` (`2acc999c4941`), `ai-worker:pre-b9` (`15bbc3de5e35`).
+  - Build: `docker compose build setup api worker ai-worker` built fresh images.
+  - Setup: `docker compose run --rm --no-deps setup` executed migrations; verified database stayed at revision `0036`.
+  - Restart: `docker compose up -d --no-deps api worker ai-worker`.
+  - Post-deploy verification:
+    - Alembic revision: `0036`.
+    - Switch in DB: `rules`, version `32`.
+    - Total `ai_request` rows: 126 ($R_0$).
+    - Health check: `GET http://127.0.0.1:8000/readyz` returned HTTP 200 `{"status":"ready"}`.
+    - Container logs: 0 errors across `api`, `worker`, `ai-worker`.
+    - Container code grep: confirmed `ai_hooks=ai_hooks,` present at line 117 of `/app/backend/reconbench_app/api/application.py` in `reconbench-api-1`.
+  - Tag: `live-20261030-b9` created locally (not pushed).
+
+- **doc-4 Retry Execution & Switch Timeline:**
+  - Budget: 1 `ai_request`, company vLLM server only (`qwen3.5:9b`), 0 Gemini.
+  - Audit log timeline:
+    - `2026-10-30 19:04:10.447932+00`: `ai.settings_save`
+    - `2026-10-30 19:04:10.453996+00`: `ai.scanned_invoice_reader_change` to `{"scanned_invoice_reader": "ai"}` (version 33)
+    - `2026-10-30 19:04:42.754832+00`: `document.reading_retry` for doc-4 (`01a10e07-ee44-703c-bbae-3c8383ad8cc3`) accepted by API with HTTP 200 (KI-007 verified fixed)
+    - `2026-10-30 19:10:07.806437+00`: `ai.settings_save`
+    - `2026-10-30 19:10:07.810201+00`: `ai.scanned_invoice_reader_change` to `{"scanned_invoice_reader": "rules"}` (version 34)
+  - Retry outcome:
+    - Requests used: 1 of 1 budgeted (total `ai_request` count increased from 126 to 127 = $R_0 + 1$).
+    - Request: `01a18e33-5f3b-7b29-940f-82d1eaa8d369` (provider: `vllm`, model: `qwen3.5:9b`).
+    - `request_state`: `succeeded`
+    - `error_code`: `None`
+    - `tokens_input`: `9631`
+    - `tokens_output`: `4678`
+    - `reserved_output_tokens`: `10158`
+    - `apply_outcome`: `applied`; 3 calls (2 pages + band: reserved 10158 = 3 × 3386); created 19:04:53, finished 19:07:00 UTC.
+    - AI worker logs: 0 lines for `vision_invalid_output`.
+    - **KI-006 verdict: not reproduced.** All 3 calls returned valid answers; page 1 stayed under the 3386 cap this time. Only per-request totals are stored, so the per-call split is unknown. KI-006 stays a hypothesis, neither confirmed nor ruled out.
+    - doc-4 `reading_state` afterwards: `failed` with `reading_failure_code = 'invalid_output'` (the D112 code). No AI values reached doc-4: consensus run `result_version_id` is null.
+  - **Why doc-4 is still failed (checked by Claude from DB, logs and code):**
+    - **The Retry answer never reaches consensus (KI-008, confirmed).** `hooks/vision.py:123` sets `cacheable=False` for a person's Retry (D109). So `runner.py:244–246` leaves `cache_key` null and stores no cache row. Consensus reads the answer only from `ai_cache` by `cache_key` (`consensus.py:570`, `:626`). `_load` returns None and the run ends `stale` (`:442`). In the DB, this is the only one of 53 `h6_vision` requests with `requested_by` set and a null `cache_key`, and the only `stale` consensus run of 11. The 8b test (b) checks only that Retry queues the job, so it can't catch this.
+    - **The document fell back to failed before the new request existed (KI-009, strong hypothesis).**
+      - Retry set doc-4 to `waiting` at 19:04:42 (audit `before_state` failed/invalid_output, `after_state` waiting).
+      - `prepare_vision_pages` ran for 11.07 s. The new `ai_request` row was created at 19:04:53.78.
+      - doc-4's `updated_at` is 19:04:52.80, so the document was re-failed in that gap with the old code.
+      - `reading_state._FAIL_FINISHED` fails a waiting document whose *latest* `h6_vision` request has failed. Until the new row exists, that latest request is the D112 failure.
+      - Which caller ran then (e.g. the sweep at `ai/ledger.py:569`) is unknown.
+      - At 19:07 the stale consensus run's `mark_version_failed` changed nothing (`only_from=(WAITING,)`).
+  - **Deviation:** the executing agent opened `.env` (twice) while looking for DB access, against CLAUDE.md and the brief. Its contents are not recorded here. Reported to the owner.
+

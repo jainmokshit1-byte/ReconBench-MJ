@@ -117,6 +117,14 @@ def request_cache_key(request: Mapping[str, Any], payload_digest: str) -> str:
     )
 
 
+def retry_cache_key(content_key: str, request_id: UUID) -> str:
+    """A person's Retry (PD-2f) never reads the cache; its fresh answer is stored
+    under a key only this request uses, so consensus can read it (KI-008)."""
+    return _digest(
+        {"content_key": content_key, "key_version": "retry-1", "request_id": str(request_id)}
+    )
+
+
 def lookup(
     connection: Connection, *, workspace_id: UUID, key: str, now: datetime, ttl_days: int
 ) -> tuple[UUID, dict[str, Any]] | None:
@@ -208,5 +216,6 @@ __all__ = [
     "purge_expired",
     "reader_params_digest",
     "request_cache_key",
+    "retry_cache_key",
     "store",
 ]
