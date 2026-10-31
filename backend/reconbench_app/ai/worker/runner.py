@@ -24,6 +24,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from reconbench_app.ai import cache as ai_cache
 from reconbench_app.ai import ledger
+from reconbench_app.ai.answer_shape import AnswerShape
 from reconbench_app.ai.connection_state import is_rotation_test
 from reconbench_app.ai.contracts import OUTPUT_MODELS, InvalidOutput, parse_output
 from reconbench_app.ai.endpoint_policy import EndpointNotAllowed
@@ -127,6 +128,31 @@ def _local_image_tokens(call: PromptPayload, kind_limits: CallKindLimits) -> int
         else:
             total += local_image_tokens(width, height, token_px=token_px)
     return total
+
+
+def _vision_call_label(call_names: tuple[str, ...], index: int) -> str:
+    return call_names[index] if index < len(call_names) else f"page {index + 1}"
+
+
+def _log_answer_shape(
+    request_id: object,
+    call_label: str,
+    finish: str | None,
+    usage: ProviderUsage | None,
+    shape: AnswerShape | None,
+) -> None:
+    """One line per vision call with counts only (KI-006); providers without a shape skip."""
+
+    if shape is None:
+        return
+    _LOGGER.info(
+        "vision_answer_shape request=%s call=%s finish=%s out=%s %s",
+        request_id,
+        call_label,
+        finish or "-",
+        usage.output_tokens if usage is not None else "-",
+        shape.log_text(),
+    )
 
 
 def _add_usage(total: ProviderUsage | None, usage: ProviderUsage | None) -> ProviderUsage | None:
@@ -414,14 +440,22 @@ class AiRequestRunner:
                 )
                 results.append(result)
                 usage = _add_usage(usage, result.usage)
+                if request["hook"] == VISION_HOOK:
+                    _log_answer_shape(
+                        request["id"],
+                        _vision_call_label(prepared.call_names, index),
+                        result.finish_reason,
+                        result.usage,
+                        result.answer_shape,
+                    )
         except ProviderFailure as failure:
             del api_key
+            call_usage = failure.usage
             failure.usage = _add_usage(usage, failure.usage)
             if request["hook"] == VISION_HOOK:
-                call_label = (
-                    prepared.call_names[failed_call_index]
-                    if prepared.call_names and failed_call_index < len(prepared.call_names)
-                    else f"page {failed_call_index + 1}"
+                call_label = _vision_call_label(prepared.call_names, failed_call_index)
+                _log_answer_shape(
+                    request["id"], call_label, failure.detail, call_usage, failure.answer_shape
                 )
                 detail = failure.detail or failure.code
                 _LOGGER.warning(

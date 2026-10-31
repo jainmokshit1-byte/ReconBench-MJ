@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from reconbench_app.ai.answer_shape import AnswerShape
+
 # "responded": the provider answered (the call finished, possibly billed).
 # "not_sent": provably never reached the provider. "may_have_been_sent": unknown.
 Delivery = Literal["responded", "not_sent", "may_have_been_sent"]
@@ -57,6 +59,8 @@ class ProviderResult:
     """The model id the provider says answered (may differ from the requested alias)."""
     reasoning_present: bool = False
     """The answer carried a separate reasoning/thinking part."""
+    answer_shape: AnswerShape | None = None
+    """Counts describing the raw answer (self-hosted reader only; never values)."""
 
 
 class ProviderFailure(RuntimeError):
@@ -70,6 +74,7 @@ class ProviderFailure(RuntimeError):
         cooldown_seconds: int | None = None,
         usage: ProviderUsage | None = None,
         detail: str | None = None,
+        answer_shape: AnswerShape | None = None,
     ) -> None:
         self.code = code
         self.delivery = delivery
@@ -77,6 +82,8 @@ class ProviderFailure(RuntimeError):
         self.usage = usage
         # A short sanitized diagnostic (no key, digit runs masked); never shown to users.
         self.detail = detail
+        # Counts describing a rejected raw answer (never its values), when there was one.
+        self.answer_shape = answer_shape
         super().__init__(f"provider call failed: {code} ({delivery})")
 
 

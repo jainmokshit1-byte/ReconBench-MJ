@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 
+from reconbench_app.ai.answer_shape import answer_shape
 from reconbench_app.ai.endpoint_policy import EndpointNotAllowed, check_allowed
 from reconbench_app.ai.provider import (
     Delivery,
@@ -424,22 +425,36 @@ class OpenAICompatProvider:
             raise ProviderFailure(
                 "invalid_output", delivery="responded", usage=usage, detail="empty_content"
             )
+        # KI-006: counts only (formatting, loop, length), so a lost answer still says why.
+        shape = answer_shape(content)
         if content.lstrip().startswith(THINKING_PREFIXES):
             self.counters["thinking_leak"] += 1
             _LOGGER.warning("vllm_thinking_leak count=%d", self.counters["thinking_leak"])
             raise ProviderFailure(
-                "invalid_output", delivery="responded", usage=usage, detail="thinking_leak"
+                "invalid_output",
+                delivery="responded",
+                usage=usage,
+                detail="thinking_leak",
+                answer_shape=shape,
             )
         if finish_reason == "length":
             self.counters["at_output_cap"] += 1
             raise ProviderFailure(
-                "invalid_output", delivery="responded", usage=usage, detail="at_output_cap"
+                "invalid_output",
+                delivery="responded",
+                usage=usage,
+                detail="at_output_cap",
+                answer_shape=shape,
             )
         try:
             json.loads(content)
         except ValueError:
             raise ProviderFailure(
-                "invalid_output", delivery="responded", usage=usage, detail="not_json"
+                "invalid_output",
+                delivery="responded",
+                usage=usage,
+                detail="not_json",
+                answer_shape=shape,
             ) from None
         model = body.get("model")
         return ProviderResult(
@@ -449,6 +464,7 @@ class OpenAICompatProvider:
             finish_reason=finish_reason if isinstance(finish_reason, str) else None,
             model_reported=model if isinstance(model, str) else None,
             reasoning_present=reasoning_present,
+            answer_shape=shape,
         )
 
 

@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import uuid
 from dataclasses import replace
 from typing import Any
@@ -734,6 +735,7 @@ def _run_vision_harness(
     pages: tuple[int, ...] = (1,),
     has_band: bool = False,
     validate_side_effect: Exception | None = None,
+    level: int = logging.WARNING,
 ) -> tuple[uuid.UUID, list[logging.LogRecord]]:
     rec = _Recorder(*responses)
     provider = OpenAICompatProvider(BASE_URL, ALLOWED, inner_transport=httpx.MockTransport(rec))
@@ -822,7 +824,7 @@ def _run_vision_harness(
     logger = logging.getLogger("reconbench_app.ai.worker.runner")
     logger.addHandler(handler)
     old_level = logger.level
-    logger.setLevel(logging.WARNING)
+    logger.setLevel(level)
 
     try:
         with (
@@ -990,3 +992,58 @@ def test_runner_logs_unknown_when_failing_call_not_identifiable() -> None:
         vision_logs[0].getMessage()
         == f"vision_invalid_output request={req_id} call=unknown detail=ungrounded"
     )
+
+
+# --------------------------------------------------------------------------- answer shape (KI-006)
+
+_SHAPE_LOG = re.compile(
+    r"vision_answer_shape request=\S+ call=(page \d+|band) finish=\S+ out=\d+"
+    r"( [a-z_]+=\d+){9}"
+)
+
+
+def test_provider_attaches_answer_shape_to_a_result_and_an_output_cap_failure() -> None:
+    pretty = json.dumps({"lines": [{"description": "x", "box_2d": [1, 2, 3, 4]}]}, indent=2)
+    recorder = _Recorder(
+        httpx.Response(200, json=_completion(pretty)),
+        httpx.Response(200, json=_completion(pretty[:-5], finish_reason="length")),
+    )
+    provider = _provider(recorder)
+    result = provider.complete(_request(), api_key="")
+    assert result.answer_shape is not None and result.answer_shape.rows == 1
+    assert result.answer_shape.ws_outside > 0
+    with pytest.raises(ProviderFailure) as caught:
+        provider.complete(_request(), api_key="")
+    assert caught.value.detail == "at_output_cap"
+    assert caught.value.answer_shape is not None
+    assert caught.value.answer_shape.chars == len(pretty) - 5
+
+
+def test_runner_logs_one_answer_shape_per_call_including_the_cut_one() -> None:
+    valid_page = (
+        '{"doc_kind":"invoice","pages":[{"page":1,"kind":"invoice"}],'
+        '"fields":[],"lines":[],"annotations":[],"unreadable":[]}'
+    )
+    responses = [
+        httpx.Response(200, json=_completion(valid_page)),
+        httpx.Response(200, json=_completion('{"cut":', finish_reason="length")),
+    ]
+    req_id, records = _run_vision_harness(responses, pages=(1, 2), level=logging.INFO)
+    shapes = [r.getMessage() for r in records if "vision_answer_shape" in r.getMessage()]
+    assert len(shapes) == 2
+    assert shapes[0].startswith(f"vision_answer_shape request={req_id} call=page 1 finish=stop ")
+    assert shapes[1].startswith(
+        f"vision_answer_shape request={req_id} call=page 2 finish=at_output_cap out=7 "
+    )
+    assert all(_SHAPE_LOG.fullmatch(message) for message in shapes)
+
+
+def test_answer_shape_log_never_carries_answer_values() -> None:
+    secret = "SECRET-INVOICE-4417"
+    cut = '{"lines":[{"description":"' + secret + '","amount":"98,765.43","box_2d":[1,2,3,4]}'
+    _req_id, records = _run_vision_harness(
+        [httpx.Response(200, json=_completion(cut, finish_reason="length"))], level=logging.INFO
+    )
+    shapes = [r.getMessage() for r in records if "vision_answer_shape" in r.getMessage()]
+    assert len(shapes) == 1 and _SHAPE_LOG.fullmatch(shapes[0])
+    assert secret not in shapes[0] and "98,765.43" not in shapes[0] and "4417" not in shapes[0]
