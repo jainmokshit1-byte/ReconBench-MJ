@@ -1928,3 +1928,161 @@ def test_fully_billed_po_remains_a_candidate_and_fails_open_quantity_check() -> 
     assert "OPEN_PO_QUANTITY_EXCEEDED" in result.links[0].evidence
     assert "open_grn_quantity" not in result.links[0].evidence
     assert ranked[0].po_document_id == fully_billed.document_id
+
+
+# A person's removal of one line's link (PD-4b) rejects that (line, PO) pairing only.
+
+
+def _two_line_po(number: int, po_no: str = "PO-300") -> MappingPO:
+    document = _document(
+        f"<PurchaseOrder><OrderNo>{po_no}</OrderNo><OrderDate>20260101</OrderDate>"
+        "<Supplier>Acme Supplies</Supplier><TaxableTotal>3000</TaxableTotal>"
+        "<Line><Description>Widget model A</Description><Qty>100</Qty>"
+        "<Rate>10</Rate><Amount>1000</Amount></Line>"
+        "<Line><Description>Dock model B</Description><Qty>100</Qty>"
+        "<Rate>20</Rate><Amount>2000</Amount></Line></PurchaseOrder>",
+        DocType.PO,
+    )
+    quantities = {1: Decimal("100"), 2: Decimal("100")}
+    return MappingPO(
+        document_id=_id(number),
+        vendor_id=_VENDOR,
+        document=document,
+        open_balance=Decimal("3000"),
+        open_qty_by_line=quantities,
+        grn_support_qty_by_line=quantities,
+        open_grn_qty_by_line=quantities,
+    )
+
+
+def _two_line_invoice() -> Document:
+    return _document(
+        "<Invoice><InvoiceNo>INV-2L</InvoiceNo><InvoiceDate>20260201</InvoiceDate>"
+        "<Supplier>Acme Supplies</Supplier><TaxableTotal>50</TaxableTotal>"
+        "<InvoiceTotal>50</InvoiceTotal>"
+        "<Line><Description>Widget model A</Description><Qty>1</Qty>"
+        "<Rate>10</Rate><Amount>10</Amount></Line>"
+        "<Line><Description>Dock model B</Description><Qty>2</Qty>"
+        "<Rate>20</Rate><Amount>40</Amount></Line></Invoice>",
+        DocType.INVOICE,
+    )
+
+
+def test_unlinking_one_line_keeps_the_other_lines_linked_to_that_po() -> None:
+    po = _two_line_po(30)
+    fresh = _source(10, _two_line_invoice())
+    one_line_removed = _source(
+        11, _two_line_invoice(), rejected_line_po_pairs=((1, po.document_id),)
+    )
+    whole_po_removed = _source(12, _two_line_invoice(), rejected_po_ids=(po.document_id,))
+
+    fresh_result = resolve_links([fresh], [po])[0]
+    removed_result = resolve_links([one_line_removed], [po])[0]
+    blocked_result = resolve_links([whole_po_removed], [po])[0]
+
+    assert [(link.line_no, link.to_document_id) for link in fresh_result.links] == [
+        (1, po.document_id),
+        (2, po.document_id),
+    ]
+    # Only the removed pairing is gone; the PO stays eligible for line 2.
+    assert [(link.line_no, link.to_document_id) for link in removed_result.links] == [
+        (2, po.document_id)
+    ]
+    assert removed_result.links[0].state is LinkState.SUGGESTED
+    assert "line 1 to this PO was removed by a person earlier" in removed_result.links[0].evidence
+    # A header-level removal still rejects the PO for the whole document.
+    assert not blocked_result.links
+
+
+def test_a_po_unlinked_on_one_line_is_reconsidered_through_its_grn() -> None:
+    # Vijayshree case (live test 1 Nov 2026): the invoice cites the GRN, the GRN cites the PO,
+    # and a person once removed line 1's link to that PO.
+    grn = _verify_header_reference(
+        _source(
+            11,
+            _document(
+                "<GRN><GRNNo>GRN-1</GRNNo><GRNDate>20260115</GRNDate>"
+                "<Supplier>Acme Supplies</Supplier><PORef>PO-100</PORef>"
+                "<Line><Description>Part MOD-100</Description><Qty>10</Qty>"
+                "<Rate>10</Rate><Amount>100</Amount></Line></GRN>",
+                DocType.GRN,
+            ),
+        ),
+        "po_refs",
+    )
+    po = _po(20, _document(_item_po_xml("PO-100", "Part MOD-100"), DocType.PO))
+    invoice = _verify_header_reference(
+        _source(
+            10,
+            _document(
+                _invoice_xml(
+                    "INV-10",
+                    grn_ref="GRN-1",
+                    qty="10",
+                    rate="10",
+                    amount="100",
+                    description="Part MOD-100",
+                ),
+                DocType.INVOICE,
+            ),
+            rejected_line_po_pairs=((1, po.document_id),),
+        ),
+        "grn_refs",
+    )
+
+    results = resolve_links([invoice, grn], [po])
+    invoice_result = next(item for item in results if item.document_id == invoice.document_id)
+
+    po_links = [link for link in invoice_result.links if link.link_type.value == "inv_po"]
+    grn_links = [link for link in invoice_result.links if link.link_type.value == "inv_grn"]
+    assert [(link.level.value, link.to_document_id) for link in po_links] == [
+        ("header", po.document_id)
+    ]
+    assert grn_links and grn_links[0].to_document_id == grn.document_id
+    # Never automatic while an earlier removal exists: a person reviews it.
+    assert po_links[0].state is LinkState.SUGGESTED
+    assert "line 1 to this PO was removed by a person earlier" in po_links[0].evidence
+
+
+def test_a_po_reached_only_through_a_shared_grn_does_not_beat_the_cited_po() -> None:
+    cited = _po(20, _document(_po_xml("PO-100"), DocType.PO))
+    other = _po(21, _document(_po_xml("PO-200"), DocType.PO))
+    grn = _verify_header_reference(
+        _source(11, _document(_grn_xml("GRN-1", "PO-200"), DocType.GRN)), "po_refs"
+    )
+    invoice = _verify_header_reference(
+        _source(
+            10,
+            _document(_invoice_xml("INV-10", po_ref="PO-100", grn_ref="GRN-1"), DocType.INVOICE),
+        ),
+        "po_refs",
+    )
+
+    results = resolve_links([invoice, grn], [cited, other])
+    invoice_result = next(item for item in results if item.document_id == invoice.document_id)
+
+    po_targets = {
+        link.to_document_id for link in invoice_result.links if link.link_type.value == "inv_po"
+    }
+    assert po_targets == {cited.document_id}
+
+
+def test_same_vendor_number_amount_and_date_give_the_expected_po() -> None:
+    expected = _po(20, _document(_po_xml("PO-100", date="20260115"), DocType.PO))
+    distractor = _po(21, _document(_po_xml("PO-101", date="20260115"), DocType.PO))
+    invoice = _verify_header_reference(
+        _source(
+            10,
+            _document(
+                _invoice_xml("INV-10", po_ref="PO-100", qty="100", amount="1000"),
+                DocType.INVOICE,
+            ),
+        ),
+        "po_refs",
+    )
+
+    result = resolve_links([invoice], [distractor, expected])[0]
+
+    assert [(link.to_document_id, link.method) for link in result.links] == [
+        (expected.document_id, LinkMethod.LABELED)
+    ]

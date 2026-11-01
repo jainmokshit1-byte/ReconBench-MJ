@@ -8,7 +8,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -84,6 +84,49 @@ class MappingSummary:
     link_versions_written: int
     resolutions_written: int
     scopes_marked: int
+
+
+# The system writes these when it replaces its own earlier proposal; they never carry a
+# person's decision, even when the replaced link was a manual one.
+_SYSTEM_SUPERSEDED = frozenset({"superseded_by_resolution"})
+
+
+@dataclass(slots=True)
+class PriorLinkDecisions:
+    """A source document's earlier link decisions by a person, as the resolver must honour them.
+
+    A person's removal or replacement of a header link rejects that PO for the whole document;
+    the same action on one line rejects only that (line, PO) pairing, so the PO stays eligible
+    for the other lines and for header-level evidence. Links the system superseded on its own
+    are not a person's decision and reject nothing; every row stays in history for the audit.
+    """
+
+    manual_po_ids: set[UUID] = field(default_factory=set)
+    rejected_po_ids: set[UUID] = field(default_factory=set)
+    rejected_line_po_pairs: set[tuple[int, UUID]] = field(default_factory=set)
+
+    def record(
+        self,
+        *,
+        to_document_id: UUID,
+        link_type: str,
+        method: str,
+        state: str,
+        line_no: int | None,
+        detail_code: str | None,
+    ) -> None:
+        if method != LinkMethod.MANUAL.value or link_type not in {
+            LinkType.INV_PO.value,
+            LinkType.GRN_PO.value,
+        }:
+            return
+        if state == LinkState.CONFIRMED.value:
+            self.manual_po_ids.add(to_document_id)
+        elif state == LinkState.REJECTED.value and detail_code not in _SYSTEM_SUPERSEDED:
+            if line_no is None:
+                self.rejected_po_ids.add(to_document_id)
+            else:
+                self.rejected_line_po_pairs.add((line_no, to_document_id))
 
 
 def _field(value: object | None, evidence_row: RowMapping | None) -> FieldValue[Any] | None:
@@ -617,6 +660,7 @@ class MappingService:
                         link.c.version_no,
                         link.c.from_document_id,
                         link.c.to_document_id,
+                        link.c.link_type,
                         link.c.method,
                         link.c.confidence,
                         link.c.state,
@@ -701,6 +745,9 @@ class MappingService:
                     "version_no": link_row.version_no,
                     "po_document_id": link_row.to_document_id,
                     "po_no": link_row.po_no,
+                    # inv_grn links point at a GRN, not a PO: the screen must not show
+                    # them as the invoice's PO (live test 1 Nov 2026).
+                    "link_type": link_row.link_type,
                     "method": link_row.method,
                     "confidence": link_row.confidence,
                     "state": link_row.state,
@@ -1872,7 +1919,7 @@ class MappingService:
             if document.header.doc_type is DocType.PO:
                 po_candidates.append((row, document, vendor_id))
             else:
-                manual_ids, rejected_ids = link_context.get(document_id, (set(), set()))
+                decisions = link_context.get(document_id, PriorLinkDecisions())
                 source_documents.append(
                     MappingDocument(
                         document_id=document_id,
@@ -1880,8 +1927,14 @@ class MappingService:
                         vendor_id=vendor_id,
                         document=document,
                         source_text=document.raw_text,
-                        manual_po_ids=tuple(sorted(manual_ids, key=str)),
-                        rejected_po_ids=tuple(sorted(rejected_ids, key=str)),
+                        manual_po_ids=tuple(sorted(decisions.manual_po_ids, key=str)),
+                        rejected_po_ids=tuple(sorted(decisions.rejected_po_ids, key=str)),
+                        rejected_line_po_pairs=tuple(
+                            sorted(
+                                decisions.rejected_line_po_pairs,
+                                key=lambda pair: (pair[0], str(pair[1])),
+                            )
+                        ),
                     )
                 )
 
@@ -2630,16 +2683,19 @@ class MappingService:
     def _current_link_context(
         connection: Connection,
         workspace_id: UUID,
-    ) -> dict[UUID, tuple[set[UUID], set[UUID]]]:
+    ) -> dict[UUID, PriorLinkDecisions]:
         pointer = metadata.tables["link_current"]
         link = metadata.tables["link"]
-        output: dict[UUID, tuple[set[UUID], set[UUID]]] = {}
+        output: dict[UUID, PriorLinkDecisions] = {}
         rows = connection.execute(
             sa.select(
                 link.c.from_document_id,
                 link.c.to_document_id,
+                link.c.link_type,
                 link.c.method,
                 link.c.state,
+                link.c.from_line_no,
+                link.c.detail_code,
             )
             .select_from(
                 pointer.join(
@@ -2653,12 +2709,14 @@ class MappingService:
             .where(pointer.c.workspace_id == workspace_id)
         )
         for row in rows:
-            source_id = cast(UUID, row.from_document_id)
-            manual, rejected = output.setdefault(source_id, (set(), set()))
-            if row.method == LinkMethod.MANUAL.value and row.state == LinkState.CONFIRMED.value:
-                manual.add(cast(UUID, row.to_document_id))
-            if row.method == LinkMethod.MANUAL.value and row.state == LinkState.REJECTED.value:
-                rejected.add(cast(UUID, row.to_document_id))
+            output.setdefault(cast(UUID, row.from_document_id), PriorLinkDecisions()).record(
+                to_document_id=cast(UUID, row.to_document_id),
+                link_type=str(row.link_type),
+                method=str(row.method),
+                state=str(row.state),
+                line_no=cast(int | None, row.from_line_no),
+                detail_code=cast(str | None, row.detail_code),
+            )
         return output
 
     def _governing_pos(

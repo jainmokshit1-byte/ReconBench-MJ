@@ -133,6 +133,9 @@ class MappingDocument(FrozenModel):
     source_text: str | None = None
     manual_po_ids: tuple[UUID, ...] = ()
     rejected_po_ids: tuple[UUID, ...] = ()
+    # (line number, PO) pairings a person removed: that line is never linked to that PO
+    # again, but the PO stays eligible for the other lines and at header level.
+    rejected_line_po_pairs: tuple[tuple[int, UUID], ...] = ()
 
     @model_validator(mode="after")
     def _supported_document_type(self) -> Self:
@@ -2968,6 +2971,37 @@ def rank_po_candidates(
     )
 
 
+def _honour_line_rejections(
+    source: MappingDocument, links: tuple[ProposedLink, ...]
+) -> tuple[ProposedLink, ...]:
+    """Keep a person's line-level removals without letting them block the whole PO.
+
+    A line link to a PO a person removed for that line is dropped. Any other link to that PO
+    stays, but never automatic: it is a suggestion whose evidence names the removed lines, so
+    the person who reviews it sees the earlier decision instead of it being silently overridden.
+    """
+
+    rejected = set(source.rejected_line_po_pairs)
+    removed_lines: dict[UUID, list[int]] = {}
+    for line_no, po_id in sorted(rejected, key=lambda pair: (str(pair[1]), pair[0])):
+        removed_lines.setdefault(po_id, []).append(line_no)
+    kept: list[ProposedLink] = []
+    for link in links:
+        if link.link_type not in {LinkType.INV_PO, LinkType.GRN_PO}:
+            kept.append(link)
+            continue
+        if link.level is LinkLevel.LINE and (link.line_no, link.to_document_id) in rejected:
+            continue
+        lines = removed_lines.get(link.to_document_id)
+        if lines is None or link.state is LinkState.CONFIRMED:
+            kept.append(link)
+            continue
+        note = "line " + ", ".join(str(item) for item in lines)
+        evidence = f"{link.evidence}; {note} to this PO was removed by a person earlier"
+        kept.append(link.model_copy(update={"state": LinkState.SUGGESTED, "evidence": evidence}))
+    return tuple(kept)
+
+
 def resolve_links(
     documents: tuple[MappingDocument, ...] | list[MappingDocument],
     purchase_orders: tuple[MappingPO, ...] | list[MappingPO],
@@ -3264,6 +3298,10 @@ def resolve_links(
                     )
                 )
             result = result.model_copy(update={"links": tuple(dated_links)})
+        if source.rejected_line_po_pairs:
+            result = result.model_copy(
+                update={"links": _honour_line_rejections(source, result.links)}
+            )
         if _has_unverified_ai_values(source.document):
             # A value read by AI counts only after a person's check (PD-2b): no link that
             # rests on such a document is automatic, whatever the method (step 6 R1, PD-3b).
