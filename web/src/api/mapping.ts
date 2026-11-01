@@ -29,8 +29,11 @@ export interface MappingVendor {
 export interface CurrentMappingLink {
   id: string;
   version_no: number;
+  /** The link's target document; a PO except for invoice → GRN links (link_type inv_grn). */
   po_document_id: string;
   po_no: string | null;
+  /** inv_po, inv_grn or grn_po. Older API responses omit it (treated as a PO link). */
+  link_type?: "inv_po" | "inv_grn" | "grn_po";
   method: string;
   confidence: string | number;
   state: "auto" | "suggested" | "confirmed" | "rejected";

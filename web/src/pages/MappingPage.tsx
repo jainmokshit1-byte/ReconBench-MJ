@@ -200,9 +200,12 @@ interface LinkSetSummary {
   lineCount: number;
 }
 
+/** An invoice → GRN link points at a GRN: it is evidence, never the document's PO. */
+const isGrnLink = (item: CurrentMappingLink) => item.link_type === "inv_grn";
+
 /** Group a document's current links by PO and work out which lines the main PO covers. */
 function summarizeLinks(row: MappingDocument): LinkSetSummary | null {
-  const active = row.links.filter((item) => item.state !== "rejected");
+  const active = row.links.filter((item) => item.state !== "rejected" && !isGrnLink(item));
   if (!active.length) return null;
   const byPo = new Map<string, CurrentMappingLink[]>();
   for (const item of active) byPo.set(item.po_document_id, [...(byPo.get(item.po_document_id) ?? []), item]);
@@ -269,7 +272,8 @@ function MappingDocumentRow({
       onLinkAction(item.id, "unlink", item.version_no);
     }
   };
-  const link = linkSet?.lead ?? row.links[0];
+  const grnLinks = row.links.filter((item) => isGrnLink(item) && item.state !== "rejected");
+  const link = linkSet?.lead ?? row.links.find((item) => !isGrnLink(item));
   const resolution = row.resolution;
   const activeVendor = vendors.find((vendor) => vendor.id === selectedVendor);
   const vendorAssignmentMismatch = Boolean(selectedVendor && row.vendor_id !== selectedVendor);
@@ -285,7 +289,7 @@ function MappingDocumentRow({
   const supplierMismatch = vendorAssignmentMismatch || vendorGstinMismatch;
   const displayStatus = linkSet
     ? linkSet.allConfirmed ? "confirmed" : linkSet.links.some((item) => item.state === "suggested") ? "suggested" : "auto"
-    : link?.state ?? (resolution?.outcome === "suggested" ? "suggested" : "unlinked");
+    : link?.state ?? (resolution?.outcome === "suggested" && !grnLinks.length ? "suggested" : "unlinked");
   const lineLevel = Boolean(linkSet && row.doc_type === "invoice" && linkSet.lineCount > 0);
   const candidateRows = resolution?.candidates ?? [];
   const aiProposal = Boolean(link?.ai_suggested && link.state === "suggested");
@@ -302,7 +306,8 @@ function MappingDocumentRow({
       <td>
         <span className={`mapping-state mapping-state-${displayStatus}`}>{displayStatus === "auto" ? "Auto" : displayStatus === "confirmed" ? "Confirmed" : displayStatus === "suggested" ? "Suggested" : "Unlinked"}</span>
         {link?.ai_suggested ? <span className="ai-advisory-tag" title="Proposed by AI from the top five same-vendor POs">{aiProposal ? "AI-suggested" : "Confirmed from AI suggestion"}</span> : null}
-        {linkSet ? <small className="mapping-evidence-meta">PO {linkSet.poNo ?? "without number"}</small> : null}
+        {linkSet ? <small className="mapping-evidence-meta">PO {linkSet.poNo ?? "without number"}</small> : row.doc_type === "invoice" && grnLinks.length ? <small className="mapping-lines-attention" role="note">No PO link yet</small> : null}
+        {grnLinks.map((item) => <small className="mapping-evidence-meta" key={item.id} title={item.evidence ?? undefined}>GRN {item.po_no ?? "without number"} · {item.state} · {Math.round(Number(item.confidence) * 100)}%</small>)}
         {link ? <small className="mapping-evidence-meta">{link.method.replaceAll("_", " ")} · {Math.round(Number(link.confidence) * 100)}%</small> : null}
         {linkSet && lineLevel ? <small className={linkSet.attentionLines.length ? "mapping-lines-attention" : "mapping-evidence-meta"}>{linkSet.linkedLines.length} of {linkSet.lineCount} lines linked</small> : null}
         {linkSet && lineLevel && linkSet.attentionLines.length ? <small className="mapping-lines-attention" role="note">Needs attention: line {linkSet.attentionLines.join(", ")} {linkSet.attentionLines.length === 1 ? "has" : "have"} no link to this PO{linkSet.otherPoLines.length ? ` (line ${linkSet.otherPoLines.join(", ")} suggested to another PO)` : ""}. Reconciliation shows such an invoice as Unlinked until every line has a PO link.</small> : null}

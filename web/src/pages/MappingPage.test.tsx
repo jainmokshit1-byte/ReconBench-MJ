@@ -292,6 +292,62 @@ describe("Mapping workflow", () => {
     expect(await screen.findByRole("status")).toHaveTextContent(/2 links were confirmed/);
   });
 
+  it("never shows an invoice's GRN link as its PO", async () => {
+    const grnLink = {
+      id: "grn-link-1",
+      version_no: 1,
+      po_document_id: "grn-synthetic-1",
+      po_no: "GRN-2026-124",
+      link_type: "inv_grn",
+      method: "via_grn",
+      confidence: "0.95",
+      state: "suggested",
+      ai_suggested: false,
+      evidence: "Same-vendor invoice↔GRN reference GRN-2026-124",
+      level: "header",
+      line_no: null,
+    };
+    const poLink = { ...grnLink, id: "po-link-1", po_document_id: poId, po_no: "PO-2026-136", link_type: "inv_po", evidence: "Linked through GRN GRN-2026-124" };
+    const base = {
+      doc_type: "invoice",
+      vendor_name: "Acme Components",
+      vendor_gstin: "27AAPFU0939F1ZV",
+      doc_date: "2026-04-02",
+      grand_total: "236.00",
+      currency: "INR",
+      source_file_id: "file-synthetic-1",
+      vendor_id: vendorId,
+      needs_verification: false,
+      line_nos: [1, 2, 3],
+      resolution: { outcome: "suggested", resolved_step: 3, detail_code: null, cited_refs: [], candidates: [] },
+    };
+    const onlyGrn = { ...base, id: "invoice-grn-only", doc_no: "INV-GRN-ONLY", links: [grnLink] };
+    const both = { ...base, id: "invoice-both", doc_no: "INV-BOTH", links: [grnLink, poLink] };
+    installFetch((url, init) => {
+      const method = init.method ?? "GET";
+      if (url.pathname === "/api/v1/vendors" && method === "GET") return response(200, [vendor]);
+      if (url.pathname === "/api/v1/vendor-merge-suggestions" && method === "GET") return response(200, []);
+      if (url.pathname === `/api/v1/vendors/${vendorId}/documents` && method === "GET") {
+        return url.searchParams.get("doc_type") === "po" ? response(200, []) : response(200, [onlyGrn, both]);
+      }
+      throw new Error(`Unexpected request: ${method} ${url.pathname}${url.search}`);
+    });
+
+    renderMapping();
+    const grnOnlyRow = await screen.findByRole("row", { name: /INV-GRN-ONLY/ });
+    expect(within(grnOnlyRow).queryByText(/PO GRN-2026-124/)).toBeNull();
+    expect(within(grnOnlyRow).queryByText(/lines linked/)).toBeNull();
+    expect(within(grnOnlyRow).queryByRole("button", { name: /Confirm link to PO/ })).toBeNull();
+    expect(within(grnOnlyRow).getByText("No PO link yet")).toBeInTheDocument();
+    expect(within(grnOnlyRow).getByText(/GRN GRN-2026-124 · suggested · 95%/)).toBeInTheDocument();
+    expect(within(grnOnlyRow).getByText("Unlinked")).toBeInTheDocument();
+
+    const bothRow = screen.getByRole("row", { name: /INV-BOTH/ });
+    expect(within(bothRow).getByText("PO PO-2026-136")).toBeInTheDocument();
+    expect(within(bothRow).getByText("3 of 3 lines linked")).toBeInTheDocument();
+    expect(within(bothRow).getByRole("button", { name: "Confirm link to PO PO-2026-136" })).toBeInTheDocument();
+  });
+
   it("pins Unassigned and allows a person to assign a document", async () => {
     const unassigned = {
       ...vendor,
