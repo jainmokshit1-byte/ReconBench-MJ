@@ -218,3 +218,21 @@ def test_pending_recomputes_queue_one_drain_job_and_no_per_po_jobs() -> None:
     assert per_po.deferrer.arguments is None
     assert drain.deferrer.arguments == {"workspace_id": str(WS)}
     assert connection.locks == [f"drain_dirty_scopes:{WS}"]
+
+
+def test_vendor_rematch_reuses_the_waiting_job_for_the_workspace() -> None:
+    deferrer = _LockedDeferrer(object())
+    task = _LockedTask(deferrer)
+    waiting = _LockConnection(waiting=11)
+    fresh = _LockConnection(waiting=None)
+    queue = ProcrastinateJobQueue({"rematch_vendors": task})
+
+    # A second vendor change while one rematch waits adds no job (one per workspace).
+    assert queue.enqueue_vendor_rematch(workspace_id=WS, connection=cast(Any, waiting)) == 11
+    assert deferrer.arguments is None
+    assert waiting.locks == [f"rematch_vendors:{WS}"]
+
+    assert queue.enqueue_vendor_rematch(workspace_id=WS, connection=cast(Any, fresh)) == 42
+    assert task.queueing_lock == f"rematch_vendors:{WS}"
+    assert deferrer.arguments == {"workspace_id": str(WS)}
+    assert fresh.log == ["savepoint", "release"]

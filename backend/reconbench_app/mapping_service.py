@@ -373,6 +373,13 @@ class MappingService:
         self.queue = queue
         self.ai_hooks = ai_hooks
 
+    def _enqueue_vendor_rematch(self, workspace_id: UUID, connection: Connection) -> None:
+        """Queue vendor and link matching in the caller's transaction (one waiting job)."""
+
+        enqueue = getattr(self.queue, "enqueue_vendor_rematch", None)
+        if enqueue is not None:
+            enqueue(workspace_id=workspace_id, connection=connection)
+
     def _enqueue_pending_recomputes(self, workspace_id: UUID, connection: Connection) -> None:
         if self.queue is not None:
             self.queue.enqueue_pending_recomputes(
@@ -1173,6 +1180,7 @@ class MappingService:
                     "pan": pan_value,
                 },
             )
+            self._enqueue_vendor_rematch(actor.workspace_id, connection)
             return {
                 "id": vendor_id,
                 "canonical_name": display,
@@ -1273,6 +1281,7 @@ class MappingService:
                 vendor_ids={vendor_id},
                 reason="vendor_renamed",
             )
+            self._enqueue_vendor_rematch(actor.workspace_id, connection)
             write_audit_event(
                 connection,
                 actor,
@@ -1683,6 +1692,7 @@ class MappingService:
         self._mark_vendor_documents_dirty(
             connection, actor.workspace_id, {source_vendor_id, survivor_vendor_id}, "vendor_merged"
         )
+        self._enqueue_vendor_rematch(actor.workspace_id, connection)
         write_audit_event(
             connection,
             actor,
@@ -1883,6 +1893,7 @@ class MappingService:
                     before_state={"document_id": str(document_id), "vendor_id": old_vendor_id},
                     after_state={"document_id": str(document_id), "vendor_id": vendor_id},
                 )
+                self._enqueue_vendor_rematch(actor.workspace_id, connection)
             return {
                 "document_id": document_id,
                 "vendor_id": vendor_id,

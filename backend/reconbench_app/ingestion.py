@@ -2032,6 +2032,9 @@ class IngestionService:
 
         try:
             self._persist_parse(file_row=row, result=result, duration_ms=duration_ms, job_id=job_id)
+        except IngestionFailure as exc:
+            self._fail_file(file_id, exc.code, str(exc), job_id=job_id)
+            return
         except (BotoCoreError, OSError) as exc:
             raise ObjectStoreUnavailable from exc
 
@@ -2921,6 +2924,25 @@ class IngestionService:
                 .mappings()
                 .one_or_none()
             )
+        elif len(candidate_ids) > 1:
+            candidates = (
+                connection.execute(
+                    sa.select(document_table)
+                    .where(
+                        document_table.c.workspace_id == workspace_id,
+                        document_table.c.id.in_(candidate_ids),
+                    )
+                    .order_by(
+                        document_table.c.withdrawn_at.desc(),
+                        document_table.c.id.desc(),
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .all()
+            )
+            if candidates and all(row["withdrawn_at"] is not None for row in candidates):
+                existing = candidates[0]
         if (
             existing is None
             and structured
@@ -2959,12 +2981,38 @@ class IngestionService:
                 .limit(1)
             )
             if natural_key_owner is not None:
-                natural_key = document_identity_collision_key(
+                collision_key = document_identity_collision_key(
                     document,
                     file_sha,
                     page_hashes=page_hashes,
                     structured=structured,
                 )
+                collision_owner = (
+                    connection.execute(
+                        sa.select(document_table)
+                        .where(
+                            document_table.c.workspace_id == workspace_id,
+                            document_table.c.natural_key == collision_key,
+                        )
+                        .with_for_update()
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if collision_owner is not None:
+                    if (
+                        collision_owner["withdrawn_at"] is not None
+                        and collision_owner["doc_type"] == header.doc_type.value
+                    ):
+                        existing = collision_owner
+                        natural_key = collision_key
+                    else:
+                        raise IngestionFailure(
+                            "DOCUMENT_COLLISION_ACTIVE",
+                            "An active document already exists with this identity.",
+                        )
+                else:
+                    natural_key = collision_key
         created = existing is None
         document_id = cast(UUID, existing["id"]) if existing is not None else new_id()
         current_version_id = cast(UUID | None, existing["current_version_id"]) if existing else None

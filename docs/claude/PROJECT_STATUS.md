@@ -1,5 +1,5 @@
 # Project status
-Last verified: 2026-10-31, commit 24e11ff live as live-20261031-b10 (D117, not pushed); switch on rules (version 38, set back by the owner at 15:52:00 UTC); Step 9 complete; CODEBASE_CONTEXT.md untracked
+Last verified: 2026-11-02, live as live-20261102-b14 (KI-012 vendor re-match + KI-013 removed-file re-upload; engine 0.1.14, D121) (not pushed; backend 0d4c886, engine 0.1.14, D118); switch on AI (version 45, set by the owner for the 1 Nov live test); 142 ai_request; KI-006 root cause found, fix deferred; step-10 record (b11/b12) still owed; CODEBASE_CONTEXT.md untracked
 
 ## Components
 Status: working-verified | implemented-untested | partial | stub | broken | not-found | unknown
@@ -11,24 +11,26 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - Waiting for reading (PD-2f, D109; live D110, D114, D116, D117) — working-verified (beta S5 + optional AI block, D114); KI-009 fixed on beta (doc-4 stayed waiting during retry); KI-008 fixed in code and deployed; doc-4 failed at output cap (KI-006 confirmed) — reconbench_app/reading_state.py, migration 0036; tests/integration/test_pd2f_waiting_for_reading.py
 - Scanned-invoice switch + 0 LLM calls outside AI reading (PD-2c/PD-2d, D107, D114) — working-verified (beta S1–S11 0 calls on rules, optional AI block 1 call, D114) — ai/vision.py, ai/settings_service.py, migration 0035; tests/integration/test_pd2c_pd2d_reading.py
 - Validation (arithmetic, GSTIN, confidence) — working-verified (unit) — reconbench_core/extraction/verify.py; tests/property
-- Vendor + link mapping — working-verified (unit + beta S8, D114: 0 auto links on unverified AI fields) — tests/unit/test_phase4_mapping_links.py, test_phase4_vendor_mapping.py, test_q2_typed_links.py
+- Vendor + link mapping — working-verified (unit + beta S8, D114: 0 auto links on unverified AI fields; KI-010/KI-011 fixed and live, D118) — tests/unit/test_phase4_mapping_links.py, test_phase4_vendor_mapping.py, test_q2_typed_links.py
 - Line alignment — working-verified (unit) — tests/unit/test_phase4_alignment.py
 - Reconciliation engine — working-verified (unit + beta S9, D114: 0 matched cases on unverified AI fields) — tests/unit/test_phase4_reconciliation.py, tests/scenarios/test_hard_zero_guards.py
 - Ledger, review, export — working-verified on beta (S10, D114: 6 sheets incl. Field Origin with 80 rows) — ledger_service.py, api/review.py, export_service.py; tests/unit/test_export_workbook.py
-- Web app — vitest 73 passed, lint + typecheck OK (2026-10-30, D114, Node v24.19.0 from nvm, not on PATH) — web/
+- Web app — vitest 74 passed, lint + typecheck OK (2026-11-02, D118, Node v24.19.0 from nvm, not on PATH) — web/
 
 ## Tests
-- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1502 passed, 22 skipped, 361 s, 2026-10-30 (D113)
-- `pytest backend/tests/integration` — run on disposable postgres:16.15 at 127.0.0.1:15499: test_phase4_task_411_413.py (3 passed), test_ai_vision.py (15 passed), test_pd2f_waiting_for_reading.py (18 passed, D117), test_pd2c_pd2d_reading.py (9 passed), test_pd3a_no_ai_calls.py (3 passed), test_ingestion.py (4 passed), test_pd_ledger_scopes.py (3 passed); 3 failures on HEAD (KNOWN_ISSUES: test_ai_h1, test_page_split); test_infrastructure_ready needs MinIO/S3 (D113)
-- Web: `npx tsc -b`, `npm run lint`, `npx vitest run` (73 passed, D114); Playwright e2e not run
+- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1549 passed, 22 skipped, 262 s, 2026-11-02 (b14)
+- `pytest backend/tests/integration` — run on disposable postgres:16.15 at 127.0.0.1:15499: test_phase4_task_411_413.py (3 passed), test_ai_vision.py (15 passed), test_pd2f_waiting_for_reading.py (18 passed, b12), test_ai_runner.py (32 passed, b12), test_pd2c_pd2d_reading.py (9 passed), test_pd3a_no_ai_calls.py (3 passed), test_ingestion.py (4 passed, b13), test_phase4_task_411_413.py (3 passed, b13), test_pd_ledger_scopes.py (3 passed); 3 failures on HEAD (KNOWN_ISSUES: test_ai_h1, test_page_split); test_infrastructure_ready needs MinIO/S3 (D113)
+- Web: `npx tsc -b`, `npm run lint`, `npx vitest run` (74 passed, D118); Playwright e2e not run
 - `make accuracy-bench` — not run: needs Docker worker image and owner's local truth set
 
 ## Active task
 - Step 9 complete (D117): KI-008 and KI-009 fixed in code and deployed (tag live-20261031-b10); doc-4 retried twice (2 vLLM requests against a budget of 1, 0 Gemini), each 3774 in / 3386 out; KI-009 fixed on beta (doc-4 stayed waiting, then failed at the request's own finish); both requests hit the output cap on page 1 (detail=at_output_cap, KI-006 confirmed); KI-008 partly seen (Retry got its own cache_key, no cache hit), end to end not yet seen.
-- Hand-off ready for owner review and decision on KI-006 output cap fix.
+- Step 10 (31 Oct, after D117; record still owed, next free D-number): b11 (37cf3b4) sizes image tokens from real pixels, so doc-4's cap is 4096 (verified on beta). Doc-4 still filled 4096 (2 requests, one from the owner's re-upload). b12 (930ac02) logs `vision_answer_shape` counts per AI call. Its retry showed about 52 header fields on page 1 plus pretty-printed JSON (51% whitespace), not a loop and not rotation (KNOWN_ISSUES KI-006). Requests 129 → 132, 0 Gemini.
+
+- Live test of 10 real invoices (1-2 Nov, records in work/live-test-20261101/): extraction (report 06) and Mapping (report 07) analysed; KI-010/KI-011 fixed and live (D118); Reconciliation analysis next.
 
 ## Next steps (max 5, highest value first)
-1. Fix KI-006 (dense scanned invoice output cap in runner.py / dynamic image reservation or server context).
+1. Owner's UI check of inv10 on Mapping (D118); then the Reconciliation analysis of the live test; write the step-10 record (b11, b12, root cause) and fix KI-006 when the owner picks it up.
 2. Exercise KI-008 end-to-end on beta once doc-4 reading succeeds.
 3. Larger PD-5c run (n=10 is too small for live switch decision).
 4. Owner decides live switch from D112 / D114 / PD-5c results.

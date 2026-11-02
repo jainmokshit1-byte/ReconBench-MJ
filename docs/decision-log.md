@@ -2579,3 +2579,41 @@ vendor_name               8        0        2       10      80.0%         [0.490
     - KI-009: fixed on beta.
     - KI-006: **confirmed**, twice. Both requests logged `call=page 1 detail=at_output_cap` with output = the 3386-token cap.
   - Switch at end: still `ai` (version 37) at 15:49 UTC, 10 minutes after the last request finished. The owner set it to `rules` at 15:52:00 UTC (version 38). Claude checked this in `ai_setting` and `audit_log`: `ai_request` still 129, none open. AI window: 15:34:11–15:52:00 UTC, 2 requests.
+
+## D118 - KI-010 / KI-011 mapping fix live (b13) (2 Nov 2026)
+
+- **Found in the owner's live test (1-2 Nov, `work/live-test-20261101/`, real values local only):** test invoice inv10 had no PO link although its PO and GRN were in the data. Root cause (verified in code): `mapping_service.py:_current_link_context` treated every manual rejected link as a document-wide rejection of that PO. A person's line-3 Remove (23 Oct) and a person's line-2 link later superseded by a mapping pass therefore blocked the PO for the whole invoice in every method; the via-GRN path returned only the invoice→GRN link (KI-010). The Mapping page then showed that GRN link as the invoice's "PO" with "7 of 7 lines linked", because `summarizeLinks` grouped all links by target and the API sent no link type (KI-011).
+- **Owner decisions in chat (2 Nov):** fix in code with regression tests, nothing changed on live until approved; then "Yes, plan the deploy" and "Yes, go ahead" for the plan in `docs/claude/plan-deploy-b13.md` (gate, commit, backup, rebuild, web patch, one mapping pass). The invoice's link is not confirmed by Claude; the owner reviews it.
+- **Fix:** `PriorLinkDecisions` — a person's Remove/Change of a header link still rejects the PO for the document; on a line it rejects only that (line, PO) pairing; rows the system superseded (`superseded_by_resolution`) reject nothing; unknown or missing detail codes stay conservative. `links.py`: `rejected_line_po_pairs`; a removed pairing is dropped, any other link to that PO stays a suggestion whose evidence ends "line N to this PO was removed by a person earlier". The vendor documents list returns `link_type`; the web groups only PO links, shows an invoice→GRN link on its own line and "No PO link yet" when no PO link exists. ENGINE_VERSION 0.1.13 → 0.1.14; RULES_HASH 63095a3a…733b. History rows are unchanged.
+- **Trade-off (open):** the new header PO link also covers the line a person removed, so reconciliation compares that line with the PO; the removal stays visible ("Removed by … · Link again") and in the evidence.
+- **Gate:** offline suite 1548 passed, 22 skipped; integration `test_ingestion.py` 4 passed and `test_phase4_task_411_413.py` 3 passed on disposable PostgreSQL; golden self-check 0 false Matched (engine 0.1.14); ruff/format clean on touched files, mypy strict core clean, app mypy 80 (= baseline), import contracts 3 kept, purity, rules hash, engine-version bump verified; web tsc, eslint, vitest 74 passed (the new web test fails on the old page). Replay on a throwaway restore of the 1 Nov backup: exactly 1 link changed.
+- **Deploy:** pre-checks (queue 0, revision 0036, ai_request 142, links 744, switch ai v45); commits 0d4c886 (backend + tests + plan) and 2ff37fd (web), local tag `live-20261102-b13`, not pushed; backup `live-db-20261102-b13.dump` (7.2 MB) + roles in the archive folder, test restore on a throwaway container with identical row counts in all 59 tables; rollback tags `:pre-b13` on setup, api, worker, ai-worker; images rebuilt; setup run (revision stays 0036); api, worker, ai-worker swapped; `/readyz` 200; all three containers carry ENGINE 0.1.14 and the new code; no errors in the first logs; web patch applied (Vite reloaded the page, module served 200).
+- **Live mapping pass (one, approved):** `MappingService.resolve_workspace` inside the worker: 1 link version written; the only link change in the workspace is inv10 → its PO, header, **suggested**, evidence noting the earlier line-3 removal.
+- **After:** queue 0, 0 new failed jobs, ai_request 142 (0 new, Gemini 0), links 745, 0 new auto links, switch unchanged (ai, v45), revision 0036.
+- **Owner check pending:** Mapping → the vendor → inv10 shows the PO as Suggested with a separate GRN line and the evidence note. The scanned-invoice switch is still "Read with AI" from the 1 Nov test.
+
+## D121 - KI-012 vendor re-match + KI-013 removed-file re-upload live (b14) (2 Nov 2026)
+
+- **Context & Root Causes:**
+  - **KI-012:** A person's vendor create, rename, merge or assignment queued only a ledger drain (`enqueue_pending_recomputes`), never re-running vendor or link matching. Consequently, unassigned POs/GRNs with matching names stayed unassigned unless manually touched.
+  - **KI-013:** A scanned GRN PDF uploaded and removed 4 times created 4 withdrawn documents sharing `(source_sha256, source_locator)`. Re-upload found `len(candidate_ids) > 1`, skipped candidate reuse, fell back to `document_identity_collision_key` (which was already owned by an earlier copy), and threw a duplicate key `IntegrityError` on `document_natural_uq`. Because `DBAPIError` was in `_RETRYABLE_ERRORS`, Procrastinate retried 5 times and failed the file.
+- **Fixes Applied:**
+  - **KI-012:** `jobs.py`: Added `enqueue_vendor_rematch`, `run_vendor_rematch`, and `reconbench.rematch_vendors` task with queueing lock `rematch_vendors:{workspace_id}`. `mapping_service.py`: `_enqueue_vendor_rematch` called inside assign (if vendor changed), create, rename, and merge.
+  - **KI-013:** `ingestion.py`: In `_upsert_document`, when `len(candidate_ids) > 1` and all candidates are withdrawn, selects the most recently withdrawn copy (`withdrawn_at.desc(), id.desc()`) and revives it. In step 4 collision key fallback, checks `collision_owner`: revives if withdrawn and matching doc type; halts cleanly with `DOCUMENT_COLLISION_ACTIVE` if active. Wrapped `_persist_parse` with `IngestionFailure` handler. `jobs.py`: Subclassed `InfrastructureRetryStrategy(RetryStrategy)` returning `None` for `IntegrityError`. Caught `IntegrityError` in `ingest_file` and `parse_file` tasks to mark the file failed with `INTEGRITY_ERROR` on attempt 1.
+- **Gate:**
+  - Rules hash: verified `63095a3ab1f08a4a54b922409db0654d186501010721ed5383594cf66717733b` (unchanged).
+  - Engine version: passed (`--base-ref HEAD`, core unchanged).
+  - Core purity: passed.
+  - Import contracts: 3 kept, 0 broken.
+  - Mypy: strict core clean (40 files); app = 80 errors (= baseline, 0 increase).
+  - Ruff check & format: clean on all 6 touched Python files.
+  - Golden self-check: 0 false Matched (`engine: reconbench-core/0.1.14`).
+  - Offline test suite: 1549 passed, 22 skipped in 262s.
+  - Disposable DB integration tests: `test_reupload_withdrawn.py` (6), `test_vendor_rematch.py` (2), `test_ingestion.py` (4), `test_ac4_vendor_hygiene.py` (6), `test_pd_ledger_scopes.py` (3), `test_phase4_task_411_413.py` (3), `test_page_split.py` (2 known failures on HEAD, KI-003). Throwaway container removed.
+- **Pre-deploy Checks & Backup:**
+  - Queue `todo`/`doing`: 0. Alembic revision: 0036. Counts: `ai_request`: 142, `link`: 746, `document` (active): 514, `document` (withdrawn): 38, `document_version`: 2685, unassigned active PO/GRN: `{'po': 2, 'grn': 3}`, `source_file` (failed): 1. Scanned switch: `ai_first` (version 45).
+  - Backup: `C:\Users\jainm\reconbench-archive\live-db-20261102-b14.dump` (7,174,502 bytes) + `live-roles-20261102-b14.sql` (1,543 bytes).
+  - Restore test: Verified against throwaway container `rb-backup-verify-pg` with exact 100% row count match across all 63 public tables. Container removed.
+- **Deployment:**
+  - Rebuilt & swapped: `setup`, `api`, `worker`, `ai-worker` images rebuilt; setup executed (revision 0036 unchanged); api/worker/ai-worker swapped; `/readyz` 200 OK.
+  - Post-checks: queue 0, 0 failed jobs, counter tables unchanged.

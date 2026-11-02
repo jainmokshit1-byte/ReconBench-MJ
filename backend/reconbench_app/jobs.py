@@ -13,8 +13,9 @@ from botocore.config import Config  # type: ignore[import-untyped]
 from botocore.exceptions import BotoCoreError  # type: ignore[import-untyped]
 from procrastinate import App, JobContext, PsycopgConnector, SyncPsycopgConnector
 from procrastinate.exceptions import AlreadyEnqueued
+from procrastinate.jobs import Job
 from procrastinate.manager import JobManager
-from procrastinate.retry import RetryStrategy
+from procrastinate.retry import RetryDecision, RetryStrategy
 from sqlalchemy.engine import Connection, Engine, make_url
 
 from reconbench_app.ai.consensus import ConsensusService
@@ -51,7 +52,18 @@ MAX_INFRASTRUCTURE_ATTEMPTS = 4  # One initial attempt plus three infrastructure
 # the shared worker (Procrastinate fetches the highest priority first, then oldest).
 RECONCILIATION_JOB_PRIORITY = 10
 _RETRYABLE_ERRORS = (BotoCoreError, OSError, sa.exc.DBAPIError, ObjectStoreUnavailable)
-_INFRASTRUCTURE_RETRY = RetryStrategy(
+
+
+class InfrastructureRetryStrategy(RetryStrategy):
+    """Retry transient infrastructure errors, excluding deterministic integrity violations."""
+
+    def get_retry_decision(self, *, exception: BaseException, job: Job) -> RetryDecision | None:
+        if isinstance(exception, sa.exc.IntegrityError):
+            return None
+        return super().get_retry_decision(exception=exception, job=job)
+
+
+_INFRASTRUCTURE_RETRY = InfrastructureRetryStrategy(
     max_attempts=MAX_INFRASTRUCTURE_ATTEMPTS,
     exponential_wait=2,
     retry_exceptions=_RETRYABLE_ERRORS,
@@ -148,6 +160,16 @@ class ProcrastinateJobQueue(QueuePort):
             queueing_lock=f"drain_dirty_scopes:{workspace_id}",
         )
 
+    def enqueue_vendor_rematch(self, *, workspace_id: UUID, connection: Connection) -> int:
+        """Re-run vendor and link matching after a person's vendor change (one waiting job)."""
+
+        return self._defer(
+            "rematch_vendors",
+            connection=connection,
+            task_kwargs={"workspace_id": str(workspace_id)},
+            queueing_lock=f"rematch_vendors:{workspace_id}",
+        )
+
     def enqueue_reconciliation(self, *, run_id: UUID, connection: Connection) -> int:
         return self._defer(
             "evaluate_cases",
@@ -210,6 +232,24 @@ def make_s3_client(settings: Settings) -> Any:
             s3={"addressing_style": "path"},
         ),
     )
+
+
+def run_vendor_rematch(
+    engine: Engine,
+    *,
+    vendor_resolution: VendorResolutionService,
+    mapping_service: MappingService,
+    queue: Any,
+    workspace_id: UUID,
+) -> None:
+    """After a person assigns, creates, renames or merges a vendor: the vendor and link
+    passes a new upload gets. Locked (manual) assignments are never changed, an ambiguous
+    name stays unassigned, and links keep their own states, thresholds and history."""
+
+    vendor_resolution.resolve_workspace(workspace_id)
+    mapping_service.resolve_workspace(workspace_id)
+    with engine.begin() as connection:
+        queue.enqueue_pending_recomputes(workspace_id=workspace_id, connection=connection)
 
 
 def register_ingestion_tasks(
@@ -290,6 +330,14 @@ def register_ingestion_tasks(
         job = context.job
         try:
             service.ingest_file(UUID(file_id), job_id=job.id)
+        except sa.exc.IntegrityError:
+            service._fail_file(
+                UUID(file_id),
+                "INTEGRITY_ERROR",
+                "A database integrity constraint was violated.",
+                job_id=job.id,
+            )
+            return
         except _RETRYABLE_ERRORS as exc:
             service._record_infrastructure_failure(
                 UUID(file_id),
@@ -310,6 +358,14 @@ def register_ingestion_tasks(
         job = context.job
         try:
             service.parse_file(UUID(file_id), job_id=job.id)
+        except sa.exc.IntegrityError:
+            service._fail_file(
+                UUID(file_id),
+                "INTEGRITY_ERROR",
+                "A database integrity constraint was violated.",
+                job_id=job.id,
+            )
+            return
         except _RETRYABLE_ERRORS as exc:
             service._record_infrastructure_failure(
                 UUID(file_id),
@@ -426,6 +482,22 @@ def register_ingestion_tasks(
             )
 
     @task_app.task(
+        name="reconbench.rematch_vendors",
+        queue="mapping",
+        retry=_INFRASTRUCTURE_RETRY,
+        pass_context=True,
+    )
+    def rematch_vendors(context: JobContext, workspace_id: str) -> None:
+        del context
+        run_vendor_rematch(
+            engine,
+            vendor_resolution=vendor_resolution,
+            mapping_service=mapping_service,
+            queue=queue,
+            workspace_id=UUID(workspace_id),
+        )
+
+    @task_app.task(
         name="reconbench.recompute_po",
         queue="mapping",
         retry=_INFRASTRUCTURE_RETRY,
@@ -497,6 +569,7 @@ def register_ingestion_tasks(
             "process_consensus": process_consensus,
             "resolve_vendors": resolve_vendors,
             "link_vendor": link_vendor,
+            "rematch_vendors": rematch_vendors,
             "recompute_po": recompute_po,
             "drain_dirty_scopes": drain_dirty_scopes,
             "evaluate_cases": evaluate_cases,

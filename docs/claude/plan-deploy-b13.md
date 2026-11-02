@@ -1,6 +1,6 @@
 # Deploy plan b13 — KI-010 / KI-011 mapping fix (2 Nov 2026)
 
-Status: **plan only, waiting for the owner's go.** Nothing below has been run on live.
+Status: **executed 2 Nov 2026 (D118).** Gate passed; deployed as live-20261102-b13; the live mapping pass changed exactly 1 link.
 
 ## What ships
 | Part | Change | Live effect |
