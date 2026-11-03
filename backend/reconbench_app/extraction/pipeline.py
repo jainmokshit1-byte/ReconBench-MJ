@@ -213,6 +213,7 @@ def layout_parse(
                 ),
             )
         )
+    warnings.extend(orientation_warnings(layout))
     if any(document.needs_verification for document in documents) and any(
         page.source == PageSource.OCR for page in layout.pages
     ):
@@ -238,6 +239,21 @@ def layout_parse(
         page_texts=_page_texts(layout),
     )
     return guard_unconfigured_parties(guard_result(result, hints), hints)
+
+
+def orientation_warnings(layout: DocumentLayout) -> list[ParseWarning]:
+    """One warning per OCR page whose orientation Tesseract could not confirm."""
+
+    return [
+        ParseWarning(
+            code="OCR_ORIENTATION_UNSURE",
+            message=(
+                f"Page {page.number} orientation could not be confirmed; check the page is upright."
+            ),
+        )
+        for page in layout.pages
+        if page.source == PageSource.OCR and page.orientation_unsure
+    ]
 
 
 def has_content(result: ParseResult) -> bool:

@@ -51,6 +51,7 @@ export const REASON_TEXT: Record<string, ReasonText> = {
   LATE_DELIVERY: { title: "Late delivery", message: "The goods were received after the PO delivery date." },
   AI_VALUE_UNVERIFIED: { title: "AI-read values not verified", message: "A value read by AI counts only after a person verifies it." },
   AI_LINES_MISSING: { title: "AI reading is missing lines", message: "The AI reading has fewer lines than the rules reading of the same file." },
+  SERIAL_DIFF: { title: "Serial numbers differ", message: "The serial numbers on the invoice line differ from those on the goods receipt." },
 };
 
 // Plain title of a reason code: the catalogue first, then the built-in text, then the code itself.

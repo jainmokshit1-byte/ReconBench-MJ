@@ -3002,6 +3002,131 @@ def _honour_line_rejections(
     return tuple(kept)
 
 
+def _header_amount(document: Document) -> tuple[str, Decimal] | None:
+    header = document.header
+    if header.grand_total is not None:
+        return "grand_total", header.grand_total.value
+    if header.taxable_total is not None:
+        return "taxable_total", header.taxable_total.value
+    return None
+
+
+def _amount_and_date_agree(
+    source: MappingDocument,
+    target: Document,
+    config: MappingConfig,
+    fallback_date: date | None = None,
+) -> bool:
+    """Same kind of total within the amount tolerance and a date within the normal window.
+
+    A GRN read without a date is dated by the PO it links to (``fallback_date``).
+    """
+
+    own = _header_amount(source.document)
+    if own is None:
+        return False
+    kind, expected = own
+    field = getattr(target.header, kind, None)
+    if field is None:
+        return False
+    tolerance = max(
+        abs(field.value) * config.amount_tolerance_pct / Decimal("100"),
+        config.amount_tolerance_abs,
+    )
+    if abs(expected - field.value) > tolerance:
+        return False
+    invoice_date = _header_date(source.document)
+    target_date = _header_date(target) or fallback_date
+    if invoice_date is None or target_date is None:
+        return False
+    return abs((invoice_date - target_date).days) <= config.date_normal_days
+
+
+def _has_priced_lines(document: Document) -> bool:
+    return any(line.quantity is not None and line.rate is not None for line in document.lines)
+
+
+def _unreferenced_fallback_links(
+    source: MappingDocument,
+    documents: tuple[MappingDocument, ...],
+    purchase_orders: tuple[MappingPO, ...],
+    output: dict[UUID, LinkResolution],
+    config: MappingConfig,
+) -> tuple[ProposedLink, ...]:
+    """Suggest the one open same-vendor PO whose total and date agree when no reference is read.
+
+    Used only when nothing else linked the invoice and it names no PO. A PO qualifies by its
+    own total/date or through a same-vendor GRN that links to it. Exactly one qualifying PO
+    is required; the link is always a suggestion (never automatic).
+    """
+
+    po_by_id = {po.document_id: po for po in purchase_orders}
+    qualifying_grns: dict[UUID, list[MappingDocument]] = {}
+    for grn in documents:
+        if grn.document.header.doc_type is not DocType.GRN or grn.vendor_id != source.vendor_id:
+            continue
+        for link in output[grn.document_id].links:
+            target = po_by_id.get(link.to_document_id)
+            if (
+                link.link_type is LinkType.GRN_PO
+                and target is not None
+                and target.vendor_id == source.vendor_id
+                and _amount_and_date_agree(
+                    source, grn.document, config, _header_date(target.document)
+                )
+            ):
+                qualifying_grns.setdefault(target.document_id, []).append(grn)
+    qualifying: list[MappingPO] = []
+    for po in purchase_orders:
+        status = po.document.header.status if isinstance(po.document.header, POHeader) else None
+        if (
+            po.vendor_id != source.vendor_id
+            or po.document_id in source.rejected_po_ids
+            # A PO read without priced lines has no known balance, not a spent one.
+            or (po.open_balance <= _ZERO and _has_priced_lines(po.document))
+            or (status is not None and status.value in {POStatus.CANCELLED, POStatus.CLOSED})
+        ):
+            continue
+        if _amount_and_date_agree(source, po.document, config) or qualifying_grns.get(
+            po.document_id
+        ):
+            qualifying.append(po)
+    if len(qualifying) != 1:
+        return ()
+    po = qualifying[0]
+    evidence = "no reference read; inferred from vendor, date and amount"
+    grns = qualifying_grns.get(po.document_id, [])
+    links = list(
+        _links_for_matches(
+            source,
+            ((po, LinkLevel.HEADER, None, evidence),),
+            method=LinkMethod.CONTENT,
+            confidence=config.step3_min_score,
+            config=config,
+            force_suggested=True,
+        )
+    )
+    has_grn_link = any(
+        link.link_type is LinkType.INV_GRN for link in output[source.document_id].links
+    )
+    if len(grns) == 1 and not has_grn_link:
+        grn = grns[0]
+        links.append(
+            ProposedLink(
+                from_document_id=source.document_id,
+                to_document_id=grn.document_id,
+                link_type=LinkType.INV_GRN,
+                level=LinkLevel.HEADER,
+                method=LinkMethod.CONTENT,
+                confidence=config.step3_min_score,
+                state=LinkState.SUGGESTED,
+                evidence=evidence,
+                via_document_id=grn.document_id,
+            )
+        )
+    return tuple(links)
+
+
 def resolve_links(
     documents: tuple[MappingDocument, ...] | list[MappingDocument],
     purchase_orders: tuple[MappingPO, ...] | list[MappingPO],
@@ -3270,6 +3395,32 @@ def resolve_links(
             remaining_balance,
             selected_config,
         )
+
+    for source in sorted_documents:
+        if (
+            source.document.header.doc_type is not DocType.INVOICE
+            or source.vendor_id is None
+            or any(link.link_type is LinkType.INV_PO for link in output[source.document_id].links)
+            or last_issues[source.document_id][0] is ReasonCode.VENDOR_MISMATCH
+            or (
+                last_issues[source.document_id][0] is ReasonCode.NO_PO_LINK
+                and last_issues[source.document_id][1] is not None
+            )
+            or _unique_header_po_refs(source.document)
+            or _line_po_refs(source.document)
+        ):
+            continue
+        fallback = _unreferenced_fallback_links(
+            source, sorted_documents, sorted_pos, output, selected_config
+        )
+        if fallback:
+            prior_result = output[source.document_id]
+            output[source.document_id] = _resolution(
+                source,
+                (*prior_result.links, *fallback),
+                candidates=prior_result.candidates,
+            )
+            last_issues[source.document_id] = (None, None)
 
     updates_by_source: dict[UUID, list[FieldVerificationUpdate]] = {}
     for update in verification_updates:

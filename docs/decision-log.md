@@ -2642,3 +2642,37 @@ vendor_name               8        0        2       10      80.0%         [0.490
 - **Deploy:** rollback tags `:pre-b16`; first build failed on a PyPI connect error inside Docker (network, not code), retry built; setup kept 0036; swap; `/readyz` 200; api/worker/ai-worker run 0.1.16 with the new code; 0 errors in logs; counters unchanged; 0 failed jobs.
 - **Rollback:** `docker tag reconbench-{api,worker,ai-worker,setup}:pre-b16 …:latest` then `docker compose up -d api worker ai-worker`; web: `git checkout live-20261103-b15 -- web/src`. Before rolling back, count invoice lines whose `po_line_ref` was set by a person (the old aligner ignores them, harmless).
 - **Still open:** lump-sum line (PD-3c, Sir's rule); unread TOTAL row (KI-015); garbled OCR lines; missing POs for three invoices; OCR upgrades proposed (digit-only cell re-reads, `--oem 1`, preprocessing behind a flag), not built.
+
+## D124 - Run-2 invoice issues: engine 0.1.17 built and replayed, not deployed (4 Nov 2026)
+- **Source:** the owner's review of `docs/claude/analysis-run2-invoice-issues.md` (phases 2–5). Branch `fix/run2-issues`; one lead plus five Sonnet sub-agents.
+- **Owner decision:** PD-3c approved (the owner's report of Sir's decision): a line with no quantity or rate on both invoice and PO is compared by amount.
+- **Engine and extraction (engine 0.1.17, migration 0037):**
+  - `s5.lump_sum` (PD-3c): an amount within the unit-rate tolerance passes; above it is RATE_HIGH, below it is RATE_LOW; with no PO amount, or an itemised PO line, the line is Needs review. It is never Matched with nothing compared.
+  - `s5.header_totals_read`: unread taxable, or line tax with no header tax, gives Needs review (LOW_CONFIDENCE_DATA).
+  - The totals solver takes line taxes as a tax candidate, confirmed only by a separately printed grand total or the amount in words. A missing grand total is pre-filled as DERIVED (0.60, below the gate).
+  - Freight spread across line amounts is accepted only when every excess is ≥ 0, each is ≤ 5 %, and they sum to a printed freight figure.
+  - `s4.serials` / `SERIAL_DIFF` (WARN) when an invoice serial is not on the GRN. The rules reader captures S/N rows.
+  - `OCR_ORIENTATION_UNSURE` page warning when OSD is undecided.
+- **Links:** a SUGGESTED-only fallback link when no reference is read. It needs exactly one same-vendor PO, matched directly or through its GRN, with total and date agreeing. An undated GRN takes its PO's date. A PO without priced lines has an unknown balance.
+- **Save:** a correction whose arithmetic QA fails leaves the failing fields unverified. `override_reason` on the correction body verifies them, audited. The API changed; there is no web control yet.
+- **Export:**
+  - new "Not included" and "PO Balance" sheets;
+  - the invoice's own GSTIN;
+  - "Payable (ex-GST)" plus a "Payable incl. GST" column;
+  - an invoice-total fallback.
+- **Verified:**
+  - offline suite: 1668 passed;
+  - 89 integration tests pass on throwaway postgres:16.15, after the reason-code downgrade test was updated for SERIAL_DIFF;
+  - web: tsc, lint, vitest 81;
+  - ruff (no new findings), mypy --strict, lint-imports, purity, rules hash, engine version.
+- **Replay on a copy of live (current versions, re-mapped):**
+  - §6 Exception → Matched;
+  - §10 Unlinked → Needs review, with 2 suggested links to its PO and GRN, the only link change;
+  - §5 Matched, after the owner's "Read with rules";
+  - every other case unchanged.
+  - Extraction changes apply only to re-read documents, so they are not replayed.
+- **Not done:**
+  - deploy;
+  - a web control for `override_reason`;
+  - the e-way-bill page warning (page kinds are not stored);
+  - the 2-way invoice↔GRN rule (Sir).

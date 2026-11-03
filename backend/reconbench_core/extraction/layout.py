@@ -62,6 +62,8 @@ class PageLayout:
     source: PageSource
     rules: tuple[Rule, ...] = ()
     rotation: int = 0
+    # OCR orientation detection ran but could not decide; the page was read as it came.
+    orientation_unsure: bool = False
 
     @property
     def median_conf(self) -> int:
@@ -204,6 +206,7 @@ def layout_to_dict(layout: DocumentLayout) -> dict[str, object]:
                     for word in page.words
                 ],
                 "rules": [[rule.x0, rule.y0, rule.x1, rule.y1] for rule in page.rules],
+                **({"orientation_unsure": True} if page.orientation_unsure else {}),
             }
             for page in layout.pages
         ],
@@ -220,6 +223,7 @@ def layout_from_dict(data: dict[str, object]) -> DocumentLayout:
                 height=int(raw["height"]),
                 source=PageSource(raw["source"]),
                 rotation=int(raw.get("rotation", 0)),
+                orientation_unsure=bool(raw.get("orientation_unsure", False)),
                 words=tuple(
                     Word(str(t), int(a), int(b), int(c), int(d), int(e))
                     for t, a, b, c, d, e in raw["words"]

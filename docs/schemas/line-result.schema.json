@@ -197,7 +197,8 @@
         "GRN_OVER_PO",
         "LATE_DELIVERY",
         "AI_VALUE_UNVERIFIED",
-        "AI_LINES_MISSING"
+        "AI_LINES_MISSING",
+        "SERIAL_DIFF"
       ],
       "title": "ReasonCode",
       "type": "string"

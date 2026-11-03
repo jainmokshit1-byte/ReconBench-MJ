@@ -45,7 +45,7 @@ def _clone() -> Iterator[Engine]:
     try:
         with engine.connect() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-        assert heads == {"0036"}, heads
+        assert heads == {"0037"}, heads
         os.environ["RB_MIGRATOR_DATABASE_URL"] = clone_url
         yield engine
     finally:
@@ -93,8 +93,10 @@ def test_downgrade_removes_only_the_code_and_upgrade_adds_it_back() -> None:
             before = dict(
                 connection.execute(
                     sa.text(
-                        "SELECT code, count(*) FROM reason_code WHERE code <> :code GROUP BY code"
+                        "SELECT code, count(*) FROM reason_code "
+                        "WHERE code <> :code AND code <> 'SERIAL_DIFF' GROUP BY code"
                     ),
+                    # SERIAL_DIFF arrives later (0037), so the downgrade removes it too.
                     {"code": _CODE},
                 ).all()
             )
@@ -112,7 +114,7 @@ def test_downgrade_removes_only_the_code_and_upgrade_adds_it_back() -> None:
 
         command.upgrade(_config(), "head")
         with engine.connect() as connection:
-            assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0036"
+            assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0037"
             assert set(_rows(connection)) == _workspaces(connection)
 
 

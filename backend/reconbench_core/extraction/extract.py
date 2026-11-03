@@ -1024,6 +1024,8 @@ def extract_document(
         extras: dict[str, Any] = {}
         if numbers.freight.known:
             extras["freight"] = format(numbers.freight.value, "f")
+        if item.serials:
+            extras["serials"] = list(item.serials)
         line_raw.append(raw)
         line_extras.append(extras)
         line_checks.append(line_check)

@@ -65,7 +65,7 @@ def _clone() -> Iterator[Engine]:
     try:
         with engine.connect() as connection:
             heads = set(MigrationContext.configure(connection).get_current_heads())
-        assert heads == {"0036"}, heads
+        assert heads == {"0037"}, heads
         os.environ["RB_MIGRATOR_DATABASE_URL"] = clone_url
         yield engine
     finally:
@@ -228,7 +228,7 @@ def test_downgrade_restores_the_previous_check_and_upgrade_reapplies_it() -> Non
 
         command.upgrade(_config(), "head")
         with engine.connect() as connection:
-            assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0036"
+            assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0037"
             assert "'ai'::text" in str(connection.scalar(sa.text(_CHECK)))
 
 

@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Any
 from uuid import UUID
 
 from reconbench_core.align import AlignmentResult, align_lines
@@ -64,6 +65,9 @@ _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
 _SPLIT_TAX_EQUAL_TOLERANCE = Decimal("0.02")
 _SPLIT_TAX_RATE_TOLERANCE = Decimal("0.05")
+# A freight share folded into a line amount is a small surcharge on the line's own value.
+_SPREAD_FREIGHT_MAX_SHARE = Decimal("0.05")
+_FREIGHT_WORDS = ("freight", "courier", "shipping")
 _ACTIVE_LINK_STATES = {LinkState.AUTO, LinkState.CONFIRMED, LinkState.SUGGESTED}
 _DUPLICATE_NUMBER_LOOKALIKE_FOLD = str.maketrans(
     {"O": "0", "I": "1", "L": "1", "|": "1", "S": "5", "B": "8", "Z": "2"}
@@ -330,6 +334,7 @@ def _check_math(
     actual: Decimal,
     expected: Decimal,
     tolerance: Tolerance,
+    extra_evidence: dict[str, Any] | None = None,
 ) -> bool:
     difference = actual - expected
     passed = _tolerance_pass(actual, expected, tolerance)
@@ -343,7 +348,10 @@ def _check_math(
             actual=actual,
             variance=difference,
             tolerance=tolerance,
-            evidence={"formula": "absolute or percentage variance per configured limit_mode"},
+            evidence={
+                "formula": "absolute or percentage variance per configured limit_mode",
+                **(extra_evidence or {}),
+            },
         )
     )
     if not passed:
@@ -452,6 +460,20 @@ def _accepted_grn_qty(line: DocLine) -> tuple[Decimal, Decimal, bool]:
     return received, rejected, True
 
 
+def _line_serials(line: DocLine) -> frozenset[str]:
+    """Serial numbers on a line (a list from rules/XML, a text cell from AI), normalised."""
+
+    raw = line.extras.get("serials")
+    if isinstance(raw, str):
+        parts: list[object] = list(re.split(r"[,;\s]+", raw))
+    elif isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    else:
+        return frozenset()
+    found = {re.sub(r"[\s-]+", "", part).upper() for part in parts if isinstance(part, str)}
+    return frozenset(item for item in found if item)
+
+
 def _link_needs_confirming(link: ReconciliationLink, config: ReconciliationConfig) -> bool:
     """A suggested or below-threshold link needs a person; a confirmed link already had one.
 
@@ -491,11 +513,13 @@ def _build_grn_ledger(
     dict[tuple[UUID, int], Decimal],
     dict[tuple[UUID, int], set[UUID]],
     dict[tuple[UUID, int], bool],
+    dict[tuple[UUID, int], frozenset[str]],
 ]:
     accepted: dict[tuple[UUID, int], Decimal] = {}
     rejected: dict[tuple[UUID, int], Decimal] = {}
     grn_ids: dict[tuple[UUID, int], set[UUID]] = {}
     fallback_received: dict[tuple[UUID, int], bool] = {}
+    serials: dict[tuple[UUID, int], frozenset[str]] = {}
     for opening in sorted(
         snapshot.opening_balances, key=lambda item: (str(item.po_document_id), item.po_line_no)
     ):
@@ -538,16 +562,21 @@ def _build_grn_ledger(
             accepted[key] = accepted.get(key, _ZERO) + qty
             rejected[key] = rejected.get(key, _ZERO) + rejected_qty
             grn_ids.setdefault(key, set()).add(grn_id)
+            line_serials = _line_serials(grn_line)
+            if line_serials:
+                serials[key] = serials.get(key, frozenset()) | line_serials
             if assumed:
                 fallback_received[key] = True
-    return accepted, rejected, grn_ids, fallback_received
+    return accepted, rejected, grn_ids, fallback_received, serials
 
 
-def _invoice_net_rate(line: DocLine) -> Decimal | None:
+def _invoice_net_rate(line: DocLine, freight_share: Decimal = _ZERO) -> Decimal | None:
+    """Amount per unit; an accepted spread-freight share is not part of the price."""
+
     quantity = _line_qty(line)
     amount = _line_amount(line)
     if quantity not in (None, _ZERO) and amount is not None:
-        return amount / quantity
+        return (amount - freight_share) / quantity
     return _field_decimal(line, "rate")
 
 
@@ -638,6 +667,142 @@ def _line_freight(line: DocLine) -> Decimal | None:
     except InvalidOperation:
         return None
     return freight if freight.is_finite() else None
+
+
+def _lump_sum_line(
+    work: _LineWork,
+    amount: Decimal,
+    config: ReconciliationConfig,
+    vendor_id: UUID | None,
+) -> Decimal | None:
+    """PD-3c: compare a line billed by amount alone with its PO line's amount.
+
+    Returns the PO amount the line is expected at, or None when nothing could be compared;
+    an uncompared line is never left Matched with nothing paid.
+    """
+
+    po_line = work.po_line
+    assert po_line is not None
+    po_amount = _field_decimal(po_line, "amount")
+    if po_amount is None or _line_qty(po_line) is not None or _field_decimal(po_line, "rate"):
+        _add_work_check(
+            work,
+            _make_check(
+                "s5.lump_sum",
+                CheckOutcome.REVIEW,
+                code=ReasonCode.ITEM_UNSURE,
+                level=ReasonLevel.REVIEW,
+                actual=amount,
+                expected=po_amount,
+                evidence={
+                    "message": "The invoice line has no quantity or rate; the PO line is "
+                    + ("itemised" if po_amount is not None else "without an amount")
+                    + ", so the amount could not be compared."
+                },
+            ),
+            ReasonCode.ITEM_UNSURE,
+        )
+        work.payable_taxable = _ZERO
+        work.at_risk = amount
+        return None
+    rule = _rule(config, "unit_rate", vendor_id, work.line)
+    variance = amount - po_amount
+    high = variance > _ZERO
+    if _tolerance_pass(amount, po_amount, rule):
+        outcome, reason, level = CheckOutcome.PASS, None, None
+    else:
+        reason = ReasonCode.RATE_HIGH if high else ReasonCode.RATE_LOW
+        outcome = CheckOutcome.FAIL if high else CheckOutcome.WARN
+        level = ReasonLevel.FAIL if high else ReasonLevel.WARN
+    _add_work_check(
+        work,
+        _make_check(
+            "s5.lump_sum",
+            outcome,
+            code=reason,
+            level=level,
+            expected=po_amount,
+            actual=amount,
+            variance=variance,
+            tolerance=rule,
+        ),
+        reason,
+    )
+    if config.payable_rate_mode == "hold":
+        work.payable_taxable = _ZERO if reason is ReasonCode.RATE_HIGH else amount
+    else:
+        work.payable_taxable = min(amount, po_amount)
+    work.at_risk = amount - work.payable_taxable
+    return po_amount
+
+
+def _decimal_text(raw: object) -> Decimal | None:
+    if not isinstance(raw, (str, Decimal)):
+        return None
+    try:
+        value = Decimal(str(raw).replace(",", "").strip())
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _printed_freight_figures(document: Document) -> list[Decimal]:
+    """Freight totals the invoice prints: a header extra and/or freight/courier CHARGE lines."""
+
+    figures: list[Decimal] = []
+    header_freight = _decimal_text(document.header.extras.get("freight"))
+    if header_freight is not None and header_freight > _ZERO:
+        figures.append(header_freight)
+    charged = _ZERO
+    for line in document.lines:
+        if _value(line.line_type) is not LineType.CHARGE:
+            continue
+        description = (_text(_value(line.description)) or "").casefold()
+        amount = _field_decimal(line, "amount")
+        if amount is not None and any(word in description for word in _FREIGHT_WORDS):
+            charged += amount
+    if charged > _ZERO:
+        figures.append(charged)
+    return figures
+
+
+def _spread_freight_shares(
+    document: Document, tolerance: Tolerance
+) -> tuple[dict[int, Decimal], Decimal | None]:
+    """Per-line freight folded into line amounts, accepted only when it adds up to the print.
+
+    A line whose amount differs from qty x rate - discount fails line math. Those excesses are
+    taken as freight shares only if every failing line has a positive excess of at most
+    ``_SPREAD_FREIGHT_MAX_SHARE`` of its value and the excesses sum to a printed freight figure
+    within the arithmetic tolerance. Otherwise nothing is accepted and the lines keep failing.
+    """
+
+    excess: dict[int, Decimal] = {}
+    for line in document.lines:
+        if _value(line.line_type) is LineType.CHARGE:
+            continue
+        quantity = _line_qty(line)
+        rate = _field_decimal(line, "rate")
+        amount = _line_amount(line)
+        if quantity is None or rate is None or amount is None:
+            continue
+        base = quantity * rate - (_field_decimal(line, "discount") or _ZERO)
+        if _tolerance_pass(amount, base, tolerance):
+            continue
+        freight = _line_freight(line)
+        if freight is not None and _tolerance_pass(amount, base + freight, tolerance):
+            continue
+        share = amount - base
+        if share <= _ZERO or base <= _ZERO or share > base * _SPREAD_FREIGHT_MAX_SHARE:
+            return {}, None
+        excess[line.line_no] = share
+    if not excess:
+        return {}, None
+    total = sum(excess.values(), _ZERO)
+    for printed in _printed_freight_figures(document):
+        if _tolerance_pass(total, printed, tolerance):
+            return excess, printed
+    return {}, None
 
 
 def _tax_rate_for_line(work: _LineWork) -> Decimal | None:
@@ -748,6 +913,8 @@ def _apply_financial_checks(
                     case_reasons,
                 )
 
+        arithmetic_rule = _rule(config, "arithmetic", invoice.vendor_id, None)
+        freight_shares, freight_printed = _spread_freight_shares(invoice.document, arithmetic_rule)
         for work in sorted(invoice_works, key=lambda item: item.line.line_no):
             amount = _line_amount(work.line)
             work.line_taxable = amount or _ZERO
@@ -909,7 +1076,9 @@ def _apply_financial_checks(
                     )
             elif work.po_line is not None:
                 po_rate = _field_decimal(work.po_line, "rate")
-                invoice_rate = _invoice_net_rate(work.line)
+                invoice_rate = _invoice_net_rate(
+                    work.line, freight_shares.get(work.line.line_no, _ZERO)
+                )
                 work.po_rate = po_rate
                 work.invoice_rate = invoice_rate
                 if quantity is not None and po_rate is not None:
@@ -1040,6 +1209,22 @@ def _apply_financial_checks(
                     work.payable_rate = payable_rate
                     work.payable_taxable = work.eligible * payable_rate
                     work.at_risk = work.line_taxable - work.payable_taxable
+                elif quantity is None and invoice_rate is None and amount:
+                    lump_expected = _lump_sum_line(work, amount, config, invoice.vendor_id)
+                    if lump_expected is not None:
+                        expected += lump_expected
+                        if (
+                            invoice.document_id not in exact_duplicate_ids
+                            and invoice.document_id not in snapshot.rejected_invoice_ids
+                        ):
+                            po_invoice_amounts = po_values.setdefault(work.po.document_id, {})
+                            prior_invoice_amount = po_invoice_amounts.get(
+                                invoice.document_id, (invoice, _ZERO)
+                            )[1]
+                            po_invoice_amounts[invoice.document_id] = (
+                                invoice,
+                                prior_invoice_amount + lump_expected,
+                            )
                 else:
                     work.payable_taxable = _ZERO
                     work.at_risk = work.line_taxable
@@ -1073,7 +1258,6 @@ def _apply_financial_checks(
                 )
 
         expected_by_invoice[invoice.document_id] = expected if matched_any else _ZERO
-        arithmetic_rule = _rule(config, "arithmetic", invoice.vendor_id, None)
         line_total = _ZERO
         line_total_available = True
         for line in invoice.document.lines:
@@ -1094,6 +1278,9 @@ def _apply_financial_checks(
                     and _tolerance_pass(amount, expected_amount + freight, arithmetic_rule)
                 ):
                     expected_amount += freight
+                share = freight_shares.get(line.line_no)
+                if share is not None:
+                    expected_amount += share
                 _check_math(
                     header_checks[invoice.document_id],
                     case_reasons[invoice.document_id],
@@ -1102,6 +1289,9 @@ def _apply_financial_checks(
                     amount,
                     expected_amount,
                     arithmetic_rule,
+                    {"freight_share": str(share), "freight_total": str(freight_printed)}
+                    if share is not None
+                    else None,
                 )
         taxable = _taxable(invoice.document)
         if taxable is not None and line_total_available and invoice.document.lines:
@@ -1183,6 +1373,33 @@ def _apply_financial_checks(
         header_tax_read = any(
             _decimal(_value(getattr(header, name))) is not None for name in ("cgst", "sgst", "igst")
         )
+        unread_totals = [
+            name
+            for name, missing in (
+                ("taxable_total", taxable is None),
+                ("tax", sum(tax_bases, _ZERO) > _ZERO and not header_tax_read),
+            )
+            if missing
+        ]
+        if invoice.document.lines and unread_totals:
+            # The header checks above skip unread totals; a skipped check must not read as a pass.
+            _add_case_check(
+                invoice,
+                _make_check(
+                    "s5.header_totals_read",
+                    CheckOutcome.REVIEW,
+                    code=ReasonCode.LOW_CONFIDENCE_DATA,
+                    level=ReasonLevel.REVIEW,
+                    evidence={
+                        "missing": unread_totals,
+                        "message": "Invoice totals were not read, so they were not checked "
+                        "against the lines.",
+                    },
+                ),
+                ReasonCode.LOW_CONFIDENCE_DATA,
+                header_checks,
+                case_reasons,
+            )
         if tax_bases and header_tax_read:
             expected_tax = sum(tax_bases, _ZERO)
             actual_tax = sum(
@@ -1272,7 +1489,7 @@ def evaluate(
     }
     active_links = _active_links(snapshot)
     exact_duplicates, suspected_duplicates = _duplicate_map(invoices, snapshot, config)
-    grn_accepted, grn_rejected, grn_ids_by_line, grn_fallback = _build_grn_ledger(
+    grn_accepted, grn_rejected, grn_ids_by_line, grn_fallback, grn_serials = _build_grn_ledger(
         snapshot, documents, po_documents, active_links, config
     )
     earliest_related: dict[tuple[UUID, int], date] = {}
@@ -1658,6 +1875,27 @@ def evaluate(
             ),
         ):
             work.grn_ids.update(grn_ids_by_line.get(ledger_key, set()))
+            invoice_serials = _line_serials(work.line)
+            received_serials = grn_serials.get(ledger_key, frozenset())
+            # Serials only on one side prove nothing. A part-billed PO line carries a subset of
+            # the receipt's serials, so only a serial billed but not received is a difference.
+            if invoice_serials and received_serials and invoice_serials - received_serials:
+                _add_work_check(
+                    work,
+                    _make_check(
+                        "s4.serials",
+                        CheckOutcome.WARN,
+                        code=ReasonCode.SERIAL_DIFF,
+                        level=ReasonLevel.WARN,
+                        evidence={
+                            "invoice_count": len(invoice_serials),
+                            "grn_count": len(received_serials),
+                            "only_on_invoice": sorted(invoice_serials - received_serials),
+                            "only_on_grn": sorted(received_serials - invoice_serials),
+                        },
+                    ),
+                    ReasonCode.SERIAL_DIFF,
+                )
             if work.alignment is not None:
                 if work.alignment.state is AlignmentState.UNSURE:
                     work.checks.append(

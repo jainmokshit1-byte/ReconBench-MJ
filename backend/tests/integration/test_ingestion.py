@@ -1360,6 +1360,8 @@ def test_csv_upload_is_queued_parsed_and_duplicate_upload_is_idempotent(
                 "Exceptions",
                 "Vendor Summary",
                 "Field Origin",
+                "Not included",
+                "PO Balance",
             ]
             assert workbook["Summary"]["B4"].value == api_kpis["invoice_count"]
             # Home KPI cards equal the Excel Summary (App Flow, Home).

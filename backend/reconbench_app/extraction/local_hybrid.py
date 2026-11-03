@@ -183,21 +183,30 @@ def _tesseract(image_path: str, arguments: list[str], timeout: int) -> str:
     return completed.stdout
 
 
-def _orientation(image_path: str) -> int:
-    """Clockwise rotation (0/90/180/270) Tesseract recommends, 0 when unsure."""
+def _orientation(image_path: str) -> tuple[int, bool]:
+    """Clockwise rotation (0/90/180/270) Tesseract recommends, 0 when unsure.
+
+    The flag is True when OSD ran but could not decide (timeout, no output, unreadable output
+    or confidence under 2.0). The rotation used is 0 in that case, as before.
+    """
 
     try:
         output = _tesseract(image_path, ["--psm", "0"], _OSD_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        return 0
+        return 0, True
     rotate = 0
     confidence = 0.0
-    for line in output.splitlines():
-        if line.startswith("Rotate:"):
-            rotate = int(line.split(":", 1)[1].strip() or 0)
-        elif line.startswith("Orientation confidence:"):
-            confidence = float(line.split(":", 1)[1].strip() or 0)
-    return rotate if rotate in {90, 180, 270} and confidence >= 2.0 else 0
+    try:
+        for line in output.splitlines():
+            if line.startswith("Rotate:"):
+                rotate = int(line.split(":", 1)[1].strip() or 0)
+            elif line.startswith("Orientation confidence:"):
+                confidence = float(line.split(":", 1)[1].strip() or 0)
+    except ValueError:
+        return 0, True
+    if confidence < 2.0:
+        return 0, True
+    return (rotate if rotate in {90, 180, 270} else 0), False
 
 
 def ocr_page(image: Image.Image, number: int, settings: OcrSettings) -> PageLayout:
@@ -212,7 +221,7 @@ def ocr_page_with_image(
         path = os.path.join(directory, "page.png")
         gray = image.convert("L")
         gray.save(path)
-        rotation = _orientation(path)
+        rotation, orientation_unsure = _orientation(path)
         if rotation:
             gray = gray.rotate(-rotation, expand=True)
         skew = estimate_skew(gray)
@@ -258,6 +267,7 @@ def ocr_page_with_image(
             source=PageSource.OCR,
             rules=rules,
             rotation=rotation,
+            orientation_unsure=orientation_unsure,
         ),
         gray,
     )

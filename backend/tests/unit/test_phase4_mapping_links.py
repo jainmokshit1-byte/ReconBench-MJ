@@ -2086,3 +2086,147 @@ def test_same_vendor_number_amount_and_date_give_the_expected_po() -> None:
     assert [(link.to_document_id, link.method) for link in result.links] == [
         (expected.document_id, LinkMethod.LABELED)
     ]
+
+
+# --- fallback suggestion when no reference is read ------------------------------------------
+
+
+def _bare_invoice_xml(*, total: str = "1000", date: str = "20260201") -> str:
+    return (
+        f"<Invoice><InvoiceNo>INV-F</InvoiceNo><InvoiceDate>{date}</InvoiceDate>"
+        "<Supplier>Acme Supplies</Supplier>"
+        f"<TaxableTotal>{total}</TaxableTotal><InvoiceTotal>{total}</InvoiceTotal></Invoice>"
+    )
+
+
+def _bare_po_xml(number: str, *, total: str = "1000", date: str = "20260201") -> str:
+    return (
+        f"<PurchaseOrder><OrderNo>{number}</OrderNo><OrderDate>{date}</OrderDate>"
+        f"<Supplier>Acme Supplies</Supplier><TaxableTotal>{total}</TaxableTotal>"
+        f"<InvoiceTotal>{total}</InvoiceTotal></PurchaseOrder>"
+    )
+
+
+def _bare_grn_xml(number: str, po_ref: str, *, total: str = "1000", date: str = "20260201") -> str:
+    return (
+        f"<GRN><GRNNo>{number}</GRNNo><GRNDate>{date}</GRNDate>"
+        f"<Supplier>Acme Supplies</Supplier><PORef>{po_ref}</PORef>"
+        f"<TaxableTotal>{total}</TaxableTotal><InvoiceTotal>{total}</InvoiceTotal></GRN>"
+    )
+
+
+def _fallback_case(
+    *, extra_po: str | None = None, **invoice_kwargs: str
+) -> tuple[MappingDocument, list[MappingDocument], list[MappingPO]]:
+    invoice = _source(10, _document(_bare_invoice_xml(**invoice_kwargs), DocType.INVOICE))
+    grn = _verify_header_reference(
+        _source(11, _document(_bare_grn_xml("GRN-F", "PO-F"), DocType.GRN)), "po_refs"
+    )
+    pos = [_po(20, _document(_bare_po_xml("PO-F"), DocType.PO))]
+    if extra_po:
+        pos.append(_po(21, _document(_bare_po_xml(extra_po), DocType.PO)))
+    return invoice, [invoice, grn], pos
+
+
+def _result_for(results: Any, invoice: MappingDocument) -> Any:
+    return next(r for r in results if r.document_id == invoice.document_id)
+
+
+def test_no_reference_unique_vendor_po_and_grn_is_suggested_never_auto() -> None:
+    invoice, docs, pos = _fallback_case()
+    config = MappingConfig(
+        link_auto_accept=Decimal("0"), step3_min_score=Decimal("0"), step3_min_lead=Decimal("0")
+    )
+    result = _result_for(resolve_links(docs, pos, config), invoice)
+    po_links = [link for link in result.links if link.link_type.value == "inv_po"]
+    grn_links = [link for link in result.links if link.link_type.value == "inv_grn"]
+    assert len(po_links) == 1 and po_links[0].to_document_id == _id(20)
+    assert len(grn_links) == 1 and grn_links[0].to_document_id == _id(11)
+    for link in (*po_links, *grn_links):
+        assert link.method is LinkMethod.CONTENT
+        assert link.state is LinkState.SUGGESTED
+        assert "no reference read; inferred from vendor, date and amount" in link.evidence
+    assert result.outcome is ResolutionOutcome.SUGGESTED
+
+
+def test_no_reference_fallback_confidence_never_exceeds_step3_min_score() -> None:
+    invoice, docs, pos = _fallback_case()
+    result = _result_for(resolve_links(docs, pos), invoice)
+    assert result.links
+    assert all(link.confidence <= MappingConfig().step3_min_score for link in result.links)
+    assert all(link.state is LinkState.SUGGESTED for link in result.links)
+
+
+def test_no_reference_two_candidate_pos_gives_no_link() -> None:
+    invoice, docs, pos = _fallback_case(extra_po="PO-G")
+    assert not _result_for(resolve_links(docs, pos), invoice).links
+
+
+def test_no_reference_amount_out_of_tolerance_gives_no_link() -> None:
+    invoice, docs, pos = _fallback_case(total="1500")
+    assert not _result_for(resolve_links(docs, pos), invoice).links
+
+
+def test_no_reference_date_outside_window_gives_no_link() -> None:
+    invoice, docs, pos = _fallback_case(date="20260301")
+    assert not _result_for(resolve_links(docs, pos), invoice).links
+
+
+def test_no_reference_vendor_none_gives_no_link() -> None:
+    invoice, docs, pos = _fallback_case()
+    anonymous = invoice.model_copy(update={"vendor_id": None})
+    docs[0] = anonymous
+    assert not _result_for(resolve_links(docs, pos), anonymous).links
+
+
+def test_no_reference_person_rejected_po_gives_no_link() -> None:
+    invoice, docs, pos = _fallback_case()
+    rejected = invoice.model_copy(update={"rejected_po_ids": (_id(20),)})
+    docs[0] = rejected
+    assert not _result_for(resolve_links(docs, pos), rejected).links
+
+
+def test_read_but_missing_po_reference_is_not_replaced_by_fallback() -> None:
+    xml = _bare_invoice_xml().replace("<TaxableTotal>", "<PORef>PO-404</PORef><TaxableTotal>", 1)
+    invoice = _verify_header_reference(_source(10, _document(xml, DocType.INVOICE)), "po_refs")
+    _, docs, pos = _fallback_case()
+    docs[0] = invoice
+    result = _result_for(resolve_links(docs, pos), invoice)
+    assert not result.links
+    assert result.reason_detail == "PO_NOT_IN_POOL"
+
+
+def test_fallback_does_not_change_an_already_linked_invoice() -> None:
+    invoice = _verify_header_reference(
+        _source(10, _document(_invoice_xml("INV-10", po_ref="PO-100"), DocType.INVOICE)),
+        "po_refs",
+    )
+    po = _po(20, _document(_po_xml("PO-100"), DocType.PO))
+    result = resolve_links([invoice], [po])[0]
+    assert result.links
+    assert all(link.method is LinkMethod.LABELED for link in result.links)
+
+
+def test_no_reference_undated_grn_of_an_unpriced_po_is_suggested() -> None:
+    # The PO was read with no lines (balance unknown, 0) and the GRN with no date.
+    invoice = _source(10, _document(_bare_invoice_xml(), DocType.INVOICE))
+    grn_xml = _bare_grn_xml("GRN-F", "PO-F").replace("<GRNDate>20260201</GRNDate>", "")
+    grn = _verify_header_reference(_source(11, _document(grn_xml, DocType.GRN)), "po_refs")
+    po = _po(20, _document(_bare_po_xml("PO-F", total="0"), DocType.PO)).model_copy(
+        update={"open_balance": Decimal("0")}
+    )
+    result = _result_for(resolve_links([invoice, grn], [po]), invoice)
+    po_links = [link for link in result.links if link.link_type.value == "inv_po"]
+    assert len(po_links) == 1 and po_links[0].state is LinkState.SUGGESTED
+
+
+def test_no_reference_spent_priced_po_gives_no_link() -> None:
+    invoice, docs, pos = _fallback_case()
+    xml = _bare_po_xml("PO-F").replace(
+        "</PurchaseOrder>",
+        "<Line><Description>Item</Description><Quantity>1</Quantity><Rate>1000</Rate>"
+        "<Amount>1000</Amount></Line></PurchaseOrder>",
+    )
+    spent = _po(20, _document(xml, DocType.PO)).model_copy(update={"open_balance": Decimal("0")})
+    assert _document(xml, DocType.PO).lines, "fixture must have a priced line"
+    assert not _result_for(resolve_links(docs, [spent]), invoice).links

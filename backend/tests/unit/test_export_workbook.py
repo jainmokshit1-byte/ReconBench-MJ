@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 import reconbench_app.export_service as export_service
 from openpyxl import load_workbook
 from reconbench_app.export_service import P0_SHEETS, ExportService
@@ -101,6 +102,7 @@ def test_workbook_readback_checks_formulas_cached_values_and_text_safety(tmp_pat
         assert values["Summary"]["B11"].value == 210
         assert values["Summary"]["B12"].value == 180
         assert values["Summary"]["B13"].value == 20
+        assert values["Summary"]["B14"].value == pytest.approx(189.0)
     finally:
         formulas.close()
         values.close()
@@ -187,7 +189,7 @@ def test_invoice_sheet_names_the_reading_method_in_the_last_column(tmp_path: Pat
         sheet = workbook["Invoice Recon"]
         assert sheet["T1"].value == "Payment Due Date"
         assert sheet["U1"].value == "Reading Method"
-        assert sheet.max_column == 21
+        assert sheet.max_column == 23
         assert [sheet["C2"].value, sheet["U2"].value] == ["0142", "Rules"]
         assert [sheet["C3"].value, sheet["U3"].value] == ["0143", "AI reading"]
         assert sheet["K2"].value == "=I2+J2"
