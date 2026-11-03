@@ -94,6 +94,34 @@ def problem_response(
     )
 
 
+def _field_detail(item: Mapping[str, Any]) -> str:
+    """A plain-words reason for one validation error; never echoes a submitted value."""
+
+    kind = item.get("type")
+    context = item.get("ctx")
+    limits = context if isinstance(context, Mapping) else {}
+
+    def limit(name: str) -> int | None:
+        value = limits.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    if kind == "decimal_max_places" and (places := limit("decimal_places")) is not None:
+        return f"must have at most {places} decimals"
+    if kind == "decimal_max_digits" and (digits := limit("max_digits")) is not None:
+        return f"must have at most {digits} digits"
+    if kind in {"decimal_parsing", "decimal_type", "decimal_whole_digits"}:
+        return "is not a valid number"
+    if kind in {"string_too_long", "too_long"} and (size := limit("max_length")) is not None:
+        return f"is too long (at most {size})"
+    if kind == "string_too_short":
+        return "is too short"
+    if kind == "missing":
+        return "is required"
+    if kind in {"date_parsing", "date_from_datetime_parsing", "date_type"}:
+        return "is not a valid date"
+    return "This field is invalid."
+
+
 def validation_errors(errors: Sequence[Mapping[str, Any]]) -> list[ProblemFieldError]:
     """Map framework validation details to stable, non-sensitive field errors."""
 
@@ -105,7 +133,7 @@ def validation_errors(errors: Sequence[Mapping[str, Any]]) -> list[ProblemFieldE
             ProblemFieldError(
                 location=[part if isinstance(part, int) else str(part) for part in location],
                 code="invalid_field",
-                detail="This field is invalid.",
+                detail=_field_detail(item),
             )
         )
     return result

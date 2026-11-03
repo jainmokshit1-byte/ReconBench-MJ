@@ -103,6 +103,35 @@ function parseFile(value: unknown): IngestionFile | null {
   };
 }
 
+/** One field the server refused in a 422: where it is in the body and why, in plain words. */
+export interface FieldIssue {
+  location: Array<string | number>;
+  detail: string;
+}
+
+/** A failed request. A 422 carries the fields the server named. */
+export class ApiRequestError extends Error {
+  readonly status: number;
+  readonly fieldIssues: FieldIssue[];
+
+  constructor(message: string, status: number, fieldIssues: FieldIssue[] = []) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.fieldIssues = fieldIssues;
+  }
+}
+
+function parseFieldIssues(body: Record<string, unknown>): FieldIssue[] {
+  const errors = body["errors"];
+  if (!Array.isArray(errors)) return [];
+  return errors.flatMap((entry): FieldIssue[] => {
+    if (!isRecord(entry) || !Array.isArray(entry["location"])) return [];
+    const location = entry["location"].filter((part): part is string | number => typeof part === "string" || typeof part === "number");
+    return [{ location, detail: typeof entry["detail"] === "string" ? entry["detail"] : "" }];
+  });
+}
+
 async function request(path: string, csrfToken: string | null, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   if (csrfToken && init.method && init.method !== "GET") {
@@ -116,14 +145,16 @@ async function request(path: string, csrfToken: string | null, init: RequestInit
   if (response.status === 401) notifySessionExpired();
   if (!response.ok && response.status !== 304) {
     let message = `Request failed (${response.status})`;
+    let fieldIssues: FieldIssue[] = [];
     try {
       const body: unknown = await response.json();
       if (isRecord(body) && typeof body["detail"] === "string") message = body["detail"];
       else if (isRecord(body) && typeof body["title"] === "string") message = body["title"];
+      if (isRecord(body)) fieldIssues = parseFieldIssues(body);
     } catch {
       // Keep the status-based message if the server returns a non-JSON error.
     }
-    throw new Error(message);
+    throw new ApiRequestError(message, response.status, fieldIssues);
   }
   return response;
 }

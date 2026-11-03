@@ -4,6 +4,7 @@ import { AlertTriangle, ChevronLeft, ChevronRight, FileText, X } from "lucide-re
 import { Link } from "react-router";
 
 import {
+  ApiRequestError,
   correctDocument,
   createManualInvoice,
   displayError,
@@ -264,6 +265,54 @@ function needsVerification(details: DocumentDetails): boolean {
   return version["needs_verification"] === true || document["needs_verification"] === true;
 }
 
+/** Arithmetic checks a person's correction failed (invoice versions only), else null. */
+function correctionQaFailures(version: Record<string, unknown>): string[] | null {
+  const qa = record(record(version["extras"])["correction_qa"]);
+  if (qa["passed"] !== false) return null;
+  const failures = Array.isArray(qa["failures"])
+    ? qa["failures"].filter((item): item is string => typeof item === "string" && item !== "")
+    : [];
+  return failures.length ? failures : ["totals"];
+}
+
+/** What a save that failed the arithmetic check means for the person, or null when it passed. */
+function qaSaveNotice(updated: DocumentDetails): string | null {
+  const failures = correctionQaFailures(record(updated["version"]));
+  if (!failures) return null;
+  const what = failures.join(", ");
+  return needsVerification(updated)
+    ? `Saved, but the values don't add up (${what}). Those fields are held unverified. Edit again, tick the reviewed box and give a reason to accept them anyway.`
+    : `Saved. The values don't add up (${what}); they are marked reviewed with your reason.`;
+}
+
+const genericFieldDetail = "This field is invalid.";
+
+/** Names the fields a 422 refused ("Line 2 · Discount: must have at most 2 decimals"), or null. */
+function describeFieldIssues(error: unknown, sentLines: Array<Record<string, unknown>>): string | null {
+  if (!(error instanceof ApiRequestError) || error.fieldIssues.length === 0) return null;
+  const label = (field: string) => fieldLabels[field] ?? (field === "override_reason" ? "Reason to accept anyway" : field.replaceAll("_", " "));
+  const items: string[] = [];
+  for (const { location, detail } of error.fieldIssues) {
+    const [first, second, third] = location;
+    let where: string;
+    if (first === "lines" && typeof second === "number") {
+      const lineNo = sentLines[second]?.["line_no"];
+      const line = `Line ${typeof lineNo === "number" ? lineNo : second + 1}`;
+      where = typeof third === "string" ? `${line} · ${label(third)}` : line;
+    } else if (typeof first === "string") {
+      where = first === "lines" ? "Line items" : label(first);
+    } else {
+      continue;
+    }
+    const why = detail && detail !== genericFieldDetail ? detail : "is not valid";
+    const item = `${where}: ${why}`;
+    if (!items.includes(item)) items.push(item);
+  }
+  if (items.length === 0) return null;
+  const shown = items.slice(0, 6).join("; ");
+  return `Not saved. ${shown}${items.length > 6 ? `; and ${items.length - 6} more` : ""}.`;
+}
+
 function reviewFieldSet(version: Record<string, unknown>, evidence: EvidenceRow[]): { header: Set<string>; lines: Set<number> } {
   const extras = record(version["extras"]);
   const listed = Array.isArray(extras["review_fields"]) ? extras["review_fields"] : [];
@@ -356,6 +405,8 @@ function DocumentCard({
   const [verified, setVerified] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const [overrideReason, setOverrideReason] = useState("");
+  const qaFailures = correctionQaFailures(version);
   const [draft, setDraft] = useState<Record<EditableHeaderField, string>>(() => correctionDraft(version));
   const [lineDraft, setLineDraft] = useState<CorrectionLine[]>(() => lines.map(correctionLine));
   const [applied, setApplied] = useState<Record<string, AppliedSuggestion>>({});
@@ -457,6 +508,9 @@ function DocumentCard({
       ...Object.fromEntries(allowedLineFields.map((field) => [field, line[field].trim() || null])),
     }));
     correction["verified"] = verified;
+    // A reason to trust values that fail the arithmetic check; never sent empty.
+    const override = overrideReason.trim();
+    if (qaFailures && verified && override) correction["override_reason"] = override;
     correction["reason"] = `${docType.toUpperCase()} fields reviewed or corrected from the document preview.`;
     // Only values still equal to the applied suggestion are claimed as AI-suggested.
     const refs: AiSuggestionRef[] = Object.values(applied)
@@ -470,13 +524,15 @@ function DocumentCard({
       setDraft(correctionDraft(updatedVersion));
       setLineDraft(updatedLines.map(correctionLine));
       setVerified(false);
+      setOverrideReason("");
       setApplied({});
       setSaveError(null);
       onSaved(updated);
       setEditing(false);
-      setSaveNotice(verified ? "Corrections saved and this document marked reviewed." : "Corrections saved as a new version. It still needs verification.");
+      setSaveNotice(qaSaveNotice(updated) ?? (verified ? "Corrections saved and this document marked reviewed." : "Corrections saved as a new version. It still needs verification."));
     } catch (cause) {
-      setSaveError(cause instanceof Error ? cause.message : "Document corrections could not be saved.");
+      setSaveError(describeFieldIssues(cause, correction["lines"] as Array<Record<string, unknown>>)
+        ?? (cause instanceof Error ? cause.message : "Document corrections could not be saved."));
     } finally {
       setSaving(false);
     }
@@ -496,7 +552,7 @@ function DocumentCard({
           {needsVerification ? <span className="verification-chip"><AlertTriangle size={13} /> Needs verification</span> : <span className="quiet-badge">Parsed</span>}
         </div>
       </div>
-      {allowedHeaders.length && !readingPending ? <div className="invoice-correction-toolbar"><button className="button button-subtle" type="button" onClick={() => { if (editing) { setDraft(correctionDraft(version)); setLineDraft(lines.map(correctionLine)); setVerified(false); setApplied({}); } setEditing((current) => !current); setSaveError(null); }}>{editing ? "Cancel editing" : `Edit extracted ${docType.toUpperCase()}`}</button>{(document["vendor_id"] === null || document["vendor_id"] === undefined) ? <Link className="button button-subtle" to={`/mapping?document_id=${encodeURIComponent(String(document["id"] ?? ""))}`}>Assign vendor</Link> : null}{saveNotice ? <span role="status">{saveNotice}</span> : null}</div> : null}
+      {allowedHeaders.length && !readingPending ? <div className="invoice-correction-toolbar"><button className="button button-subtle" type="button" onClick={() => { if (editing) { setDraft(correctionDraft(version)); setLineDraft(lines.map(correctionLine)); setVerified(false); setOverrideReason(""); setApplied({}); } setEditing((current) => !current); setSaveError(null); }}>{editing ? "Cancel editing" : `Edit extracted ${docType.toUpperCase()}`}</button>{(document["vendor_id"] === null || document["vendor_id"] === undefined) ? <Link className="button button-subtle" to={`/mapping?document_id=${encodeURIComponent(String(document["id"] ?? ""))}`}>Assign vendor</Link> : null}{saveNotice ? <span role="status">{saveNotice}</span> : null}</div> : null}
       {typeof document["id"] === "string" ? <AiSuggestionsPanel documentId={document["id"]} documentVersion={documentVersion} fieldLabels={fieldLabels} applyBlockedReason={applyBlockedReason} onApply={applySuggestion} onKeepCurrent={keepCurrentValue} onFocusSource={onFocusSource} isRelevantSuggestion={(suggestion) => {
         if (!reviewOnly || !needsVerification) return true;
         if (suggestion.scope === "header") return visibleHeaders.some(([field]) => field === suggestion.field);
@@ -582,6 +638,12 @@ function DocumentCard({
           {lineDraft.map((line, index) => <tr key={line.id ?? `new-${index}`}><td>{line.line_no}</td>{allowedLineFields.map((field) => <td key={field}>{field === "line_type" ? <select aria-label={`Line ${line.line_no} line type`} value={line.line_type || "goods"} onChange={(event) => updateLine(index, field, event.currentTarget.value)}><option value="goods">Goods</option><option value="charge">Charge</option></select> : <input aria-label={`Line ${line.line_no} ${String(field).replaceAll("_", " ")}`} inputMode={["quantity", "received_qty", "rejected_qty", "accepted_qty", "rate", "discount", "amount", "tax_rate", "cgst_amount", "sgst_amount", "igst_amount"].includes(String(field)) ? "decimal" : undefined} value={line[field]} onChange={(event) => updateLine(index, field, event.currentTarget.value)} />}</td>)}<td><button className="button button-subtle" type="button" aria-label={`Remove line ${line.line_no}`} onClick={() => setLineDraft((current) => current.filter((_entry, rowIndex) => rowIndex !== index))}>Remove</button></td></tr>)}
           {lineDraft.length === 0 ? <tr><td colSpan={allowedLineFields.length + 2}>No lines. Add a line if this document contains line items.</td></tr> : null}
         </tbody></table></div>
+        {qaFailures ? <div className="invoice-qa-override" role="group" aria-labelledby={`qa-override-${String(document["id"])}`}>
+          <h4 id={`qa-override-${String(document["id"])}`}>Values don't add up</h4>
+          <p>The saved values do not reconcile: {qaFailures.join(", ")}. They are kept but stay unverified until you check the source PDF and give a reason below.</p>
+          <label><span>Reason to accept these values anyway (e.g. line items are read badly; header checked against the PDF)</span><textarea aria-label="Reason to accept these values anyway" rows={2} maxLength={500} value={overrideReason} onChange={(event) => setOverrideReason(event.currentTarget.value)} /></label>
+          {overrideReason.trim() && !verified ? <p className="invoice-qa-hint">The reason applies only when "I reviewed the source PDF" is ticked.</p> : null}
+        </div> : null}
         <label className="invoice-verified-check"><input type="checkbox" checked={verified} onChange={(event) => setVerified(event.currentTarget.checked)} /> I reviewed the source PDF and confirm the displayed {docType.toUpperCase()} data is correct.</label>
         {saveError ? <p className="inline-error" role="alert">{saveError}</p> : null}
         <button className="button button-primary" type="button" disabled={saving || !csrfToken} onClick={() => void saveCorrections()}>{saving ? "Saving version…" : verified ? "Save and mark reviewed" : "Save corrections"}</button>
@@ -749,7 +811,7 @@ export function IngestionPreview({
     const updatedId = String(record(updated["document"])["id"] ?? "");
     const docNo = String(record(updated["version"])["doc_no"] ?? "Document");
     const wasReviewed = !needsVerification(updated);
-    setSavedNotice(wasReviewed ? `${docNo} saved and marked reviewed.` : `${docNo} saved as a new version; it still needs verification.`);
+    setSavedNotice(qaSaveNotice(updated)?.replace(/^Saved/, `${docNo} saved`) ?? (wasReviewed ? `${docNo} saved and marked reviewed.` : `${docNo} saved as a new version; it still needs verification.`));
     setData((current) => {
       const exists = current.documents.some((item) => String(record(item["document"])["id"] ?? "") === updatedId);
       return {
