@@ -640,6 +640,73 @@ def _line_freight(line: DocLine) -> Decimal | None:
     return freight if freight.is_finite() else None
 
 
+def _lump_sum_line(
+    work: _LineWork,
+    amount: Decimal,
+    config: ReconciliationConfig,
+    vendor_id: UUID | None,
+) -> Decimal | None:
+    """PD-3c: compare a line billed by amount alone with its PO line's amount.
+
+    Returns the PO amount the line is expected at, or None when nothing could be compared;
+    an uncompared line is never left Matched with nothing paid.
+    """
+
+    po_line = work.po_line
+    assert po_line is not None
+    po_amount = _field_decimal(po_line, "amount")
+    if po_amount is None or _line_qty(po_line) is not None or _field_decimal(po_line, "rate"):
+        _add_work_check(
+            work,
+            _make_check(
+                "s5.lump_sum",
+                CheckOutcome.REVIEW,
+                code=ReasonCode.ITEM_UNSURE,
+                level=ReasonLevel.REVIEW,
+                actual=amount,
+                expected=po_amount,
+                evidence={
+                    "message": "The invoice line has no quantity or rate; the PO line is "
+                    + ("itemised" if po_amount is not None else "without an amount")
+                    + ", so the amount could not be compared."
+                },
+            ),
+            ReasonCode.ITEM_UNSURE,
+        )
+        work.payable_taxable = _ZERO
+        work.at_risk = amount
+        return None
+    rule = _rule(config, "unit_rate", vendor_id, work.line)
+    variance = amount - po_amount
+    high = variance > _ZERO
+    if _tolerance_pass(amount, po_amount, rule):
+        outcome, reason, level = CheckOutcome.PASS, None, None
+    else:
+        reason = ReasonCode.RATE_HIGH if high else ReasonCode.RATE_LOW
+        outcome = CheckOutcome.FAIL if high else CheckOutcome.WARN
+        level = ReasonLevel.FAIL if high else ReasonLevel.WARN
+    _add_work_check(
+        work,
+        _make_check(
+            "s5.lump_sum",
+            outcome,
+            code=reason,
+            level=level,
+            expected=po_amount,
+            actual=amount,
+            variance=variance,
+            tolerance=rule,
+        ),
+        reason,
+    )
+    if config.payable_rate_mode == "hold":
+        work.payable_taxable = _ZERO if reason is ReasonCode.RATE_HIGH else amount
+    else:
+        work.payable_taxable = min(amount, po_amount)
+    work.at_risk = amount - work.payable_taxable
+    return po_amount
+
+
 def _tax_rate_for_line(work: _LineWork) -> Decimal | None:
     return _line_tax_rate(work.line) or (
         _field_decimal(work.po_line, "tax_rate") if work.po_line is not None else None
@@ -1040,6 +1107,22 @@ def _apply_financial_checks(
                     work.payable_rate = payable_rate
                     work.payable_taxable = work.eligible * payable_rate
                     work.at_risk = work.line_taxable - work.payable_taxable
+                elif quantity is None and invoice_rate is None and amount:
+                    lump_expected = _lump_sum_line(work, amount, config, invoice.vendor_id)
+                    if lump_expected is not None:
+                        expected += lump_expected
+                        if (
+                            invoice.document_id not in exact_duplicate_ids
+                            and invoice.document_id not in snapshot.rejected_invoice_ids
+                        ):
+                            po_invoice_amounts = po_values.setdefault(work.po.document_id, {})
+                            prior_invoice_amount = po_invoice_amounts.get(
+                                invoice.document_id, (invoice, _ZERO)
+                            )[1]
+                            po_invoice_amounts[invoice.document_id] = (
+                                invoice,
+                                prior_invoice_amount + lump_expected,
+                            )
                 else:
                     work.payable_taxable = _ZERO
                     work.at_risk = work.line_taxable
@@ -1183,6 +1266,33 @@ def _apply_financial_checks(
         header_tax_read = any(
             _decimal(_value(getattr(header, name))) is not None for name in ("cgst", "sgst", "igst")
         )
+        unread_totals = [
+            name
+            for name, missing in (
+                ("taxable_total", taxable is None),
+                ("tax", sum(tax_bases, _ZERO) > _ZERO and not header_tax_read),
+            )
+            if missing
+        ]
+        if invoice.document.lines and unread_totals:
+            # The header checks above skip unread totals; a skipped check must not read as a pass.
+            _add_case_check(
+                invoice,
+                _make_check(
+                    "s5.header_totals_read",
+                    CheckOutcome.REVIEW,
+                    code=ReasonCode.LOW_CONFIDENCE_DATA,
+                    level=ReasonLevel.REVIEW,
+                    evidence={
+                        "missing": unread_totals,
+                        "message": "Invoice totals were not read, so they were not checked "
+                        "against the lines.",
+                    },
+                ),
+                ReasonCode.LOW_CONFIDENCE_DATA,
+                header_checks,
+                case_reasons,
+            )
         if tax_bases and header_tax_read:
             expected_tax = sum(tax_bases, _ZERO)
             actual_tax = sum(

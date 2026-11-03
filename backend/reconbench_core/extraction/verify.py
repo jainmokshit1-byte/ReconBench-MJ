@@ -414,6 +414,21 @@ def solve_document(doc: DocumentNumbers, lines: Sequence[LineNumbers]) -> Docume
     cgsts = _unique([doc.cgst.ocr, *doc.tax_candidates.get("cgst", [])])
     sgsts = _unique([doc.sgst.ocr, *doc.tax_candidates.get("sgst", [])])
     igsts = _unique([doc.igst.ocr, *doc.tax_candidates.get("igst", [])])
+    # A totals row without tax labels: the line taxes are a candidate, confirmed only
+    # when lines + taxes balance against a separately printed grand total or the words.
+    lines_tax: Decimal | None = None
+    if lines_sum is not None and all(
+        line.taxes and all(t.known for t in line.taxes) for line in lines
+    ):
+        lines_tax = sum((t.value or ZERO for line in lines for t in line.taxes), ZERO)
+    if lines_tax:
+        if doc.interstate is not False and lines_tax not in igsts:
+            igsts.append(lines_tax)
+        half = money(lines_tax / 2)
+        if doc.interstate is not True and half * 2 == lines_tax:
+            for group in (cgsts, sgsts):
+                if half not in group:
+                    group.append(half)
     glyphs: set[Decimal] = set()
     if doc.rupee_glyph:
         # A "₹" read as a digit: the shorter value is an alternative, trusted only
@@ -499,6 +514,19 @@ def solve_document(doc: DocumentNumbers, lines: Sequence[LineNumbers]) -> Docume
                         doc.grand_total.status = Status.CORRECTED
                         doc.grand_total.note = "amount in words (rupee sign read as a digit)"
                         break
+    if not doc.grand_total.known and doc.taxable.known:
+        # Pre-filled for the reviewer; DERIVED stays below the confidence gate.
+        doc.grand_total.value = money(
+            sum(
+                (
+                    num.value or ZERO
+                    for num in (doc.taxable, doc.cgst, doc.sgst, doc.igst, doc.round_off)
+                ),
+                ZERO,
+            )
+        )
+        doc.grand_total.status = Status.DERIVED
+        doc.grand_total.note = "taxable + taxes read (no grand total printed or read)"
     return doc
 
 
