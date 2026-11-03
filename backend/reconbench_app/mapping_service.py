@@ -2345,7 +2345,13 @@ class MappingService:
             return None
         if source_row.doc_type not in {DocType.INVOICE.value, DocType.GRN.value}:
             raise ValueError("only invoice or GRN links can be edited")
-        if old_target.doc_type != DocType.PO.value:
+        grn_link = current["link_type"] == LinkType.INV_GRN.value
+        if grn_link:
+            # An invoice→GRN link is evidence for its PO: it can be confirmed or removed,
+            # never moved to another document.
+            if old_target.doc_type != DocType.GRN.value or action not in {"confirm", "unlink"}:
+                raise ValueError("an invoice-to-GRN link can only be confirmed or removed")
+        elif old_target.doc_type != DocType.PO.value:
             raise ValueError("the current link target is not a purchase order")
         if action in {"confirm", "restore"} and (
             source_row.effective_vendor_id is None
@@ -2353,7 +2359,9 @@ class MappingService:
             or source_row.effective_vendor_id != old_target.effective_vendor_id
         ):
             raise ValueError(
-                "a link cannot be confirmed until source and PO have the same resolved vendor"
+                "a link cannot be confirmed until source and "
+                + ("GRN" if grn_link else "PO")
+                + " have the same resolved vendor"
             )
 
         affected_ids = {source_id, old_target_id}
@@ -2400,6 +2408,7 @@ class MappingService:
                 old=current,
                 detail_code=cast(str | None, current["detail_code"]),
                 actor_id=actor.actor_id,
+                evidence=cast(Mapping[str, Any] | None, current["evidence"]) or None,
             )
             audit_action = "link.confirm"
         elif action == "restore":

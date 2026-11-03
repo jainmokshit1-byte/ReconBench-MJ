@@ -349,6 +349,61 @@ describe("Mapping workflow", () => {
     expect(within(bothRow).getByRole("button", { name: "Confirm link to PO PO-2026-136" })).toBeInTheDocument();
   });
 
+  it("confirms a suggested invoice-to-GRN link on its own", async () => {
+    const grnLink = {
+      id: "grn-link-2",
+      version_no: 3,
+      po_document_id: "grn-synthetic-2",
+      po_no: "GRN-2026-227",
+      link_type: "inv_grn",
+      method: "labeled",
+      confidence: "0.80",
+      state: "suggested",
+      ai_suggested: false,
+      evidence: "Handwritten GRN reference",
+      level: "header",
+      line_no: null,
+    };
+    const poLink = { ...grnLink, id: "po-link-2", po_document_id: poId, po_no: "PO-2026-236", link_type: "inv_po", state: "confirmed", confidence: "0.99" };
+    const row = {
+      id: "invoice-grn-confirm",
+      doc_no: "INV-GRN-CONFIRM",
+      doc_type: "invoice",
+      vendor_name: "Acme Components",
+      vendor_gstin: "27AAPFU0939F1ZV",
+      doc_date: "2026-04-02",
+      grand_total: "236.00",
+      currency: "INR",
+      source_file_id: "file-synthetic-2",
+      vendor_id: vendorId,
+      needs_verification: false,
+      line_nos: [1],
+      resolution: { outcome: "linked", resolved_step: 1, detail_code: null, cited_refs: [], candidates: [] },
+      links: [poLink, grnLink],
+    };
+    const request = installFetch((url, init) => {
+      const method = init.method ?? "GET";
+      if (url.pathname === "/api/v1/vendors" && method === "GET") return response(200, [vendor]);
+      if (url.pathname === "/api/v1/vendor-merge-suggestions" && method === "GET") return response(200, []);
+      if (url.pathname === `/api/v1/vendors/${vendorId}/documents` && method === "GET") {
+        return url.searchParams.get("doc_type") === "po" ? response(200, []) : response(200, [row]);
+      }
+      if (url.pathname === "/api/v1/links/grn-link-2" && method === "PATCH") {
+        expect(JSON.parse(String(init.body))).toEqual({ action: "confirm", to_document_id: null });
+        return response(200, { ...grnLink, state: "confirmed", version_no: 4 });
+      }
+      throw new Error(`Unexpected request: ${method} ${url.pathname}${url.search}`);
+    });
+
+    renderMapping();
+    const tableRow = await screen.findByRole("row", { name: /INV-GRN-CONFIRM/ });
+    fireEvent.click(within(tableRow).getByRole("button", { name: "Confirm GRN link" }));
+    await waitFor(() => expect(request).toHaveBeenCalledWith(
+      expect.stringContaining("/api/v1/links/grn-link-2"),
+      expect.objectContaining({ method: "PATCH" }),
+    ));
+  });
+
   it("pins Unassigned and allows a person to assign a document", async () => {
     const unassigned = {
       ...vendor,
