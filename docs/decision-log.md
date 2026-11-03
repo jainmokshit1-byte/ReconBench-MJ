@@ -2676,3 +2676,21 @@ vendor_name               8        0        2       10      80.0%         [0.490
   - a web control for `override_reason`;
   - the e-way-bill page warning (page kinds are not stored);
   - the 2-way invoice↔GRN rule (Sir).
+
+## D125 - Run-2 fixes + health page live (b17) (4 Nov 2026)
+- **What:** engine 0.1.17 (D124) plus the system health page; migration 0036 → 0037 (SERIAL_DIFF catalogue row). Tag `live-20261104-b17` on `main`.
+- **Pre-checks (read-only):** queue 0; Alembic 0036; ai_request 152; links auto 601 / suggested 82 / confirmed 624 / rejected 47; document_version 2695; recon_run 31; switch ai v47.
+- **Backup:** `live-db-20261104-b17.dump` (7,565,134 bytes) + roles; restore into a throwaway postgres:16.15; 59 tables identical.
+- **Swap:**
+  - `:pre-b17` rollback tags on setup, api, worker and ai-worker;
+  - build; setup ran 0036 → 0037;
+  - api, worker and ai-worker up; web restarted;
+  - `/readyz` 200; all three containers carry 0.1.17 and the new code;
+  - 0 log errors; 0 failed jobs.
+- **Post-checks:** every counter unchanged except Alembic. The SERIAL_DIFF catalogue row is present.
+- **One-time mapping pass:** the `rematch_vendors` job (2 jobs succeeded). Exactly 2 new links, both SUGGESTED (content): the §10 invoice → its PO and its GRN. 0 auto, 0 ai_request.
+- **Rollback:**
+  - re-tag `:pre-b17` → `:latest` and `docker compose up -d api worker ai-worker`;
+  - the old code cannot read SERIAL_DIFF, so first check that no case or catalogue use blocks it (owner's go);
+  - downgrade to 0036 only with the owner's go;
+  - restore the b17 dump only if data went wrong.
