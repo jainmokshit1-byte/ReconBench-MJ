@@ -406,6 +406,11 @@ button:disabled, input:disabled { cursor: not-allowed; }
 .invoice-correction-lines-heading { margin: 14px 0 5px; }
 .invoice-verified-check { display: flex; align-items: flex-start; gap: 7px; margin: 12px 0; color: var(--text-secondary-strong); font-size: 10px; }
 .invoice-verified-check input { margin-top: 1px; }
+.invoice-qa-override { display: grid; gap: 6px; margin: 12px 0 0; padding: 9px; border: 1px solid var(--panel-border); border-radius: 4px; color: var(--text-secondary-strong); font-size: 10px; }
+.invoice-qa-override h4, .invoice-qa-override p { margin: 0; }
+.invoice-qa-override label { display: grid; gap: 4px; }
+.invoice-qa-override textarea { width: 100%; padding: 7px; border: 1px solid var(--input-border, var(--panel-border)); border-radius: 4px; color: var(--text-primary); background: var(--surface); font: inherit; font-size: 10px; resize: vertical; }
+.invoice-qa-hint { color: var(--text-muted-strong); }
 .preview-muted { color: var(--text-muted-strong); font-size: 9px; }
 .evidence-list { display: grid; gap: 5px; }
 .evidence-row { display: grid; grid-template-columns: 1.1fr 1.3fr .7fr 100px; gap: 8px; align-items: center; padding: 7px 9px; border: 1px solid var(--subtle-divider); border-radius: 5px; color: var(--text-secondary-strong); background: var(--surface); font-size: 9px; }
