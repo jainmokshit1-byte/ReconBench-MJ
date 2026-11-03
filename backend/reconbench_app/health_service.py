@@ -18,7 +18,7 @@ from reconbench_core.version import ENGINE_VERSION
 
 from reconbench_app.ai.provider_connection import ProviderConnectionService
 from reconbench_app.ai.settings_service import AiSettingsService
-from reconbench_app.authorization import ActorContext
+from reconbench_app.authorization import ActorContext, requires
 from reconbench_app.configuration import ConfigurationService
 from reconbench_app.db.metadata import metadata
 from reconbench_app.settings import Settings
@@ -194,6 +194,7 @@ class HealthService:
         self.ai_settings_service = ai_settings_service
         self.ai_provider_connection_service = ai_provider_connection_service
 
+    @requires("data.view")
     def get_dashboard(self, workspace_id: UUID, actor: ActorContext) -> SystemHealthResponse:
         """Produce the full system health and diagnostic view for the given workspace."""
 
@@ -913,11 +914,13 @@ class HealthService:
                                 "  count(*) filter ("
                                 "    where effective_status in ('matched', 'resolved')"
                                 "  ) as done, "
-                                "  count(*) filter (where effective_status = 'matched') as matched, "
+                                "  count(*) filter (where effective_status = 'matched')"
+                                "  as matched, "
                                 "  count(*) filter ("
                                 "    where effective_status in ('exception', 'needs_review')"
                                 "  ) as exceptions, "
-                                "  count(*) filter (where effective_status = 'unlinked') as pending, "
+                                "  count(*) filter (where effective_status = 'unlinked')"
+                                "  as pending, "
                                 "  sum(at_risk) as at_risk, "
                                 "  count(*) filter (where is_stale) as stale_count "
                                 "FROM v_case_current "
