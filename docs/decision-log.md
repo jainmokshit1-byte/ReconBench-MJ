@@ -2617,3 +2617,15 @@ vendor_name               8        0        2       10      80.0%         [0.490
 - **Deployment:**
   - Rebuilt & swapped: `setup`, `api`, `worker`, `ai-worker` images rebuilt; setup executed (revision 0036 unchanged); api/worker/ai-worker swapped; `/readyz` 200 OK.
   - Post-checks: queue 0, 0 failed jobs, counter tables unchanged.
+
+## D122 - Matching fixes + scanned PO/GRN AI reading live (b15) (3 Nov 2026)
+- **Owner decisions (chat, 3 Nov):** the scanned-invoice AI switch also covers scanned POs and GRNs (one shared switch, no migration); auto-link at 0.75 approved for verified data only but not coded (printed-reference links already score 0.95-0.99; content-only links are always suggestions); switch stays on AI after the deploy.
+- **Shipped (engine 0.1.14 -> 0.1.15, no migration, Alembic 0036):** Verify of the last AI value queues vendor + link matching; zero-amount rows need no PO line; LINK_INFERRED case reason for suggested PO links; AI_LINES_MISSING reason/check/warning; AI-read half GST rate left out; scanned PO/GRN AI reading and verification; no auto link while its source, target or via document holds an unverified AI value; `names=` in `vision_answer_shape`; web case fix links, reason titles, link confidence label.
+- **Gate:** rules hash, engine version, core purity, lint-imports (3 kept), mypy core clean, app 80 (baseline); offline 1579 passed / 22 skipped; integration 80 passed on a throwaway postgres:16.15 incl. new `test_flow_three_way_match.py` (digital Matched, zero row Matched, AI invoice Matched after Verify); only KI-003 failures (`test_ai_h1` 1, `test_page_split` 2); web tsc + lint clean, vitest 79; golden self-check passed.
+- **Commits (no push):** 72d856d (backend), c3b2da2 (web), c391fd1 (docs); tag `live-20261103-b15`. The planned separate PO/GRN commit was folded into the backend commit (shared hunks in `ingestion.py`).
+- **Pre-checks:** queue 0; Alembic 0036; `ai_request` 142; links auto 595 / suggested 81 / confirmed 28 / rejected 43; active documents PO 253, GRN 252, invoice 10; `document_version` 2686; `recon_run` 26; versions with AI_LINES_MISSING 0; switch `ai` (version 45).
+- **Backup:** `C:\Users\jainm\reconbench-archive\live-db-20261103-b15.dump` (7,234,923 bytes) + `live-roles-20261103-b15.sql`; restored into a throwaway container, row counts identical across all 59 public tables; container removed.
+- **Deploy:** rollback tags `reconbench-{setup,api,worker,ai-worker}:pre-b15`; images rebuilt; setup kept revision 0036; api/worker/ai-worker swapped; `/readyz` 200; all three containers run ENGINE_VERSION 0.1.15 with the new code; 0 errors in the first logs.
+- **Post-checks:** every counter unchanged; no queue events, no failed jobs.
+- **One-time mapping pass (owner go):** job 8224 `rematch_vendors` + the ledger drain it queued, both succeeded; 0 link or document changes, 0 new `ai_request` (no invoice had been verified yet); 0 auto links on documents with unverified AI values.
+- **Web:** the live web container serves `./web`, so the UI changes were live from their edit (restarted 3 Nov, before the backend swap).
