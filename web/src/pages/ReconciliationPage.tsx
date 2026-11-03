@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Clipboard, Download, RefreshCw, X } from "lucide-react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { useVirtualizer } from "@tanstack/react-virtual";
 
 import {
@@ -24,7 +24,7 @@ import type { CaseDetailResponse, CaseSummary, ExportSummary, RunSummary } from 
 import { AiLineOpinion } from "../components/AiLineOpinion";
 import { AiSharingBanner } from "../components/AiSharingBanner";
 import { PageHeader } from "../components/PageHeader";
-import { checkRows, REASON_TEXT, type CheckRow, type ReasonText } from "../utils/reconChecks";
+import { checkRows, reasonTitle, REASON_TEXT, type CheckRow, type ReasonText } from "../utils/reconChecks";
 import { useAuth } from "../auth/useAuth";
 import { usePeriod } from "../contexts/usePeriod";
 
@@ -74,9 +74,11 @@ interface CaseTableRowProps {
   isActive: boolean;
   onSelect: (caseId: string) => void;
   onToggleSelected: (caseId: string, selected: boolean) => void;
+  reasonCatalogue?: Record<string, ReasonText>;
 }
 
-export const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isSelected, isActive, onSelect, onToggleSelected }: CaseTableRowProps) {
+export const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isSelected, isActive, onSelect, onToggleSelected, reasonCatalogue }: CaseTableRowProps) {
+  const issueTitles = item.reason_codes.map((code) => reasonTitle(code, reasonCatalogue));
   return (
     <tr
       data-index={virtualIndex}
@@ -115,10 +117,31 @@ export const CaseTableRow = memo(function CaseTableRow({ item, virtualIndex, isS
           <span>{item.overlay ? `${label(item.effective_status)} / ${label(item.computed_status)}` : label(item.effective_status)}{item.is_stale ? " · stale" : ""}</span>
         </span>
       </td>
-      <td title={item.reason_codes.map(label).join(", ")}>{item.reason_codes.length ? item.reason_codes.map(label).join(", ") : "None"}</td>
+      <td title={item.reason_codes.join(", ")}>{item.reason_codes.length ? issueTitles.join(", ") : "None"}</td>
     </tr>
   );
 });
+
+const VERIFY_REASONS = ["AI_VALUE_UNVERIFIED", "LOW_CONFIDENCE_DATA", "AI_LINES_MISSING"];
+const LINK_REASONS = ["LINK_INFERRED", "NO_PO_LINK"];
+
+// Where a person fixes the cause of a case: the document's values, or its PO link.
+export function CaseFixLinks({ invoiceId, vendorId, reasonCodes }: { invoiceId: string | null; vendorId: string | null; reasonCodes: string[] }) {
+  if (!invoiceId) return null;
+  const mapping = new URLSearchParams();
+  if (vendorId) mapping.set("vendor_id", vendorId);
+  mapping.set("doc_type", "invoice");
+  mapping.set("document_id", invoiceId);
+  const verify = reasonCodes.some((code) => VERIFY_REASONS.includes(code));
+  const link = reasonCodes.some((code) => LINK_REASONS.includes(code));
+  if (!verify && !link) return null;
+  return (
+    <div className="case-fix-links">
+      {verify ? <Link className="text-link" to={`/mapping?${mapping.toString()}&preview=1`}>Verify document values</Link> : null}
+      {link ? <Link className="text-link" to={`/mapping?${mapping.toString()}`}>Confirm PO link on Mapping</Link> : null}
+    </div>
+  );
+}
 
 function checks(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null) : [];
@@ -456,6 +479,12 @@ export function ReconciliationPage() {
     });
   }, [setSearchParams]);
 
+  const selectedItem = items.find((item) => item.case_id === selectedCaseId);
+  const detailCase = detail?.case;
+  const caseInvoiceId = typeof detailCase?.["invoice_id"] === "string" ? detailCase["invoice_id"] : (selectedItem?.invoice_id ?? null);
+  const caseVendorId = typeof detailCase?.["vendor_id"] === "string" ? detailCase["vendor_id"] : (selectedItem?.vendor_id ?? null);
+  const caseReasonCodes = Array.isArray(detailCase?.["reason_codes"]) ? detailCase["reason_codes"].filter((code): code is string => typeof code === "string") : (selectedItem?.reason_codes ?? []);
+
   const selectCaseFromRow = useCallback((caseId: string) => selectCase(caseId), [selectCase]);
   const toggleCaseSelection = useCallback((caseId: string, selected: boolean) => {
     setSelectedCases((previous) => {
@@ -611,7 +640,7 @@ export function ReconciliationPage() {
               {virtualRows.map((virtualRow) => {
                 const item = items[virtualRow.index];
                 if (!item) return null;
-                return <CaseTableRow key={item.case_id} item={item} virtualIndex={virtualRow.index} isSelected={selectedCases.has(item.case_id)} isActive={selectedCaseId === item.case_id} onSelect={selectCaseFromRow} onToggleSelected={toggleCaseSelection} />;
+                return <CaseTableRow key={item.case_id} item={item} virtualIndex={virtualRow.index} isSelected={selectedCases.has(item.case_id)} isActive={selectedCaseId === item.case_id} onSelect={selectCaseFromRow} onToggleSelected={toggleCaseSelection} reasonCatalogue={reasonCatalogue} />;
               })}
               {lastVirtualRow && lastVirtualRow.end < rowVirtualizer.getTotalSize() ? <tr aria-hidden="true" className="recon-virtual-spacer"><td colSpan={11} style={{ height: rowVirtualizer.getTotalSize() - lastVirtualRow.end }} /></tr> : null}
               {!loading && items.length === 0 ? <tr><td className="recon-table-empty" colSpan={11}>No cases for these filters yet. Run reconciliation after documents are mapped.</td></tr> : null}
@@ -639,6 +668,7 @@ export function ReconciliationPage() {
             <div className="case-panel-heading"><div><div className="panel-kicker">CASE EVIDENCE</div><h2 id="case-panel-title">{String(detail.case["invoice_no"] ?? detail.case["invoice_id"] ?? "Invoice case")}</h2></div><div className="case-panel-tools"><button className="icon-button" type="button" aria-label="Copy case link" onClick={() => void navigator.clipboard.writeText(window.location.href)}><Clipboard size={15} /></button><button className="icon-button" type="button" aria-label="Close case details" onClick={() => selectCase(null)}><X size={17} /></button></div></div>
             <div className="case-panel-status"><span className={`recon-status recon-status-${String(detail.case["effective_status"] ?? "pending")}`}>{label(detail.case["effective_status"])}</span>{detail.case["overlay"] ? <small>Computed result: {label(detail.case["status"])}</small> : null}</div>
             {detail.case["is_stale"] ? <div className="recon-stale-banner"><AlertTriangle size={15} /> Mapping or settings changed; run again before export.</div> : null}
+            {detail.case["effective_status"] !== "matched" ? <CaseFixLinks invoiceId={caseInvoiceId} vendorId={caseVendorId} reasonCodes={caseReasonCodes} /> : null}
             <section className="case-summary-grid" aria-label="Financial summary">
               <div><span>Invoice taxable</span><strong>{amount(detail.case["invoice_taxable"])}</strong></div>
               <div><span>Expected taxable</span><strong>{amount(detail.case["expected_taxable"])}</strong></div>

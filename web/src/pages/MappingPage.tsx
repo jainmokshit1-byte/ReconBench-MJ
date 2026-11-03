@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, Clipboard, FileSearch, GitMerge, Pencil, Plus, RefreshCw, Search, Unlink } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router";
 
@@ -32,6 +32,12 @@ const tabs: Array<{ id: DocType; label: string }> = [
   { id: "grn", label: "GRN" },
   { id: "invoice", label: "Invoice" },
 ];
+
+const STATE_HELP: Record<string, string> = {
+  auto: "Linked automatically (confidence at or above the auto-link threshold, data verified)",
+  suggested: "Needs a person: confirm or change",
+  confirmed: "A person confirmed it",
+};
 
 const savedTimeFormatter = new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 
@@ -304,11 +310,11 @@ function MappingDocumentRow({
       <td>{displayDate(row.doc_date)}</td>
       <td className="mapping-amount">{displayAmount(row.grand_total, row.currency)}</td>
       <td>
-        <span className={`mapping-state mapping-state-${displayStatus}`}>{displayStatus === "auto" ? "Auto" : displayStatus === "confirmed" ? "Confirmed" : displayStatus === "suggested" ? "Suggested" : "Unlinked"}</span>
+        <span className={`mapping-state mapping-state-${displayStatus}`} title={STATE_HELP[displayStatus]}>{displayStatus === "auto" ? "Auto" : displayStatus === "confirmed" ? "Confirmed" : displayStatus === "suggested" ? "Suggested" : "Unlinked"}</span>
         {link?.ai_suggested ? <span className="ai-advisory-tag" title="Proposed by AI from the top five same-vendor POs">{aiProposal ? "AI-suggested" : "Confirmed from AI suggestion"}</span> : null}
         {linkSet ? <small className="mapping-evidence-meta">PO {linkSet.poNo ?? "without number"}</small> : row.doc_type === "invoice" && grnLinks.length ? <small className="mapping-lines-attention" role="note">No PO link yet</small> : null}
         {grnLinks.map((item) => <small className="mapping-evidence-meta" key={item.id} title={item.evidence ?? undefined}>GRN {item.po_no ?? "without number"} · {item.state} · {Math.round(Number(item.confidence) * 100)}%</small>)}
-        {link ? <small className="mapping-evidence-meta">{link.method.replaceAll("_", " ")} · {Math.round(Number(link.confidence) * 100)}%</small> : null}
+        {link ? <small className="mapping-evidence-meta">{link.method.replaceAll("_", " ")} · link confidence {Math.round(Number(link.confidence) * 100)}%</small> : null}
         {linkSet && lineLevel ? <small className={linkSet.attentionLines.length ? "mapping-lines-attention" : "mapping-evidence-meta"}>{linkSet.linkedLines.length} of {linkSet.lineCount} lines linked</small> : null}
         {linkSet && lineLevel && linkSet.attentionLines.length ? <small className="mapping-lines-attention" role="note">Needs attention: line {linkSet.attentionLines.join(", ")} {linkSet.attentionLines.length === 1 ? "has" : "have"} no link to this PO{linkSet.otherPoLines.length ? ` (line ${linkSet.otherPoLines.join(", ")} suggested to another PO)` : ""}. Reconciliation shows such an invoice as Unlinked until every line has a PO link.</small> : null}
         {linkSet && linkSet.links.length > 1 ? <details className="mapping-evidence"><summary>Line links ({linkSet.links.length})</summary><ol>{linkSet.links.map((item) => <li key={item.id}>{item.line_no === null ? "Header" : `Line ${item.line_no}`} · {item.state} · {item.method.replaceAll("_", " ")} · {Math.round(Number(item.confidence) * 100)}%</li>)}</ol></details> : null}
@@ -426,10 +432,19 @@ export function MappingPage() {
     return () => window.clearTimeout(timer);
   }, [refresh]);
 
+  const autoPreviewed = useRef(false);
   useEffect(() => {
     if (!documentId || loading) return;
     document.getElementById(`mapping-document-${documentId}`)?.scrollIntoView({ block: "center" });
-  }, [documentId, documents, loading]);
+    // "Verify document values" on a Reconciliation case opens the source preview once.
+    const target = documents.find((row) => row.id === documentId);
+    if (searchParams.get("preview") === "1" && target && !autoPreviewed.current) {
+      autoPreviewed.current = true;
+      getFile(target.source_file_id)
+        .then(({ file }) => setPreview({ file, documentId: target.id }))
+        .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "The source preview could not be opened."));
+    }
+  }, [documentId, documents, loading, searchParams]);
 
   const activeVendor = useMemo(
     () => vendors.find((vendor) => vendor.id === selectedVendor) ?? null,

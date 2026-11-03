@@ -1,9 +1,10 @@
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router";
 
 import type { CaseSummary } from "../api/reconciliation";
 import { checkRows, REASON_TEXT } from "../utils/reconChecks";
-import { CaseTableRow, CheckTable } from "./ReconciliationPage";
+import { CaseFixLinks, CaseTableRow, CheckTable } from "./ReconciliationPage";
 
 // The engine's ReasonCode values (reconbench_core/schema ReasonCode), checked in order.
 const ENGINE_REASON_CODES = [
@@ -124,5 +125,55 @@ describe("reconciliation checks as verifiable rows (PD-4a)", () => {
     const [shown, reference, difference] = cells.slice(5, 8).map((cell) => scaled(cell ?? "0"));
     expect((shown ?? 0n) - (reference ?? 0n)).toBe(difference);
     expect(cells[9]).toBe("needs review");
+  });
+});
+
+describe("case Issues column and fix links", () => {
+  const renderRow = (reasonCodes: string[], reasonCatalogue?: Record<string, { title: string; message: string }>) =>
+    render(
+      <table>
+        <tbody>
+          <CaseTableRow item={{ ...summary, reason_codes: reasonCodes }} virtualIndex={0} isSelected={false} isActive={false} onSelect={vi.fn()} onToggleSelected={vi.fn()} reasonCatalogue={reasonCatalogue} />
+        </tbody>
+      </table>,
+    );
+
+  it("shows a plain title in Issues, not the raw code, and keeps the code as a tooltip", () => {
+    renderRow(["RATE_HIGH", "LINK_INFERRED"]);
+    const cell = screen.getAllByRole("cell")[10];
+    expect(cell?.textContent).toBe("Rate above PO, PO link needs confirming");
+    expect(cell?.getAttribute("title")).toBe("RATE_HIGH, LINK_INFERRED");
+  });
+
+  it("prefers the workspace catalogue title and falls back to the code for an unknown one", () => {
+    renderRow(["RATE_HIGH", "SOME_NEW_CODE"], { RATE_HIGH: { title: "Workspace title", message: "m" } });
+    expect(screen.getAllByRole("cell")[10]?.textContent).toBe("Workspace title, SOME NEW CODE");
+  });
+
+  const renderFix = (reasonCodes: string[]) =>
+    render(<MemoryRouter><CaseFixLinks invoiceId="invoice-1" vendorId="vendor-1" reasonCodes={reasonCodes} /></MemoryRouter>);
+
+  it("links to document verification for unverified or low-confidence data", () => {
+    for (const code of ["AI_VALUE_UNVERIFIED", "LOW_CONFIDENCE_DATA", "AI_LINES_MISSING"]) {
+      renderFix([code]);
+      const link = screen.getByRole("link", { name: "Verify document values" });
+      expect(link.getAttribute("href")).toBe("/mapping?vendor_id=vendor-1&doc_type=invoice&document_id=invoice-1&preview=1");
+      expect(screen.queryByRole("link", { name: "Confirm PO link on Mapping" })).toBeNull();
+      cleanup();
+    }
+  });
+
+  it("links to Mapping for an inferred or missing PO link", () => {
+    for (const code of ["LINK_INFERRED", "NO_PO_LINK"]) {
+      renderFix([code]);
+      expect(screen.getByRole("link", { name: "Confirm PO link on Mapping" }).getAttribute("href")).toBe("/mapping?vendor_id=vendor-1&doc_type=invoice&document_id=invoice-1");
+      expect(screen.queryByRole("link", { name: "Verify document values" })).toBeNull();
+      cleanup();
+    }
+  });
+
+  it("shows no fix link for other reasons", () => {
+    renderFix(["RATE_HIGH", "QTY_OVER_PO"]);
+    expect(screen.queryAllByRole("link")).toHaveLength(0);
   });
 });

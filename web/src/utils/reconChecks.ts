@@ -50,12 +50,19 @@ export const REASON_TEXT: Record<string, ReasonText> = {
   GRN_OVER_PO: { title: "Received more than ordered", message: "Received quantity is above the ordered quantity; the excess is not billable." },
   LATE_DELIVERY: { title: "Late delivery", message: "The goods were received after the PO delivery date." },
   AI_VALUE_UNVERIFIED: { title: "AI-read values not verified", message: "A value read by AI counts only after a person verifies it." },
+  AI_LINES_MISSING: { title: "AI reading is missing lines", message: "The AI reading has fewer lines than the rules reading of the same file." },
 };
+
+// Plain title of a reason code: the catalogue first, then the built-in text, then the code itself.
+export function reasonTitle(code: string, catalogue: Record<string, ReasonText> = REASON_TEXT): string {
+  return catalogue[code]?.title || REASON_TEXT[code]?.title || code.replaceAll("_", " ");
+}
 
 const CHECK_NAMES: Record<string, string> = {
   "s1.exact_duplicate": "Duplicate invoice",
   "s1.suspected_duplicate": "Possible duplicate",
   "s1.ai_values_verified": "AI-read values verified",
+  "s1.ai_lines_read": "AI reading has all lines",
   "s1.extraction_gate": "Data quality",
   "s1.po_open": "PO open",
   "s1.vendor_resolved": "Vendor resolved",

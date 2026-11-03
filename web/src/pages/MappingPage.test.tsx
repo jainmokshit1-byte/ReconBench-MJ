@@ -217,7 +217,8 @@ describe("Mapping workflow", () => {
     expect(within(row).getByText("GSTIN 27AAPFU0939F1ZV")).toBeInTheDocument();
     expect(within(row).queryByRole("alert")).not.toBeInTheDocument();
     expect(within(row).getByText("Auto")).toBeInTheDocument();
-    expect(within(row).getByText(/labeled · 99%/)).toBeInTheDocument();
+    expect(within(row).getByText(/labeled · link confidence 99%/)).toBeInTheDocument();
+    expect(within(row).getByText("Auto")).toHaveAttribute("title", expect.stringContaining("auto-link threshold"));
     fireEvent.click(within(row).getByText("Evidence"));
     expect(within(row).getByText("Purchase Order No: PO-2026-001")).toBeInTheDocument();
     fireEvent.click(within(row).getByRole("button", { name: /Confirm link/ }));
