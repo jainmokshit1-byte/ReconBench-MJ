@@ -50,4 +50,3 @@ def get_system_health(request: Request) -> Response:
 
 
 __all__ = ["get_system_health", "router"]
-

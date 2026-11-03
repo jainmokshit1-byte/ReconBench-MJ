@@ -385,12 +385,8 @@ class HealthService:
                     severity="warning",
                     component="workers",
                     title="Failed background jobs detected",
-                    description=(
-                        f"{job_counts['failed']} background jobs failed in queue."
-                    ),
-                    action_hint=(
-                        "Review worker logs or retry failed files on Ingestion / Health."
-                    ),
+                    description=(f"{job_counts['failed']} background jobs failed in queue."),
+                    action_hint=("Review worker logs or retry failed files on Ingestion / Health."),
                 )
             )
 
@@ -449,9 +445,7 @@ class HealthService:
                             severity="warning",
                             component="ai",
                             title=f"AI Provider '{card_obj.provider}' connection failed",
-                            description=(
-                                f"Last check failed ({card_obj.reason_code or 'error'})."
-                            ),
+                            description=(f"Last check failed ({card_obj.reason_code or 'error'})."),
                             action_hint=(
                                 "Verify API key, endpoint URL, or network access on Settings."
                             ),
@@ -911,25 +905,29 @@ class HealthService:
                             matched_pct = round((matched_c / total_cases) * 100, 1)
 
                     # Live metrics from v_case_current view
-                    case_stats = conn.execute(
-                        sa.text(
-                            "SELECT "
-                            "  count(*) as total, "
-                            "  count(*) filter ("
-                            "    where effective_status in ('matched', 'resolved')"
-                            "  ) as done, "
-                            "  count(*) filter (where effective_status = 'matched') as matched, "
-                            "  count(*) filter ("
-                            "    where effective_status in ('exception', 'needs_review')"
-                            "  ) as exceptions, "
-                            "  count(*) filter (where effective_status = 'unlinked') as pending, "
-                            "  sum(at_risk) as at_risk, "
-                            "  count(*) filter (where is_stale) as stale_count "
-                            "FROM v_case_current "
-                            "WHERE workspace_id = :workspace_id"
-                        ),
-                        {"workspace_id": workspace_id},
-                    ).mappings().first()
+                    case_stats = (
+                        conn.execute(
+                            sa.text(
+                                "SELECT "
+                                "  count(*) as total, "
+                                "  count(*) filter ("
+                                "    where effective_status in ('matched', 'resolved')"
+                                "  ) as done, "
+                                "  count(*) filter (where effective_status = 'matched') as matched, "
+                                "  count(*) filter ("
+                                "    where effective_status in ('exception', 'needs_review')"
+                                "  ) as exceptions, "
+                                "  count(*) filter (where effective_status = 'unlinked') as pending, "
+                                "  sum(at_risk) as at_risk, "
+                                "  count(*) filter (where is_stale) as stale_count "
+                                "FROM v_case_current "
+                                "WHERE workspace_id = :workspace_id"
+                            ),
+                            {"workspace_id": workspace_id},
+                        )
+                        .mappings()
+                        .first()
+                    )
 
                     if case_stats and case_stats["total"]:
                         total_cases = int(case_stats["total"] or 0)
