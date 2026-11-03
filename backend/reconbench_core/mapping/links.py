@@ -3012,9 +3012,15 @@ def _header_amount(document: Document) -> tuple[str, Decimal] | None:
 
 
 def _amount_and_date_agree(
-    source: MappingDocument, target: Document, config: MappingConfig
+    source: MappingDocument,
+    target: Document,
+    config: MappingConfig,
+    fallback_date: date | None = None,
 ) -> bool:
-    """Same kind of total within the amount tolerance and a date within the normal window."""
+    """Same kind of total within the amount tolerance and a date within the normal window.
+
+    A GRN read without a date is dated by the PO it links to (``fallback_date``).
+    """
 
     own = _header_amount(source.document)
     if own is None:
@@ -3030,7 +3036,7 @@ def _amount_and_date_agree(
     if abs(expected - field.value) > tolerance:
         return False
     invoice_date = _header_date(source.document)
-    target_date = _header_date(target)
+    target_date = _header_date(target) or fallback_date
     if invoice_date is None or target_date is None:
         return False
     return abs((invoice_date - target_date).days) <= config.date_normal_days
@@ -3061,7 +3067,9 @@ def _unreferenced_fallback_links(
                 link.link_type is LinkType.GRN_PO
                 and target is not None
                 and target.vendor_id == source.vendor_id
-                and _amount_and_date_agree(source, grn.document, config)
+                and _amount_and_date_agree(
+                    source, grn.document, config, _header_date(target.document)
+                )
             ):
                 qualifying_grns.setdefault(target.document_id, []).append(grn)
     qualifying: list[MappingPO] = []
