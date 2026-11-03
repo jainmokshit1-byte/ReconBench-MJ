@@ -5,6 +5,7 @@ import { useAuth } from "../auth/useAuth";
 import { AppShell } from "../components/AppShell";
 import { HomePage } from "../pages/HomePage";
 import { AdminErrorsPage } from "../pages/AdminErrorsPage";
+import { HealthPage } from "../pages/HealthPage";
 import { IngestionPage } from "../pages/IngestionPage";
 import { LoginPage } from "../pages/LoginPage";
 import { MappingPage } from "../pages/MappingPage";
@@ -26,6 +27,7 @@ export function App() {
               <Route path="reconciliation" element={<ReconciliationPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="admin/errors" element={<AdminErrorsPage />} />
+              <Route path="health" element={<HealthPage />} />
               <Route path="*" element={<Navigate to="/home" replace />} />
             </Route>
           </Route>

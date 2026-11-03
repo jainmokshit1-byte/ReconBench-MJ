@@ -1,6 +1,258 @@
 {
   "components": {
     "schemas": {
+      "AiHealthDashboard": {
+        "properties": {
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "mode_label": {
+            "title": "Mode Label",
+            "type": "string"
+          },
+          "precision": {
+            "$ref": "#/components/schemas/AiPrecisionHealth"
+          },
+          "primary_reader": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Primary Reader"
+          },
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/AiProviderHealth"
+            },
+            "title": "Providers",
+            "type": "array"
+          },
+          "reader_strategy": {
+            "title": "Reader Strategy",
+            "type": "string"
+          },
+          "scanned_invoices_available": {
+            "title": "Scanned Invoices Available",
+            "type": "boolean"
+          },
+          "scanned_invoices_reader": {
+            "title": "Scanned Invoices Reader",
+            "type": "string"
+          },
+          "scanned_invoices_reading": {
+            "title": "Scanned Invoices Reading",
+            "type": "boolean"
+          },
+          "status": {
+            "enum": [
+              "healthy",
+              "degraded",
+              "unhealthy"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/AiUsageHealth"
+          }
+        },
+        "required": [
+          "status",
+          "mode",
+          "mode_label",
+          "reader_strategy",
+          "scanned_invoices_reader",
+          "scanned_invoices_available",
+          "scanned_invoices_reading"
+        ],
+        "title": "AiHealthDashboard",
+        "type": "object"
+      },
+      "AiPrecisionHealth": {
+        "properties": {
+          "accuracy_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accuracy Pct"
+          },
+          "auto_verified_fields": {
+            "default": 0,
+            "title": "Auto Verified Fields",
+            "type": "integer"
+          },
+          "failed_reading_documents": {
+            "default": 0,
+            "title": "Failed Reading Documents",
+            "type": "integer"
+          },
+          "failed_requests": {
+            "default": 0,
+            "title": "Failed Requests",
+            "type": "integer"
+          },
+          "fallback_to_rules": {
+            "default": 0,
+            "title": "Fallback To Rules",
+            "type": "integer"
+          },
+          "human_verified_fields": {
+            "default": 0,
+            "title": "Human Verified Fields",
+            "type": "integer"
+          },
+          "recent_errors": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Recent Errors",
+            "type": "array"
+          },
+          "successful_requests": {
+            "default": 0,
+            "title": "Successful Requests",
+            "type": "integer"
+          },
+          "total_ai_fields": {
+            "default": 0,
+            "title": "Total Ai Fields",
+            "type": "integer"
+          },
+          "total_requests": {
+            "default": 0,
+            "title": "Total Requests",
+            "type": "integer"
+          },
+          "waiting_documents": {
+            "default": 0,
+            "title": "Waiting Documents",
+            "type": "integer"
+          }
+        },
+        "title": "AiPrecisionHealth",
+        "type": "object"
+      },
+      "AiProviderHealth": {
+        "properties": {
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "capabilities": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capabilities"
+          },
+          "checked_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checked At"
+          },
+          "connected_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connected At"
+          },
+          "connection_state": {
+            "title": "Connection State",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "key_configured": {
+            "default": false,
+            "title": "Key Configured",
+            "type": "boolean"
+          },
+          "key_hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Hint"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "provider": {
+            "enum": [
+              "gemini",
+              "vllm"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "reason_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason Code"
+          }
+        },
+        "required": [
+          "provider",
+          "enabled",
+          "connection_state"
+        ],
+        "title": "AiProviderHealth",
+        "type": "object"
+      },
       "AiSettingsUpdate": {
         "additionalProperties": false,
         "description": "Every field is optional; the key is write-only and never echoed.",
@@ -281,6 +533,48 @@
           "field"
         ],
         "title": "AiSuggestionRefBody",
+        "type": "object"
+      },
+      "AiUsageHealth": {
+        "properties": {
+          "calls_this_month": {
+            "default": 0,
+            "title": "Calls This Month",
+            "type": "integer"
+          },
+          "calls_today": {
+            "default": 0,
+            "title": "Calls Today",
+            "type": "integer"
+          },
+          "tokens_this_month": {
+            "default": 0,
+            "title": "Tokens This Month",
+            "type": "integer"
+          },
+          "tokens_today": {
+            "default": 0,
+            "title": "Tokens Today",
+            "type": "integer"
+          },
+          "uncertain_requests_count": {
+            "default": 0,
+            "title": "Uncertain Requests Count",
+            "type": "integer"
+          },
+          "usd_today": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usd Today"
+          }
+        },
+        "title": "AiUsageHealth",
         "type": "object"
       },
       "AiValueRefBody": {
@@ -2173,6 +2467,154 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HealthIssue": {
+        "properties": {
+          "action_hint": {
+            "title": "Action Hint",
+            "type": "string"
+          },
+          "component": {
+            "title": "Component",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "warning",
+              "info"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "component",
+          "title",
+          "description",
+          "action_hint"
+        ],
+        "title": "HealthIssue",
+        "type": "object"
+      },
+      "InfrastructureComponent": {
+        "properties": {
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latency Ms"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "healthy",
+              "degraded",
+              "unhealthy"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "title": "InfrastructureComponent",
+        "type": "object"
+      },
+      "IngestionHealthDashboard": {
+        "properties": {
+          "by_doc_type": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "By Doc Type",
+            "type": "object"
+          },
+          "by_status": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "By Status",
+            "type": "object"
+          },
+          "digital_count": {
+            "default": 0,
+            "title": "Digital Count",
+            "type": "integer"
+          },
+          "failed_files_count": {
+            "default": 0,
+            "title": "Failed Files Count",
+            "type": "integer"
+          },
+          "recent_failed_files": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Recent Failed Files",
+            "type": "array"
+          },
+          "scanned_count": {
+            "default": 0,
+            "title": "Scanned Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "healthy",
+              "degraded",
+              "unhealthy"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "total_files": {
+            "default": 0,
+            "title": "Total Files",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "IngestionHealthDashboard",
+        "type": "object"
+      },
       "InvoiceCorrectionBody": {
         "additionalProperties": false,
         "properties": {
@@ -3289,6 +3731,54 @@
         "title": "ManualReconBody",
         "type": "object"
       },
+      "MappingHealthDashboard": {
+        "properties": {
+          "confirmed_links": {
+            "default": 0,
+            "title": "Confirmed Links",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "healthy",
+              "degraded",
+              "unhealthy"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "suggested_links": {
+            "default": 0,
+            "title": "Suggested Links",
+            "type": "integer"
+          },
+          "three_way_matched_sets": {
+            "default": 0,
+            "title": "Three Way Matched Sets",
+            "type": "integer"
+          },
+          "total_links": {
+            "default": 0,
+            "title": "Total Links",
+            "type": "integer"
+          },
+          "total_vendors": {
+            "default": 0,
+            "title": "Total Vendors",
+            "type": "integer"
+          },
+          "unassigned_documents": {
+            "default": 0,
+            "title": "Unassigned Documents",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "MappingHealthDashboard",
+        "type": "object"
+      },
       "MergeSuggestionDecisionBody": {
         "additionalProperties": false,
         "properties": {
@@ -3806,6 +4296,125 @@
         "title": "ReasonLevel",
         "type": "string"
       },
+      "ReconciliationHealthDashboard": {
+        "properties": {
+          "at_risk_total": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At Risk Total"
+          },
+          "done_cases": {
+            "default": 0,
+            "title": "Done Cases",
+            "type": "integer"
+          },
+          "engine_version": {
+            "title": "Engine Version",
+            "type": "string"
+          },
+          "exception_count": {
+            "default": 0,
+            "title": "Exception Count",
+            "type": "integer"
+          },
+          "grni_total": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grni Total"
+          },
+          "latest_run_finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Run Finished At"
+          },
+          "latest_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Run Id"
+          },
+          "latest_run_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Run Status"
+          },
+          "matched_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matched Pct"
+          },
+          "pending_count": {
+            "default": 0,
+            "title": "Pending Count",
+            "type": "integer"
+          },
+          "rules_hash": {
+            "title": "Rules Hash",
+            "type": "string"
+          },
+          "stale_cases_count": {
+            "default": 0,
+            "title": "Stale Cases Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "healthy",
+              "degraded",
+              "unhealthy"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "total_cases": {
+            "default": 0,
+            "title": "Total Cases",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "engine_version",
+          "rules_hash"
+        ],
+        "title": "ReconciliationHealthDashboard",
+        "type": "object"
+      },
       "RetentionBody": {
         "additionalProperties": false,
         "properties": {
@@ -4129,6 +4738,71 @@
           "tax"
         ],
         "title": "SynonymsBody",
+        "type": "object"
+      },
+      "SystemHealthResponse": {
+        "properties": {
+          "ai": {
+            "$ref": "#/components/schemas/AiHealthDashboard"
+          },
+          "app_version": {
+            "default": "0.1.0",
+            "title": "App Version",
+            "type": "string"
+          },
+          "engine_version": {
+            "title": "Engine Version",
+            "type": "string"
+          },
+          "infrastructure": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/InfrastructureComponent"
+            },
+            "title": "Infrastructure",
+            "type": "object"
+          },
+          "ingestion": {
+            "$ref": "#/components/schemas/IngestionHealthDashboard"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/HealthIssue"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "mapping": {
+            "$ref": "#/components/schemas/MappingHealthDashboard"
+          },
+          "reconciliation": {
+            "$ref": "#/components/schemas/ReconciliationHealthDashboard"
+          },
+          "status": {
+            "enum": [
+              "healthy",
+              "degraded",
+              "unhealthy"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "timestamp",
+          "engine_version",
+          "infrastructure",
+          "ai",
+          "ingestion",
+          "mapping",
+          "reconciliation"
+        ],
+        "title": "SystemHealthResponse",
         "type": "object"
       },
       "ThresholdsBody": {
@@ -7939,6 +8613,29 @@
         "tags": [
           "API v1",
           "Documents"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "description": "Return live operational metrics for databases, storage, workers, AI, and pipeline stages.",
+        "operationId": "get_system_health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemHealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get full system health, connections, and AI precision metrics",
+        "tags": [
+          "API v1",
+          "Operations"
         ]
       }
     },

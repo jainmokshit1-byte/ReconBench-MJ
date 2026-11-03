@@ -24,6 +24,7 @@ const mainNavigation = [
   { to: "/ingestion", label: "Ingestion", icon: FileInput },
   { to: "/mapping", label: "Mapping", icon: GitMerge },
   { to: "/reconciliation", label: "Reconciliation", icon: ArrowDownToLine },
+  { to: "/health", label: "System Health", icon: Activity },
 ];
 
 export function AppShell() {

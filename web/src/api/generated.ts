@@ -963,6 +963,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get full system health, connections, and AI precision metrics
+         * @description Return live operational metrics for databases, storage, workers, AI, and pipeline stages.
+         */
+        get: operations["get_system_health_api_v1_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/kpis": {
         parameters: {
             query?: never;
@@ -1326,6 +1346,119 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AiHealthDashboard */
+        AiHealthDashboard: {
+            /** Mode */
+            mode: string;
+            /** Mode Label */
+            mode_label: string;
+            precision?: components["schemas"]["AiPrecisionHealth"];
+            /** Primary Reader */
+            primary_reader?: string | null;
+            /** Providers */
+            providers?: components["schemas"]["AiProviderHealth"][];
+            /** Reader Strategy */
+            reader_strategy: string;
+            /** Scanned Invoices Available */
+            scanned_invoices_available: boolean;
+            /** Scanned Invoices Reader */
+            scanned_invoices_reader: string;
+            /** Scanned Invoices Reading */
+            scanned_invoices_reading: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "healthy" | "degraded" | "unhealthy";
+            usage?: components["schemas"]["AiUsageHealth"];
+        };
+        /** AiPrecisionHealth */
+        AiPrecisionHealth: {
+            /** Accuracy Pct */
+            accuracy_pct?: number | null;
+            /**
+             * Auto Verified Fields
+             * @default 0
+             */
+            auto_verified_fields: number;
+            /**
+             * Failed Reading Documents
+             * @default 0
+             */
+            failed_reading_documents: number;
+            /**
+             * Failed Requests
+             * @default 0
+             */
+            failed_requests: number;
+            /**
+             * Fallback To Rules
+             * @default 0
+             */
+            fallback_to_rules: number;
+            /**
+             * Human Verified Fields
+             * @default 0
+             */
+            human_verified_fields: number;
+            /** Recent Errors */
+            recent_errors?: {
+                [key: string]: unknown;
+            }[];
+            /**
+             * Successful Requests
+             * @default 0
+             */
+            successful_requests: number;
+            /**
+             * Total Ai Fields
+             * @default 0
+             */
+            total_ai_fields: number;
+            /**
+             * Total Requests
+             * @default 0
+             */
+            total_requests: number;
+            /**
+             * Waiting Documents
+             * @default 0
+             */
+            waiting_documents: number;
+        };
+        /** AiProviderHealth */
+        AiProviderHealth: {
+            /** Base Url */
+            base_url?: string | null;
+            /** Capabilities */
+            capabilities?: {
+                [key: string]: unknown;
+            } | null;
+            /** Checked At */
+            checked_at?: string | null;
+            /** Connected At */
+            connected_at?: string | null;
+            /** Connection State */
+            connection_state: string;
+            /** Enabled */
+            enabled: boolean;
+            /**
+             * Key Configured
+             * @default false
+             */
+            key_configured: boolean;
+            /** Key Hint */
+            key_hint?: string | null;
+            /** Model */
+            model?: string | null;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "gemini" | "vllm";
+            /** Reason Code */
+            reason_code?: string | null;
+        };
         /**
          * AiSettingsUpdate
          * @description Every field is optional; the key is write-only and never echoed.
@@ -1387,6 +1520,36 @@ export interface components {
              * @enum {string}
              */
             scope: "header" | "line";
+        };
+        /** AiUsageHealth */
+        AiUsageHealth: {
+            /**
+             * Calls This Month
+             * @default 0
+             */
+            calls_this_month: number;
+            /**
+             * Calls Today
+             * @default 0
+             */
+            calls_today: number;
+            /**
+             * Tokens This Month
+             * @default 0
+             */
+            tokens_this_month: number;
+            /**
+             * Tokens Today
+             * @default 0
+             */
+            tokens_today: number;
+            /**
+             * Uncertain Requests Count
+             * @default 0
+             */
+            uncertain_requests_count: number;
+            /** Usd Today */
+            usd_today?: string | null;
         };
         /**
          * AiValueRefBody
@@ -1952,6 +2115,80 @@ export interface components {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
         };
+        /** HealthIssue */
+        HealthIssue: {
+            /** Action Hint */
+            action_hint: string;
+            /** Component */
+            component: string;
+            /** Description */
+            description: string;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "critical" | "warning" | "info";
+            /** Title */
+            title: string;
+        };
+        /** InfrastructureComponent */
+        InfrastructureComponent: {
+            /** Details */
+            details?: {
+                [key: string]: unknown;
+            };
+            /** Latency Ms */
+            latency_ms?: number | null;
+            /** Message */
+            message?: string | null;
+            /** Name */
+            name: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "healthy" | "degraded" | "unhealthy";
+        };
+        /** IngestionHealthDashboard */
+        IngestionHealthDashboard: {
+            /** By Doc Type */
+            by_doc_type?: {
+                [key: string]: number;
+            };
+            /** By Status */
+            by_status?: {
+                [key: string]: number;
+            };
+            /**
+             * Digital Count
+             * @default 0
+             */
+            digital_count: number;
+            /**
+             * Failed Files Count
+             * @default 0
+             */
+            failed_files_count: number;
+            /** Recent Failed Files */
+            recent_failed_files?: {
+                [key: string]: unknown;
+            }[];
+            /**
+             * Scanned Count
+             * @default 0
+             */
+            scanned_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "healthy" | "degraded" | "unhealthy";
+            /**
+             * Total Files
+             * @default 0
+             */
+            total_files: number;
+        };
         /** InvoiceCorrectionBody */
         InvoiceCorrectionBody: {
             /** Ai Suggestion Refs */
@@ -2287,6 +2524,44 @@ export interface components {
              */
             run_date?: string;
         };
+        /** MappingHealthDashboard */
+        MappingHealthDashboard: {
+            /**
+             * Confirmed Links
+             * @default 0
+             */
+            confirmed_links: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "healthy" | "degraded" | "unhealthy";
+            /**
+             * Suggested Links
+             * @default 0
+             */
+            suggested_links: number;
+            /**
+             * Three Way Matched Sets
+             * @default 0
+             */
+            three_way_matched_sets: number;
+            /**
+             * Total Links
+             * @default 0
+             */
+            total_links: number;
+            /**
+             * Total Vendors
+             * @default 0
+             */
+            total_vendors: number;
+            /**
+             * Unassigned Documents
+             * @default 0
+             */
+            unassigned_documents: number;
+        };
         /** MergeSuggestionDecisionBody */
         MergeSuggestionDecisionBody: {
             /** Decision */
@@ -2470,6 +2745,55 @@ export interface components {
          * @enum {string}
          */
         ReasonLevel: "block" | "review" | "fail" | "pending" | "warn" | "info";
+        /** ReconciliationHealthDashboard */
+        ReconciliationHealthDashboard: {
+            /** At Risk Total */
+            at_risk_total?: string | null;
+            /**
+             * Done Cases
+             * @default 0
+             */
+            done_cases: number;
+            /** Engine Version */
+            engine_version: string;
+            /**
+             * Exception Count
+             * @default 0
+             */
+            exception_count: number;
+            /** Grni Total */
+            grni_total?: string | null;
+            /** Latest Run Finished At */
+            latest_run_finished_at?: string | null;
+            /** Latest Run Id */
+            latest_run_id?: string | null;
+            /** Latest Run Status */
+            latest_run_status?: string | null;
+            /** Matched Pct */
+            matched_pct?: number | null;
+            /**
+             * Pending Count
+             * @default 0
+             */
+            pending_count: number;
+            /** Rules Hash */
+            rules_hash: string;
+            /**
+             * Stale Cases Count
+             * @default 0
+             */
+            stale_cases_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "healthy" | "degraded" | "unhealthy";
+            /**
+             * Total Cases
+             * @default 0
+             */
+            total_cases: number;
+        };
         /** RetentionBody */
         RetentionBody: {
             /** Document Days */
@@ -2564,6 +2888,36 @@ export interface components {
             totals: string[];
             /** Vendor Name */
             vendor_name: string[];
+        };
+        /** SystemHealthResponse */
+        SystemHealthResponse: {
+            ai: components["schemas"]["AiHealthDashboard"];
+            /**
+             * App Version
+             * @default 0.1.0
+             */
+            app_version: string;
+            /** Engine Version */
+            engine_version: string;
+            /** Infrastructure */
+            infrastructure: {
+                [key: string]: components["schemas"]["InfrastructureComponent"];
+            };
+            ingestion: components["schemas"]["IngestionHealthDashboard"];
+            /** Issues */
+            issues?: components["schemas"]["HealthIssue"][];
+            mapping: components["schemas"]["MappingHealthDashboard"];
+            reconciliation: components["schemas"]["ReconciliationHealthDashboard"];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "healthy" | "degraded" | "unhealthy";
+            /**
+             * Timestamp
+             * Format: date-time
+             */
+            timestamp: string;
         };
         /** ThresholdsBody */
         ThresholdsBody: {
@@ -4825,6 +5179,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_system_health_api_v1_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SystemHealthResponse"];
                 };
             };
         };

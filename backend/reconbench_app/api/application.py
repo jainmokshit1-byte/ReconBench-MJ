@@ -30,6 +30,7 @@ from reconbench_app.api.configuration import router as configuration_router
 from reconbench_app.api.conventions import ApiProblem, problem_response
 from reconbench_app.api.conventions import validation_errors as convention_validation_errors
 from reconbench_app.api.exports import router as exports_router
+from reconbench_app.api.health import router as health_router
 from reconbench_app.api.ingestion import router as ingestion_router
 from reconbench_app.api.mapping import router as mapping_router
 from reconbench_app.api.reconciliation import router as reconciliation_router
@@ -39,6 +40,7 @@ from reconbench_app.authorization import public_endpoint, requires
 from reconbench_app.configuration import ConfigurationService
 from reconbench_app.db.repository import VersionConflict
 from reconbench_app.extraction.einvoice_keys import einvoice_keys
+from reconbench_app.health_service import HealthService
 from reconbench_app.idempotency import IdempotencyInProgress, IdempotencyKeyConflict
 from reconbench_app.ingestion import IngestionService
 from reconbench_app.jobs import make_s3_client, register_ingestion_tasks
@@ -137,6 +139,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.ai_provider_connection_service = ProviderConnectionService(
         app.state.ai_settings_service
+    )
+    app.state.health_service = HealthService(
+        engine=engine,
+        s3_client=s3,
+        settings=resolved_settings,
+        job_queue=job_queue,
+        configuration_service=app.state.configuration_service,
+        ai_settings_service=app.state.ai_settings_service,
+        ai_provider_connection_service=app.state.ai_provider_connection_service,
     )
 
     @app.exception_handler(StarletteHTTPException)
@@ -311,6 +322,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api_v1.include_router(reconciliation_router)
     api_v1.include_router(review_router)
     api_v1.include_router(exports_router)
+    api_v1.include_router(health_router)
     app.include_router(api_v1)
 
     # FastAPI's generated OpenAPI/docs endpoints are not public; keep them behind
