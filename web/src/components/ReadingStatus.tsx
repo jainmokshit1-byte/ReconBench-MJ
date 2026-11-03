@@ -1,15 +1,17 @@
 import { useState } from "react";
 import { AlertTriangle, Clock } from "lucide-react";
 
-import { readWithRules, retryReading } from "../api/ingestion";
+import { readWithRules, rereadWithRules, retryReading } from "../api/ingestion";
 import type { DocumentDetails } from "../api/ingestion";
 import { readingFailureText } from "./readingFailure";
 
 /**
  * PD-2f: a scanned invoice read with the switch on AI waits for its reading; nothing is
  * used in mapping or reconciliation until the AI version is current or a person picks
- * "Read with rules". After a failure a person picks Retry or "Read with rules". Renders
- * nothing for a ready document, or when the server does not send a reading state.
+ * "Read with rules". After a failure a person picks Retry or "Read with rules". A ready
+ * invoice, PO or GRN gets a subtle "Read again with rules" (confirm first): the rules read
+ * the stored file once more and the result becomes a new version, never AI. Renders nothing
+ * when the server does not send a reading state.
  */
 export function ReadingStatus({
   details,
@@ -22,13 +24,16 @@ export function ReadingStatus({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
   const document = details["document"] as Record<string, unknown> | undefined;
   const state = document?.["reading_state"];
-  if (state !== "waiting" && state !== "failed") return null;
   const documentId = typeof document?.["id"] === "string" ? document["id"] : null;
   const version = typeof document?.["version"] === "number" ? document["version"] : null;
   const code = typeof document?.["reading_failure_code"] === "string" ? document["reading_failure_code"] : null;
   const canSend = Boolean(csrfToken && documentId && version !== null) && !busy;
+  const docType = document?.["doc_type"];
+  const canReread = state === "ready" && (docType === "invoice" || docType === "po" || docType === "grn");
+  if (state !== "waiting" && state !== "failed" && !canReread) return null;
 
   const send = async (action: typeof retryReading) => {
     if (!csrfToken || !documentId || version === null) return;
@@ -36,12 +41,43 @@ export function ReadingStatus({
     setError(null);
     try {
       onSaved(await action(documentId, version, csrfToken));
+      setConfirming(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The choice could not be saved.");
     } finally {
       setBusy(false);
     }
   };
+
+  if (canReread) {
+    // A ready document: a person may have the rules read its stored file again (never AI).
+    return (
+      <section className="verify-unverified-fields" aria-label="Read again with rules">
+        {confirming ? (
+          <>
+            <p className="preview-muted">
+              This replaces the current values with a fresh rules reading. Earlier versions are kept.
+            </p>
+            <div className="invoice-correction-toolbar">
+              <button className="button button-primary" type="button" disabled={!canSend} onClick={() => void send(rereadWithRules)}>
+                Read again
+              </button>
+              <button className="button button-subtle" type="button" disabled={busy} onClick={() => { setConfirming(false); setError(null); }}>
+                Cancel
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="invoice-correction-toolbar">
+            <button className="button button-subtle" type="button" disabled={!canSend} onClick={() => setConfirming(true)}>
+              Read again with rules
+            </button>
+          </div>
+        )}
+        {error ? <p role="alert">{error}</p> : null}
+      </section>
+    );
+  }
 
   return (
     <section className="verify-unverified-fields" aria-label="AI reading">

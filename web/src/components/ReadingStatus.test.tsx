@@ -7,6 +7,7 @@ import { readingFailureText } from "./readingFailure";
 
 const retryReading = vi.fn();
 const readWithRules = vi.fn();
+const rereadWithRules = vi.fn();
 
 vi.mock("../api/ingestion", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/ingestion")>();
@@ -14,6 +15,7 @@ vi.mock("../api/ingestion", async (importOriginal) => {
     ...actual,
     retryReading: (...args: unknown[]) => retryReading(...args),
     readWithRules: (...args: unknown[]) => readWithRules(...args),
+    rereadWithRules: (...args: unknown[]) => rereadWithRules(...args),
   };
 });
 
@@ -21,6 +23,7 @@ afterEach(() => {
   cleanup();
   retryReading.mockReset();
   readWithRules.mockReset();
+  rereadWithRules.mockReset();
 });
 
 function details(document: Record<string, unknown>): DocumentDetails {
@@ -28,12 +31,22 @@ function details(document: Record<string, unknown>): DocumentDetails {
 }
 
 describe("ReadingStatus (PD-2f)", () => {
-  it("renders nothing for a ready document or a server that sends no reading state", () => {
-    const { container: ready } = render(<ReadingStatus details={details({ reading_state: "ready" })} csrfToken="csrf" onSaved={vi.fn()} />);
-    expect(ready.innerHTML).toBe("");
-    cleanup();
+  it("renders nothing when the server sends no reading state", () => {
     const { container: older } = render(<ReadingStatus details={details({})} csrfToken="csrf" onSaved={vi.fn()} />);
     expect(older.innerHTML).toBe("");
+  });
+
+  it("offers only a subtle Read again with rules for a ready document", () => {
+    render(<ReadingStatus details={details({ reading_state: "ready" })} csrfToken="csrf" onSaved={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Read again with rules" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Read with rules" })).toBeNull();
+    expect(screen.queryByText(/replaces the current values/)).toBeNull();
+  });
+
+  it("does not offer it for other document types", () => {
+    const { container } = render(<ReadingStatus details={details({ reading_state: "ready", doc_type: "credit_note" })} csrfToken="csrf" onSaved={vi.fn()} />);
+    expect(container.innerHTML).toBe("");
   });
 
   it("shows a waiting invoice with Read with rules only", () => {
@@ -65,6 +78,42 @@ describe("ReadingStatus (PD-2f)", () => {
 
     expect((await screen.findByRole("alert")).textContent).toBe("This invoice's reading changed; reload the page.");
     expect(readWithRules).toHaveBeenCalledWith("doc-1", 7, "csrf");
+  });
+
+  it("asks to confirm, then reads again with the loaded version and refreshes the document", async () => {
+    const saved = details({ reading_state: "ready", version: 8 });
+    rereadWithRules.mockResolvedValue(saved);
+    const onSaved = vi.fn();
+    render(<ReadingStatus details={details({ reading_state: "ready" })} csrfToken="csrf" onSaved={onSaved} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Read again with rules" }));
+    expect(screen.getByText("This replaces the current values with a fresh rules reading. Earlier versions are kept.")).toBeTruthy();
+    expect(rereadWithRules).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Read again" }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(saved));
+    expect(rereadWithRules).toHaveBeenCalledWith("doc-1", 7, "csrf");
+    expect(retryReading).not.toHaveBeenCalled();
+    expect(readWithRules).not.toHaveBeenCalled();
+  });
+
+  it("can be cancelled without calling the server, and shows a refusal as an alert", async () => {
+    rereadWithRules.mockRejectedValue(new Error("The rules now find a different number of documents in this file."));
+    render(<ReadingStatus details={details({ reading_state: "ready" })} csrfToken="csrf" onSaved={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Read again with rules" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Read again with rules" })).toBeTruthy();
+    expect(rereadWithRules).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Read again with rules" }));
+    fireEvent.click(screen.getByRole("button", { name: "Read again" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("The rules now find a different number of documents in this file.");
+  });
+
+  it("disables Read again with rules without a session", () => {
+    render(<ReadingStatus details={details({ reading_state: "ready" })} csrfToken={null} onSaved={vi.fn()} />);
+    expect((screen.getByRole("button", { name: "Read again with rules" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("disables both choices without a session", () => {

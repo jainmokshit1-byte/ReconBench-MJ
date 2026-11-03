@@ -435,7 +435,7 @@ export async function verifyAiValues(
 async function readingAction(
   documentId: string,
   version: number,
-  action: "retry" | "use-rules",
+  action: "retry" | "use-rules" | "reread-rules",
   csrfToken: string,
 ): Promise<DocumentDetails> {
   const response = await request(`/documents/${encodeURIComponent(documentId)}/reading/${action}`, csrfToken, {
@@ -455,6 +455,11 @@ export function retryReading(documentId: string, version: number, csrfToken: str
 /** PD-2f: use the rules reading of a waiting or failed scanned invoice (audited). */
 export function readWithRules(documentId: string, version: number, csrfToken: string): Promise<DocumentDetails> {
   return readingAction(documentId, version, "use-rules", csrfToken);
+}
+
+/** Read a ready document's stored file again with the rules: a new current version, older ones kept (audited, never AI). */
+export function rereadWithRules(documentId: string, version: number, csrfToken: string): Promise<DocumentDetails> {
+  return readingAction(documentId, version, "reread-rules", csrfToken);
 }
 
 /** Backwards-compatible name retained for invoice-only call sites. */
