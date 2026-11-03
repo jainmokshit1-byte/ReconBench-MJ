@@ -6,7 +6,7 @@ import json
 import tempfile
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -27,7 +27,10 @@ P0_SHEETS = (
     "Exceptions",
     "Vendor Summary",
     "Field Origin",
+    "Not included",
+    "PO Balance",
 )
+TOTAL_DERIVED_NOTE = "total not read; taxable + tax"
 FIELD_ORIGIN_LABELS = {
     "ocr": "Rules",
     "ai": "AI",
@@ -72,6 +75,33 @@ def _plain(value: object | None) -> str:
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
+
+
+def _invoice_total(record: Any) -> tuple[Decimal | None, bool]:
+    """Invoice total: the read grand total, else taxable + tax + round-off (flagged derived)."""
+
+    grand = _decimal(record["invoice_total"])
+    if grand is not None:
+        return grand, False
+    taxable = _decimal(record["invoice_taxable"])
+    if taxable is None:
+        return None, False
+    parts = (_decimal(record[name]) for name in ("cgst_total", "sgst_total", "igst_total"))
+    tax = sum((part or Decimal(0) for part in parts), Decimal(0))
+    return taxable + tax + (_decimal(record["round_off"]) or Decimal(0)), True
+
+
+def _payable_incl_gst(record: Any) -> Decimal | None:
+    """Payable (ex-GST) plus GST at the invoice's header tax ratio, 2 dp half-up."""
+
+    taxable = _decimal(record["invoice_taxable"])
+    payable = _decimal(record["payable_taxable"])
+    if taxable is None or taxable == 0 or payable is None:
+        return None
+    parts = (_decimal(record[name]) for name in ("cgst_total", "sgst_total", "igst_total"))
+    tax = sum((part or Decimal(0) for part in parts), Decimal(0))
+    gst = (payable * tax / taxable).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return payable + gst
 
 
 def _write_text(sheet: Any, row: int, column: int, value: object | None, fmt: Any = None) -> None:
@@ -337,13 +367,17 @@ class ExportService:
                         .order_by(evidence_table.c.created_at.asc(), evidence_table.c.id.asc())
                     ).mappings()
                     for ev in evidence_rows:
-                        evidence_by_version.setdefault(
-                            cast(UUID, ev["document_version_id"]), {}
-                        )[str(ev["field_name"])] = {
+                        evidence_by_version.setdefault(cast(UUID, ev["document_version_id"]), {})[
+                            str(ev["field_name"])
+                        ] = {
                             "origin": ev["origin"],
                             "verification": ev["verification"],
                         }
+            not_included = self._not_included_rows(connection, workspace_id)
+            po_balance = self._po_balance_rows(connection, workspace_id)
         context = {
+            "not_included": not_included,
+            "po_balance": po_balance,
             "workspace_id": workspace_id,
             "run_id": run_id,
             "run": dict(run_row),
@@ -353,6 +387,99 @@ class ExportService:
             "field_evidence": evidence_by_version,
         }
         return cases, lines, context
+
+    @staticmethod
+    def _not_included_rows(connection: Connection, workspace_id: UUID) -> list[dict[str, Any]]:
+        """Documents not read yet / failed, and files that failed or parsed partly."""
+
+        document = metadata.tables["document"]
+        version = metadata.tables["document_version"]
+        source_file = metadata.tables["source_file"]
+        rows: list[dict[str, Any]] = []
+        for item in connection.execute(
+            sa.select(
+                document.c.doc_type,
+                document.c.doc_no,
+                document.c.reading_state,
+                document.c.reading_failure_code,
+                source_file.c.display_name,
+            )
+            .select_from(
+                document.outerjoin(
+                    version, version.c.id == document.c.current_version_id
+                ).outerjoin(source_file, source_file.c.id == version.c.source_file_id)
+            )
+            .where(
+                document.c.workspace_id == workspace_id,
+                document.c.withdrawn_at.is_(None),
+                document.c.reading_state != "ready",
+            )
+            .order_by(document.c.doc_type, document.c.doc_no, source_file.c.display_name)
+        ):
+            rows.append(
+                {
+                    "kind": "Document",
+                    "doc_type": str(item.doc_type),
+                    "doc_no": item.doc_no,
+                    "file_name": item.display_name,
+                    "state": item.reading_state,
+                    "code": item.reading_failure_code,
+                }
+            )
+        for file_item in connection.execute(
+            sa.select(source_file.c.display_name, source_file.c.status, source_file.c.error_code)
+            .where(
+                source_file.c.workspace_id == workspace_id,
+                source_file.c.status.in_(["failed", "partial"]),
+            )
+            .order_by(source_file.c.display_name, source_file.c.id)
+        ):
+            rows.append(
+                {
+                    "kind": "File",
+                    "doc_type": None,
+                    "doc_no": None,
+                    "file_name": file_item.display_name,
+                    "state": str(file_item.status),
+                    "code": file_item.error_code,
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _po_balance_rows(connection: Connection, workspace_id: UUID) -> list[dict[str, Any]]:
+        """Per PO line from the ledger, for non-withdrawn POs of the workspace."""
+
+        ledger = metadata.tables["po_line_ledger"]
+        document = metadata.tables["document"]
+        line = metadata.tables["doc_line"]
+        return [
+            dict(item)
+            for item in connection.execute(
+                sa.select(
+                    document.c.doc_no.label("po_no"),
+                    ledger.c.po_line_no,
+                    line.c.description,
+                    ledger.c.po_rate,
+                    ledger.c.ordered,
+                    ledger.c.billed,
+                    ledger.c.received_accepted,
+                    ledger.c.open_qty,
+                    ledger.c.grni_qty,
+                )
+                .select_from(
+                    ledger.join(document, document.c.id == ledger.c.po_document_id).outerjoin(
+                        line, line.c.id == ledger.c.po_doc_line_id
+                    )
+                )
+                .where(
+                    ledger.c.workspace_id == workspace_id,
+                    document.c.workspace_id == workspace_id,
+                    document.c.withdrawn_at.is_(None),
+                )
+                .order_by(document.c.doc_no, ledger.c.po_line_no)
+            ).mappings()
+        ]
 
     @staticmethod
     def _vendor_document_counts(
@@ -425,13 +552,15 @@ class ExportService:
             "Expected @ PO Rate",
             "Variance ₹",
             "Variance %",
-            "Payable",
+            "Payable (ex-GST)",
             "At-risk",
             "Status",
             "Reason Codes",
             "Override Info",
             "Payment Due Date",
             "Reading Method",
+            "Payable incl. GST",
+            "Notes",
         ]
         invoice_sheets: list[tuple[Any, str, int]] = []
         invoice_row_info: list[tuple[RowMapping, str, int]] = []
@@ -452,8 +581,6 @@ class ExportService:
             row_no = row_index + 1
             current_sheet_name = invoice_sheet_name
             invoice_row_info.append((record, current_sheet_name, row_no))
-            vendor_id = cast(UUID | None, record["effective_vendor_id"])
-            gstins = context["gstins"].get(vendor_id, []) if vendor_id else []
             links = record["link_summary"] if isinstance(record["link_summary"], list) else []
             link_methods = [str(item.get("method", "")) for item in links if isinstance(item, dict)]
             confidences = [
@@ -466,7 +593,9 @@ class ExportService:
                 for name in ("cgst_total", "sgst_total", "igst_total", "round_off")
             ]
             tax = sum(value or 0 for value in tax_parts)
-            total = _excel_number(record["invoice_total"])
+            total_value, total_derived = _invoice_total(record)
+            total = float(total_value) if total_value is not None else None
+            payable_incl_gst = _payable_incl_gst(record)
             expected = _excel_number(record["expected_taxable"])
             variance = _excel_number(record["variance"])
             variance_pct = _excel_number(record["variance_pct"])
@@ -474,7 +603,7 @@ class ExportService:
             risk = _excel_number(record["at_risk"])
             values: list[object | None] = [
                 record["effective_vendor_name"] or record["vendor_name"],
-                ", ".join(gstins) if gstins else record["vendor_gstin"],
+                record["vendor_gstin"],
                 record["invoice_no"],
                 record["invoice_date"],
                 record["po_nos"],
@@ -534,6 +663,20 @@ class ExportService:
                 row_index,
                 20,
                 READING_METHOD_LABELS.get(str(record["reading_method"]), record["reading_method"]),
+                text_fmt,
+            )
+            self._write_cell(
+                sheets_invoice,
+                row_index,
+                21,
+                float(payable_incl_gst) if payable_incl_gst is not None else None,
+                money_fmt,
+            )
+            self._write_cell(
+                sheets_invoice,
+                row_index,
+                22,
+                TOTAL_DERIVED_NOTE if total_derived else None,
                 text_fmt,
             )
             row_index += 1
@@ -698,8 +841,13 @@ class ExportService:
             self._write_cell(exception_sheet, exception_row, 1, record["invoice_no"], text_fmt)
             self._write_cell(exception_sheet, exception_row, 2, record["invoice_date"], date_fmt)
             self._write_cell(exception_sheet, exception_row, 3, record["po_nos"], text_fmt)
+            exception_total = _invoice_total(record)[0]
             self._write_cell(
-                exception_sheet, exception_row, 4, _excel_number(record["invoice_total"]), money_fmt
+                exception_sheet,
+                exception_row,
+                4,
+                float(exception_total) if exception_total is not None else None,
+                money_fmt,
             )
             self._write_cell(exception_sheet, exception_row, 5, status, text_fmt)
             self._write_cell(exception_sheet, exception_row, 6, record["reason_codes"], text_fmt)
@@ -741,7 +889,7 @@ class ExportService:
                 },
             )
             group["statuses"][str(record["effective_status"])] += 1
-            group["invoice"] += _decimal(record["invoice_total"]) or Decimal(0)
+            group["invoice"] += _invoice_total(record)[0] or Decimal(0)
             group["risk"] += _decimal(record["at_risk"]) or Decimal(0)
             if record["vendor_gstin"] and str(record["vendor_gstin"]) not in group["gstins"]:
                 group["gstins"].append(str(record["vendor_gstin"]))
@@ -843,6 +991,66 @@ class ExportService:
                 origin_row_index += 1
         origin_sheet.autofilter(0, 0, max(0, origin_row_index - 1), len(origin_headers) - 1)
 
+        not_included_headers = ["Kind", "Doc type", "Doc No.", "File", "State", "Code"]
+        not_included = context.get("not_included") or []
+        not_included_sheet = self._new_sheet(
+            workbook, "Not included", not_included_headers, header_fmt
+        )
+        for offset, item in enumerate(not_included[: EXCEL_MAX_ROWS - 1], start=1):
+            for column, key in enumerate(
+                ("kind", "doc_type", "doc_no", "file_name", "state", "code")
+            ):
+                self._write_cell(not_included_sheet, offset, column, item.get(key), text_fmt)
+        not_included_sheet.autofilter(
+            0, 0, max(1, len(not_included)), len(not_included_headers) - 1
+        )
+
+        balance_headers = [
+            "PO No.",
+            "PO Line",
+            "Description",
+            "PO Rate",
+            "Ordered",
+            "Billed",
+            "Received (accepted)",
+            "Open Qty",
+            "GRNI Qty",
+            "Open Value",
+        ]
+        balance_rows = context.get("po_balance") or []
+        balance_sheet = self._new_sheet(workbook, "PO Balance", balance_headers, header_fmt)
+        for offset, item in enumerate(balance_rows[: EXCEL_MAX_ROWS - 1], start=1):
+            rate = _decimal(item.get("po_rate"))
+            open_qty = _decimal(item.get("open_qty"))
+            open_value = rate * open_qty if rate is not None and open_qty is not None else None
+            balance_values: list[object | None] = [
+                item.get("po_no"),
+                item.get("po_line_no"),
+                item.get("description"),
+                _excel_number(rate),
+                _excel_number(item.get("ordered")),
+                _excel_number(item.get("billed")),
+                _excel_number(item.get("received_accepted")),
+                _excel_number(open_qty),
+                _excel_number(item.get("grni_qty")),
+                float(open_value) if open_value is not None else None,
+            ]
+            for column, value in enumerate(balance_values):
+                self._write_cell(
+                    balance_sheet,
+                    offset,
+                    column,
+                    value,
+                    money_fmt
+                    if column in {3, 9}
+                    else qty_fmt
+                    if column in {4, 5, 6, 7, 8}
+                    else text_fmt
+                    if column != 1
+                    else None,
+                )
+        balance_sheet.autofilter(0, 0, max(1, len(balance_rows)), len(balance_headers) - 1)
+
         statuses = Counter(str(record["effective_status"]) for record in cases)
         run = context["run"]
         tolerance_settings = ""
@@ -865,8 +1073,10 @@ class ExportService:
             ("Needs Review", statuses.get("needs_review", 0)),
             ("Duplicate", statuses.get("duplicate", 0)),
             ("₹ Invoiced", None),
-            ("₹ Payable", None),
+            ("₹ Payable (ex-GST)", None),
             ("₹ At-risk", None),
+            ("₹ Payable incl. GST", None),
+            ("Not included (documents / files)", len(not_included)),
             ("Engine version", run.get("engine_version")),
             ("Rules hash", run.get("rules_hash")),
             ("Configuration version", run.get("config_version_id")),
@@ -879,23 +1089,26 @@ class ExportService:
         ]
         formula_by_metric = {
             "₹ Invoiced": "K",
-            "₹ Payable": "O",
+            "₹ Payable (ex-GST)": "O",
             "₹ At-risk": "P",
+            "₹ Payable incl. GST": "V",
         }
         for row_index, (metric, value) in enumerate(summary_rows, start=1):
             _write_text(summary, row_index, 0, metric, text_fmt)
             if metric in formula_by_metric:
-                column = formula_by_metric[metric]
+                letter = formula_by_metric[metric]
                 ranges = [
-                    f"'{name}'!{column}2:{column}{max(last_row + 1, 2)}"
+                    f"'{name}'!{letter}2:{letter}{max(last_row + 1, 2)}"
                     for _sheet, name, last_row in invoice_sheets
                 ]
-                cached_column = {"K": "invoice_total", "O": "payable_taxable", "P": "at_risk"}[
-                    column
-                ]
-                cached = float(
-                    sum((_decimal(item[cached_column]) or Decimal(0) for item in cases), Decimal(0))
-                )
+                if letter == "K":
+                    cached_values = [_invoice_total(item)[0] for item in cases]
+                elif letter == "V":
+                    cached_values = [_payable_incl_gst(item) for item in cases]
+                else:
+                    cached_column = {"O": "payable_taxable", "P": "at_risk"}[letter]
+                    cached_values = [_decimal(item[cached_column]) for item in cases]
+                cached = float(sum((v or Decimal(0) for v in cached_values), Decimal(0)))
                 summary.write_formula(
                     row_index,
                     1,
