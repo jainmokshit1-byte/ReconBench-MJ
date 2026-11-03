@@ -695,4 +695,17 @@ REASON_CODES = (
         "is_proposed": False,
         "is_active": True,
     },
+    {
+        # Revision 0037 adds it to existing workspaces with this same text; the web has it too.
+        "code": "SERIAL_DIFF",
+        "level": "warn",
+        "stage": "S4",
+        "title": "Serial numbers differ",
+        "message": "The serial numbers on the invoice line differ from those on the goods receipt.",
+        "suggested_action": "Compare the serial numbers on the invoice with the receipt.",
+        "overridable": True,
+        "level_configurable": False,
+        "is_proposed": False,
+        "is_active": True,
+    },
 )

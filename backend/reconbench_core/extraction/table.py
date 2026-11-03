@@ -118,6 +118,7 @@ class Item:
     item_code: str | None = None
     hsn: Reading[str] | None = None
     words: list[Word] = field(default_factory=list)
+    serials: list[str] = field(default_factory=list)
 
     def numbers(self, col: Col) -> list[Reading[Decimal]]:
         readings = []
@@ -498,6 +499,34 @@ def _qty_uom_pair(words: Sequence[Word]) -> tuple[Word, Word] | None:
     return None
 
 
+_SERIAL_LABEL = re.compile(
+    r"^(?:SERIAL(?:\s*(?:NO|NUMBERS?|#))?|S/?N|SR\.?\s*NO)\b\.?\s*[:#.-]?\s*", re.I
+)
+_SERIAL_TOKEN = re.compile(r"^(?=[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{5,}$", re.I)
+
+
+def serial_tokens(text: str, continuation: bool = False) -> list[str] | None:
+    """Serial numbers on a "S/N: A,B" row (or a bare run of serials right after one).
+
+    Returns None when the row is not a serial row. A serial is alphanumeric, at least six
+    characters and holds a digit; a labelled row with no such token yields an empty list.
+    """
+
+    text = text.strip()
+    labelled = _SERIAL_LABEL.match(text)
+    if labelled is not None:
+        body = text[labelled.end() :]
+    elif continuation:
+        body = text
+    else:
+        return None
+    tokens = [t for t in re.split(r"[,;\s]+", body) if t]
+    good = [t.upper() for t in tokens if _SERIAL_TOKEN.match(t)]
+    if labelled is None and (not tokens or len(good) != len(tokens)):
+        return None
+    return good
+
+
 def _drop_leading_noise(text: str) -> str:
     """Drop a leading serial number or OCR speck before the description proper."""
 
@@ -590,6 +619,7 @@ def extract_tables(pages: Sequence[PageLayout]) -> TableResult:
         result.headings.append(heading)
         current: Item | None = result.items[-1] if result.items else None
         open_description = False
+        in_serials = False
         for row in rows:
             if row.cy <= heading.y1:
                 continue
@@ -663,6 +693,7 @@ def extract_tables(pages: Sequence[PageLayout]) -> TableResult:
             has_text = sum(char.isalnum() for char in description) >= 3
             if amount is not None and has_text:
                 current = Item(page=page.number, row_y=row.cy)
+                in_serials = False
                 current.values = by_col
                 current.words = list(row.words)
                 description = _drop_leading_noise(description)
@@ -691,6 +722,13 @@ def extract_tables(pages: Sequence[PageLayout]) -> TableResult:
             hsn = _hsn_from(text)
             if hsn is not None and current.hsn is None:
                 current.hsn = hsn
+            found_serials = serial_tokens(description, in_serials)
+            if found_serials is not None:
+                current.serials.extend(s for s in found_serials if s not in current.serials)
+                in_serials = True
+                open_description = False
+                continue
+            in_serials = False
             if not open_description or not description.strip():
                 continue
             if _ATTRIBUTE.search(description) or _is_code_like(description):

@@ -38,6 +38,7 @@ CHECK_REGISTRY = (
     CheckDefinition("s4.grn_pending", 1, "S4"),
     CheckDefinition("s4.grn_quantity_fallback", 1, "S4"),
     CheckDefinition("s4.ledger_completeness", 1, "S4"),
+    CheckDefinition("s4.serials", 1, "S4"),
     CheckDefinition("s5.cumulative_po_value", 1, "S5"),
     CheckDefinition("s5.extra_charge", 1, "S5"),
     CheckDefinition("s5.grand_total", 1, "S5"),

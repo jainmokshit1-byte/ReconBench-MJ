@@ -363,6 +363,8 @@ class ReasonCode(StrEnum):
     AI_VALUE_UNVERIFIED = "AI_VALUE_UNVERIFIED"
     # The AI reading carries fewer invoice lines than the rules reading of the same file.
     AI_LINES_MISSING = "AI_LINES_MISSING"
+    # Invoice and GRN carry serial numbers for the same PO line and the sets differ.
+    SERIAL_DIFF = "SERIAL_DIFF"
 
 
 class CheckOutcome(StrEnum):
@@ -418,6 +420,7 @@ GRN_OVER_PO = ReasonCode.GRN_OVER_PO
 LATE_DELIVERY = ReasonCode.LATE_DELIVERY
 AI_VALUE_UNVERIFIED = ReasonCode.AI_VALUE_UNVERIFIED
 AI_LINES_MISSING = ReasonCode.AI_LINES_MISSING
+SERIAL_DIFF = ReasonCode.SERIAL_DIFF
 REASON_CODES = tuple(ReasonCode)
 
 
@@ -843,4 +846,5 @@ __all__ = [
     "LATE_DELIVERY",
     "AI_VALUE_UNVERIFIED",
     "AI_LINES_MISSING",
+    "SERIAL_DIFF",
 ]

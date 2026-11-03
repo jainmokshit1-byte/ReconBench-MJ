@@ -452,6 +452,20 @@ def _accepted_grn_qty(line: DocLine) -> tuple[Decimal, Decimal, bool]:
     return received, rejected, True
 
 
+def _line_serials(line: DocLine) -> frozenset[str]:
+    """Serial numbers on a line (a list from rules/XML, a text cell from AI), normalised."""
+
+    raw = line.extras.get("serials")
+    if isinstance(raw, str):
+        parts: list[object] = list(re.split(r"[,;\s]+", raw))
+    elif isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    else:
+        return frozenset()
+    found = {re.sub(r"[\s-]+", "", part).upper() for part in parts if isinstance(part, str)}
+    return frozenset(item for item in found if item)
+
+
 def _link_needs_confirming(link: ReconciliationLink, config: ReconciliationConfig) -> bool:
     """A suggested or below-threshold link needs a person; a confirmed link already had one.
 
@@ -491,11 +505,13 @@ def _build_grn_ledger(
     dict[tuple[UUID, int], Decimal],
     dict[tuple[UUID, int], set[UUID]],
     dict[tuple[UUID, int], bool],
+    dict[tuple[UUID, int], frozenset[str]],
 ]:
     accepted: dict[tuple[UUID, int], Decimal] = {}
     rejected: dict[tuple[UUID, int], Decimal] = {}
     grn_ids: dict[tuple[UUID, int], set[UUID]] = {}
     fallback_received: dict[tuple[UUID, int], bool] = {}
+    serials: dict[tuple[UUID, int], frozenset[str]] = {}
     for opening in sorted(
         snapshot.opening_balances, key=lambda item: (str(item.po_document_id), item.po_line_no)
     ):
@@ -538,9 +554,12 @@ def _build_grn_ledger(
             accepted[key] = accepted.get(key, _ZERO) + qty
             rejected[key] = rejected.get(key, _ZERO) + rejected_qty
             grn_ids.setdefault(key, set()).add(grn_id)
+            line_serials = _line_serials(grn_line)
+            if line_serials:
+                serials[key] = serials.get(key, frozenset()) | line_serials
             if assumed:
                 fallback_received[key] = True
-    return accepted, rejected, grn_ids, fallback_received
+    return accepted, rejected, grn_ids, fallback_received, serials
 
 
 def _invoice_net_rate(line: DocLine) -> Decimal | None:
@@ -1272,7 +1291,7 @@ def evaluate(
     }
     active_links = _active_links(snapshot)
     exact_duplicates, suspected_duplicates = _duplicate_map(invoices, snapshot, config)
-    grn_accepted, grn_rejected, grn_ids_by_line, grn_fallback = _build_grn_ledger(
+    grn_accepted, grn_rejected, grn_ids_by_line, grn_fallback, grn_serials = _build_grn_ledger(
         snapshot, documents, po_documents, active_links, config
     )
     earliest_related: dict[tuple[UUID, int], date] = {}
@@ -1658,6 +1677,27 @@ def evaluate(
             ),
         ):
             work.grn_ids.update(grn_ids_by_line.get(ledger_key, set()))
+            invoice_serials = _line_serials(work.line)
+            received_serials = grn_serials.get(ledger_key, frozenset())
+            # Serials only on one side prove nothing. A part-billed PO line carries a subset of
+            # the receipt's serials, so only a serial billed but not received is a difference.
+            if invoice_serials and received_serials and invoice_serials - received_serials:
+                _add_work_check(
+                    work,
+                    _make_check(
+                        "s4.serials",
+                        CheckOutcome.WARN,
+                        code=ReasonCode.SERIAL_DIFF,
+                        level=ReasonLevel.WARN,
+                        evidence={
+                            "invoice_count": len(invoice_serials),
+                            "grn_count": len(received_serials),
+                            "only_on_invoice": sorted(invoice_serials - received_serials),
+                            "only_on_grn": sorted(received_serials - invoice_serials),
+                        },
+                    ),
+                    ReasonCode.SERIAL_DIFF,
+                )
             if work.alignment is not None:
                 if work.alignment.state is AlignmentState.UNSURE:
                     work.checks.append(
