@@ -7484,6 +7484,49 @@
         ]
       }
     },
+    "/api/v1/documents/{document_id}/reading/reread-rules": {
+      "post": {
+        "description": "Read the stored file of a ready document again with the rules (audited).\n\nThe result is a new current version; earlier versions stay. Never calls an AI provider.",
+        "operationId": "reread_with_rules_api_v1_documents__document_id__reading_reread_rules_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read a ready document again with rules",
+        "tags": [
+          "API v1",
+          "Documents"
+        ]
+      }
+    },
     "/api/v1/documents/{document_id}/reading/retry": {
       "post": {
         "description": "Ask the active provider to read a failed scanned invoice again (PD-2f, audited).",

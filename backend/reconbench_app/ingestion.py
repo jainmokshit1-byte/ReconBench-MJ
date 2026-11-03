@@ -398,6 +398,16 @@ class QueuePort(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class _RereadSubject:
+    """A ready document a person may read again (``reread_with_rules``)."""
+
+    doc_type: str
+    natural_key: str
+    version_id: UUID
+    source_file_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class UploadReceipt:
     file_id: UUID
     sha256: str
@@ -4561,35 +4571,7 @@ class IngestionService:
                 )
             linked_po_ids: set[UUID] = set()
             if doc_type == DocType.GRN.value:
-                link_current = metadata.tables["link_current"]
-                link_table = metadata.tables["link"]
-                linked_po_ids = {
-                    cast(UUID, linked_po_id)
-                    for linked_po_id in connection.scalars(
-                        sa.select(link_current.c.to_document_id)
-                        .select_from(
-                            link_current.join(
-                                link_table,
-                                sa.and_(
-                                    link_current.c.workspace_id == link_table.c.workspace_id,
-                                    link_current.c.current_link_id == link_table.c.id,
-                                ),
-                            )
-                        )
-                        .where(
-                            link_current.c.workspace_id == actor.workspace_id,
-                            link_current.c.from_document_id == document_id,
-                            link_current.c.link_type == "grn_po",
-                            link_table.c.state.in_(("auto", "suggested", "confirmed")),
-                            sa.not_(
-                                sa.and_(
-                                    link_table.c.ai_suggested,
-                                    link_table.c.state == "suggested",
-                                )
-                            ),
-                        )
-                    ).all()
-                }
+                linked_po_ids = self._linked_po_ids(connection, actor.workspace_id, document_id)
             previous_version_id = cast(UUID, current_document["current_version_id"])
             current_version = (
                 connection.execute(
@@ -5418,6 +5400,418 @@ class IngestionService:
                 reason="invoice read with rules by user choice",
             )
         return self.get_document(actor.workspace_id, document_id)
+
+    @requires("files.upload")
+    def reread_with_rules(
+        self, actor: ActorContext, document_id: UUID, *, expected_version: int
+    ) -> dict[str, Any] | None:
+        """A person reads a ready document's stored file again with the rules.
+
+        The rules read the same stored PDF, XML or CSV once more (never AI: no provider
+        call is made, whatever the scanned-invoice switch says) and the result becomes a
+        new current version of the document. Earlier versions, a person's save included,
+        stay. The new version is a fresh reading, so nothing a person verified is carried
+        over to it. When the file now gives another number of documents, or this document
+        can't be found in the new reading, nothing changes and no other document is
+        touched. Audited.
+        """
+
+        version_table = metadata.tables["document_version"]
+        identity_table = metadata.tables["document_identity"]
+        source = metadata.tables["source_file"]
+        with self.engine.connect() as connection:
+            subject = self._reread_document(connection, actor, document_id, expected_version)
+            if subject is None:
+                return None
+            file_row = (
+                connection.execute(
+                    sa.select(source).where(
+                        source.c.workspace_id == actor.workspace_id,
+                        source.c.id == subject.source_file_id,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if (
+            file_row is None
+            or file_row["removed_at"] is not None
+            or file_row["format"]
+            not in {FileFormat.PDF.value, FileFormat.XML.value, FileFormat.CSV.value}
+            or file_row["zone"] == UploadZone.OPENING_BALANCE.value
+        ):
+            raise IngestionFailure(
+                "REREAD_SOURCE_UNAVAILABLE",
+                "The file this document was read from is no longer available to read again.",
+            )
+        file_id = cast(UUID, file_row["id"])
+        file_sha = cast(str, file_row["sha256"])
+        content = self._read_object(cast(str, file_row["object_key"]))
+        hints = self._parser_hints(actor.workspace_id, file_row)
+        result: ParseResult | None
+        try:
+            if file_row["format"] == FileFormat.PDF.value:
+                # The rules only: vision readings are queued by a fresh parse, never here.
+                result = parse_pdf_isolated(
+                    content,
+                    hints,
+                    languages=self.ocr_languages,
+                    engine_name=self.extraction_engine,
+                    einvoice_keys=self.einvoice_keys,
+                )
+            else:
+                result = parse(content, hints)
+        except Exception:  # noqa: BLE001 - any parser failure leaves the document as it is.
+            result = None
+        if result is None or not result.success or not result.documents:
+            raise IngestionFailure(
+                "REREAD_PARSE_FAILED",
+                "The rules could not read the file again. The current values are unchanged.",
+            )
+        if len(result.documents) != int(file_row["docs_found"] or 0):
+            raise IngestionFailure(
+                "REREAD_DOCUMENT_COUNT_CHANGED",
+                "The rules now find a different number of documents in this file, so it "
+                "can't be read again here. The current values are unchanged.",
+            )
+        structured = result.file_format in {FileFormat.XML, FileFormat.CSV}
+
+        with self.engine.begin() as connection:
+            locked = self._reread_document(
+                connection, actor, document_id, expected_version, for_update=True
+            )
+            if locked is None:
+                return None
+            if locked.source_file_id != file_id:
+                raise BatchVersionConflict("The document changed after it was loaded.")
+            known_locators = set(
+                connection.scalars(
+                    sa.select(identity_table.c.source_locator)
+                    .join(
+                        version_table,
+                        version_table.c.id == identity_table.c.document_version_id,
+                    )
+                    .where(
+                        identity_table.c.workspace_id == actor.workspace_id,
+                        version_table.c.workspace_id == actor.workspace_id,
+                        version_table.c.document_id == document_id,
+                        identity_table.c.source_sha256 == file_sha,
+                    )
+                )
+            )
+            found: list[tuple[Document, tuple[PageImageHash, ...]]] = []
+            for candidate in result.documents:
+                if candidate.header.doc_type.value != locked.doc_type:
+                    continue
+                own_pages = split_pages(candidate)
+                candidate_hashes = tuple(
+                    page_hash
+                    for page_hash in result.page_image_hashes
+                    if not own_pages or page_hash.page in own_pages
+                )
+                same_key = (
+                    document_natural_key(
+                        candidate, file_sha, page_hashes=candidate_hashes, structured=structured
+                    )
+                    == locked.natural_key
+                )
+                if same_key or candidate.source_locator in known_locators:
+                    found.append((candidate, candidate_hashes))
+            if len(found) != 1:
+                raise IngestionFailure(
+                    "REREAD_DOCUMENT_UNMATCHED",
+                    "This document could not be found again in the new reading of its file. "
+                    "The current values are unchanged.",
+                )
+            document, document_hashes = found[0]
+            new_version_id = self._append_rules_version(
+                connection,
+                actor=actor,
+                document_id=document_id,
+                file_id=file_id,
+                file_sha=file_sha,
+                document=document,
+                page_hashes=document_hashes,
+                result=result,
+                structured=structured,
+                uom_aliases=hints.uom_aliases,
+                charge_keywords=hints.charge_keywords,
+            )
+            write_audit_event(
+                connection,
+                actor,
+                action="document.reread_rules",
+                target_type="document",
+                target_id=document_id,
+                before_state={"document_version_id": str(locked.version_id)},
+                after_state={"document_version_id": str(new_version_id)},
+                reason="Document read again with rules by user choice.",
+            )
+            self.queue.enqueue("resolve_vendors", file_id=file_id, connection=connection)
+            if locked.doc_type == DocType.GRN.value:
+                scopes = [
+                    ("po", po_document_id)
+                    for po_document_id in sorted(
+                        self._linked_po_ids(connection, actor.workspace_id, document_id), key=str
+                    )
+                ]
+            else:
+                scopes = [(locked.doc_type if locked.doc_type == "po" else "invoice", document_id)]
+            for scope_kind, scope_id in scopes:
+                self._mark_dirty_scope(
+                    connection,
+                    workspace_id=actor.workspace_id,
+                    scope_kind=scope_kind,
+                    scope_id=scope_id,
+                    reason=f"{locked.doc_type} read again with rules by user choice",
+                )
+        return self.get_document(actor.workspace_id, document_id)
+
+    def _reread_document(
+        self,
+        connection: Connection,
+        actor: ActorContext,
+        document_id: UUID,
+        expected_version: int,
+        *,
+        for_update: bool = False,
+    ) -> _RereadSubject | None:
+        """The ready document a person may read again, or ``None`` when it does not exist."""
+
+        document_table = metadata.tables["document"]
+        version_table = metadata.tables["document_version"]
+        query = sa.select(document_table).where(
+            document_table.c.workspace_id == actor.workspace_id,
+            document_table.c.id == document_id,
+            document_table.c.withdrawn_at.is_(None),
+        )
+        row = (
+            connection.execute(query.with_for_update() if for_update else query)
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        if int(row["version"]) != expected_version:
+            raise BatchVersionConflict("The document changed after it was loaded.")
+        if row["reading_state"] != reading_state.READY:
+            raise IngestionFailure(
+                "REREAD_NOT_READY",
+                "This document is waiting for its reading. Choose Retry or Read with rules first.",
+            )
+        if row["doc_type"] not in _AI_VERIFY_DOC_TYPES:
+            raise IngestionFailure(
+                "REREAD_UNSUPPORTED",
+                "Reading again is available for invoices, purchase orders and goods receipts.",
+            )
+        version_id = cast(UUID, row["current_version_id"])
+        source_file_id = connection.scalar(
+            sa.select(version_table.c.source_file_id).where(
+                version_table.c.workspace_id == actor.workspace_id,
+                version_table.c.id == version_id,
+            )
+        )
+        if source_file_id is None:
+            raise IngestionFailure(
+                "REREAD_SOURCE_UNAVAILABLE",
+                "This document has no stored file to read again.",
+            )
+        return _RereadSubject(
+            doc_type=str(row["doc_type"]),
+            natural_key=str(row["natural_key"]),
+            version_id=version_id,
+            source_file_id=cast(UUID, source_file_id),
+        )
+
+    def _append_rules_version(
+        self,
+        connection: Connection,
+        *,
+        actor: ActorContext,
+        document_id: UUID,
+        file_id: UUID,
+        file_sha: str,
+        document: Document,
+        page_hashes: tuple[PageImageHash, ...],
+        result: ParseResult,
+        structured: bool,
+        uom_aliases: Mapping[str, str],
+        charge_keywords: tuple[str, ...],
+    ) -> UUID:
+        """Append a fresh rules reading as the document's new current version.
+
+        Older versions stay; the document keeps its identity. Nothing is carried over from
+        the version it replaces, so no person-verified evidence is on the new one.
+        """
+
+        document_table = metadata.tables["document"]
+        version_table = metadata.tables["document_version"]
+        identity_table = metadata.tables["document_identity"]
+        text_table = metadata.tables["document_text"]
+        workspace_id = actor.workspace_id
+        header = document.header
+        header_values = _header_values(header)
+        doc_no = _plain(header_values.get("doc_no"))
+        extraction_method = _extraction_method(
+            result.file_format, is_ocr=any(page_text.is_ocr for page_text in result.page_texts)
+        )
+        latest_seq = connection.scalar(
+            sa.select(sa.func.max(version_table.c.seq)).where(
+                version_table.c.workspace_id == workspace_id,
+                version_table.c.document_id == document_id,
+            )
+        )
+        version_id = new_id()
+        connection.execute(
+            sa.insert(version_table).values(
+                id=version_id,
+                workspace_id=workspace_id,
+                document_id=document_id,
+                seq=int(latest_seq or 0) + 1,
+                content_hash=_canonical_hash(document.model_dump(mode="json")),
+                **_version_header_columns(header_values),
+                extraction_method=extraction_method.value,
+                reading_method=_reading_method(extraction_method),
+                extraction_conf=document.confidence,
+                needs_verification=document.needs_verification,
+                verification_reasons=[reason.value for reason in document.reason_codes],
+                extras=_jsonable(
+                    {
+                        "header": header.extras,
+                        "document": document.model_dump(mode="json").get("extras", {}),
+                    }
+                ),
+                source_file_id=file_id,
+                locator=_jsonable({"source": document.source_locator})
+                if document.source_locator
+                else None,
+                parser_version=PARSER_VERSION,
+                layout_signature=result.layout_signature,
+                created_by=actor.actor_id,
+            )
+        )
+        connection.execute(
+            sa.insert(identity_table).values(
+                workspace_id=workspace_id,
+                document_version_id=version_id,
+                source_sha256=file_sha,
+                source_locator=document.source_locator,
+                page_hashes=[
+                    item.value for item in sorted(page_hashes, key=lambda item: item.page)
+                ],
+                content_fingerprint=content_fingerprint(document, structured=structured),
+            )
+        )
+        self._insert_lines_and_evidence(
+            connection,
+            workspace_id=workspace_id,
+            version_id=version_id,
+            document=document,
+            extraction_method=extraction_method,
+            uom_aliases=uom_aliases,
+            charge_keywords=charge_keywords,
+        )
+        own_pages = split_pages(document)
+        for page_text in result.page_texts:
+            if own_pages and page_text.page not in own_pages:
+                continue
+            connection.execute(
+                sa.insert(text_table).values(
+                    document_version_id=version_id,
+                    workspace_id=workspace_id,
+                    page=page_text.page,
+                    content=page_text.content,
+                    char_count=len(page_text.content),
+                    is_ocr=page_text.is_ocr,
+                    scanned=page_text.scanned,
+                )
+            )
+        connection.execute(
+            sa.update(document_table)
+            .where(
+                document_table.c.workspace_id == workspace_id,
+                document_table.c.id == document_id,
+            )
+            .values(
+                current_version_id=version_id,
+                vendor_identity=_vendor_identity(
+                    _plain(header_values.get("vendor_gstin")),
+                    _plain(header_values.get("vendor_name")),
+                ),
+                doc_no=doc_no,
+                canonical_doc_no=canonicalize_document_number(doc_no) if doc_no else None,
+                doc_date=_plain(header_values.get("doc_date")),
+                grand_total=_plain(header_values.get("grand_total")),
+                needs_verification=document.needs_verification,
+                input_seq=document_table.c.input_seq + (1 if header.doc_type is DocType.PO else 0),
+                updated_at=sa.func.now(),
+                version=document_table.c.version + 1,
+            )
+        )
+        self._write_warnings(
+            connection,
+            workspace_id=workspace_id,
+            file_id=file_id,
+            document_id=document_id,
+            warning_rows=[
+                warning
+                for warning in result.warnings
+                if warning.locator == document.source_locator
+                or (
+                    len(result.documents) == 1
+                    and warning.locator == "pdf"
+                    and document.source_locator is not None
+                )
+            ],
+            document=document,
+            document_version_id=version_id,
+        )
+        _event(
+            connection,
+            workspace_id=workspace_id,
+            file_id=file_id,
+            document_id=document_id,
+            document_version_id=version_id,
+            stage="upserted",
+            outcome="ok",
+            parser_version=PARSER_VERSION,
+            detail={"outcome": "reread_rules"},
+        )
+        return version_id
+
+    @staticmethod
+    def _linked_po_ids(connection: Connection, workspace_id: UUID, document_id: UUID) -> set[UUID]:
+        """The purchase orders a goods receipt is linked to (confirmed, auto or suggested)."""
+
+        link_current = metadata.tables["link_current"]
+        link_table = metadata.tables["link"]
+        return {
+            cast(UUID, linked_po_id)
+            for linked_po_id in connection.scalars(
+                sa.select(link_current.c.to_document_id)
+                .select_from(
+                    link_current.join(
+                        link_table,
+                        sa.and_(
+                            link_current.c.workspace_id == link_table.c.workspace_id,
+                            link_current.c.current_link_id == link_table.c.id,
+                        ),
+                    )
+                )
+                .where(
+                    link_current.c.workspace_id == workspace_id,
+                    link_current.c.from_document_id == document_id,
+                    link_current.c.link_type == "grn_po",
+                    link_table.c.state.in_(("auto", "suggested", "confirmed")),
+                    sa.not_(
+                        sa.and_(
+                            link_table.c.ai_suggested,
+                            link_table.c.state == "suggested",
+                        )
+                    ),
+                )
+            )
+        }
 
     @requires("files.upload")
     def verify_ai_values(

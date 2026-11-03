@@ -639,6 +639,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/documents/{document_id}/reading/reread-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read a ready document again with rules
+         * @description Read the stored file of a ready document again with the rules (audited).
+         *
+         *     The result is a new current version; earlier versions stay. Never calls an AI provider.
+         */
+        post: operations["reread_with_rules_api_v1_documents__document_id__reading_reread_rules_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/documents/{document_id}/reading/retry": {
         parameters: {
             query?: never;
@@ -4400,6 +4422,37 @@ export interface operations {
         };
     };
     get_document_raw_api_v1_documents__document_id__raw_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reread_with_rules_api_v1_documents__document_id__reading_reread_rules_post: {
         parameters: {
             query?: never;
             header?: never;

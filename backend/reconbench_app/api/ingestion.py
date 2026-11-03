@@ -1081,6 +1081,39 @@ def read_with_rules(document_id: UUID, request: Request) -> Response:
     return _reading_action(document_id, request, retry=False)
 
 
+@router.post(
+    "/documents/{document_id}/reading/reread-rules",
+    tags=["Documents"],
+    summary="Read a ready document again with rules",
+)
+@requires("files.upload")
+def reread_with_rules(document_id: UUID, request: Request) -> Response:
+    """Read the stored file of a ready document again with the rules (audited).
+
+    The result is a new current version; earlier versions stay. Never calls an AI provider.
+    """
+
+    expected_version = require_if_match(request.headers.get("if-match"))
+    try:
+        result = _service(request).reread_with_rules(
+            _actor(request), document_id, expected_version=expected_version
+        )
+    except (BatchVersionConflict, IngestionFailure) as exc:
+        return _handle_ingestion_error(exc, request)
+    if result is None:
+        return _problem(
+            request,
+            status=404,
+            title="Not found",
+            detail="The document was not found.",
+            code="not_found",
+        )
+    return DecimalJSONResponse(
+        content=to_jsonable(result),
+        headers={"ETag": etag_for_version(int(result["document"]["version"]))},
+    )
+
+
 @router.get("/documents/{document_id}/ai-suggestions", tags=["Documents"])
 @requires("data.view")
 def get_document_ai_suggestions(document_id: UUID, request: Request) -> Response:
