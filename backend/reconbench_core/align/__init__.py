@@ -14,7 +14,9 @@ from reconbench_core.schema import (
     AlignmentState,
     DecimalValue,
     DocLine,
+    FieldSource,
     FieldValue,
+    FieldVerification,
     FrozenModel,
     LineType,
     Probability,
@@ -23,6 +25,7 @@ from reconbench_core.schema import (
 _ONE = Decimal("1")
 _FOUR_PLACES = Decimal("0.0001")
 _MAX_TIE_BREAK = 999
+_CONTAINED_TOKEN_SET = Decimal("85")
 _COLORS = {
     "black",
     "blue",
@@ -110,6 +113,9 @@ def _description_score(left: NormalizedItem, right: NormalizedItem) -> Decimal |
 
 
 def _spec_category(token: str) -> str | None:
+    # A long digit run is a serial or order number printed beside the item, not its spec.
+    if re.search(r"\d{8,}", token):
+        return None
     if re.fullmatch(r"[a-z]{1,6}\d{2,}[a-z0-9]*(?:[-/][a-z0-9]+)*", token):
         return "model"
     if re.fullmatch(r"\d+(?:\.\d+)?(?:gb|tb)", token):
@@ -139,8 +145,31 @@ def spec_tokens_conflict(left: NormalizedItem, right: NormalizedItem) -> bool:
         if category is not None:
             right_by_category.setdefault(category, set()).add(token)
     for category in left_by_category.keys() & right_by_category.keys():
-        if left_by_category[category] != right_by_category[category]:
+        left_specs, right_specs = left_by_category[category], right_by_category[category]
+        if any(
+            not any(_same_spec(token, other, left.tokens, right.tokens) for other in right_specs)
+            for token in left_specs
+        ) or any(
+            not any(_same_spec(other, token, left.tokens, right.tokens) for other in left_specs)
+            for token in right_specs
+        ):
             return True
+    return False
+
+
+def _same_spec(
+    left: str, right: str, left_tokens: tuple[str, ...], right_tokens: tuple[str, ...]
+) -> bool:
+    """Equal, or one side ran a word into the code that the other side prints apart."""
+
+    if left == right:
+        return True
+    if right.startswith(left):
+        rest = right[len(left) :]
+        return rest.isalpha() and rest in left_tokens
+    if left.startswith(right):
+        rest = left[len(right) :]
+        return rest.isalpha() and rest in right_tokens
     return False
 
 
@@ -170,7 +199,10 @@ def _line_similarity(left: DocLine, right: DocLine, config: AlignmentConfig) -> 
     left_description = normalize_item_text(_field_value(left.description) or "")
     right_description = normalize_item_text(_field_value(right.description) or "")
     description = _description_score(left_description, right_description)
-    if description is not None and spec_tokens_conflict(left_description, right_description):
+    spec_conflict = description is not None and spec_tokens_conflict(
+        left_description, right_description
+    )
+    if description is not None and spec_conflict:
         description = min(description, config.spec_conflict_cap)
 
     components: dict[str, Decimal | None] = {
@@ -215,7 +247,32 @@ def _line_similarity(left: DocLine, right: DocLine, config: AlignmentConfig) -> 
         if components["hsn"] is None:
             return Decimal("0.0000")
         weighted = min(weighted, config.item_aligned - Decimal("0.0001"))
+    elif (
+        not spec_conflict
+        and weighted < config.item_aligned
+        and _commercially_identical(left, right)
+        and Decimal(
+            str(fuzz.token_set_ratio(left_description.description, right_description.description))
+        )
+        >= _CONTAINED_TOKEN_SET
+    ):
+        # One side's words sit inside the other's (a long marketplace title, an appended
+        # serial) and quantity and rate agree to the paisa: the same item, so aligned.
+        weighted = config.item_aligned
     return weighted.quantize(_FOUR_PLACES, rounding=ROUND_HALF_UP)
+
+
+def _commercially_identical(left: DocLine, right: DocLine) -> bool:
+    quantities = _field_value(left.quantity), _field_value(right.quantity)
+    rates = _field_value(left.rate), _field_value(right.rate)
+    return (
+        None not in quantities
+        and None not in rates
+        and quantities[0] == quantities[1]
+        and rates[0] == rates[1]
+        and rates[0] != 0
+        and quantities[0] != 0
+    )
 
 
 def _relative_proximity(left: Decimal | None, right: Decimal | None) -> Decimal | None:
@@ -268,6 +325,17 @@ def _alignment_state(
     return AlignmentState.NOT_ON_PO
 
 
+def _person_pin(line: DocLine, po_line_numbers: dict[str, int]) -> int | None:
+    """The PO line a person tied this invoice line to (a value read from the page never pins)."""
+
+    ref = line.po_line_ref
+    if ref is None or not (
+        ref.source is FieldSource.MANUAL or ref.verification is FieldVerification.USER
+    ):
+        return None
+    return po_line_numbers.get(str(ref.value).strip())
+
+
 def align_lines(
     invoice_lines: tuple[DocLine, ...] | list[DocLine],
     po_lines: tuple[DocLine, ...] | list[DocLine],
@@ -280,7 +348,8 @@ def align_lines(
     The Hungarian solve first enforces one-to-one assignments. Remaining invoice
     lines may then reuse their best qualifying PO line, allowing split billing.
     Missing optional features are excluded and the remaining configured weights
-    are renormalized; quantity and rate affect only equal-score tie-breaking.
+    are renormalized. Quantity and rate break equal-score ties, and lift a pair
+    whose words are contained in each other to aligned when both agree exactly.
     """
 
     sorted_invoices = sorted(invoice_lines, key=_line_key)
@@ -365,6 +434,18 @@ def align_lines(
             score=score,
             state=_alignment_state(score, config, explicit_single_line),
         )
+
+    # A person's "Accept item match" ties the line to that PO line, whatever the score.
+    po_index_by_no = {str(po_line.line_no): index for index, po_line in enumerate(sorted_pos)}
+    for row_index, invoice_line in enumerate(invoice_goods):
+        pinned = _person_pin(invoice_line, po_index_by_no)
+        if pinned is not None:
+            result_by_line[_line_key(invoice_line)] = AlignmentResult(
+                invoice_line_no=invoice_line.line_no,
+                po_line_no=sorted_pos[pinned].line_no,
+                score=scores[row_index][pinned],
+                state=AlignmentState.ALIGNED,
+            )
 
     return tuple(result_by_line[_line_key(line)] for line in sorted_invoices)
 

@@ -6,7 +6,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from reconbench_core.align import AlignmentResult, align_lines
@@ -62,6 +62,8 @@ from reconbench_core.version import ENGINE_VERSION
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
+_SPLIT_TAX_EQUAL_TOLERANCE = Decimal("0.02")
+_SPLIT_TAX_RATE_TOLERANCE = Decimal("0.05")
 _ACTIVE_LINK_STATES = {LinkState.AUTO, LinkState.CONFIRMED, LinkState.SUGGESTED}
 _DUPLICATE_NUMBER_LOOKALIKE_FOLD = str.maketrans(
     {"O": "0", "I": "1", "L": "1", "|": "1", "S": "5", "B": "8", "Z": "2"}
@@ -606,8 +608,40 @@ def _payment_due(invoice: Document, po: Document) -> date | None:
     return invoice_date + timedelta(days=int(match.group(1)))
 
 
+def _line_tax_rate(line: DocLine) -> Decimal | None:
+    """The line's GST rate; a per-component rate (2.5 + 2.5) is doubled to the full slab (5)."""
+
+    rate = _field_decimal(line, "tax_rate")
+    cgst = _field_decimal(line, "cgst_amount")
+    sgst = _field_decimal(line, "sgst_amount")
+    amount = _line_amount(line)
+    if rate is None or cgst is None or sgst is None or amount is None:
+        return rate
+    if (
+        cgst > _ZERO
+        and sgst > _ZERO
+        and abs(cgst - sgst) <= _SPLIT_TAX_EQUAL_TOLERANCE
+        and abs(amount * rate / _HUNDRED - cgst) <= _SPLIT_TAX_RATE_TOLERANCE
+    ):
+        return rate * 2
+    return rate
+
+
+def _line_freight(line: DocLine) -> Decimal | None:
+    """The per-line freight column some suppliers fold into the line amount, if it reads."""
+
+    raw = line.extras.get("freight")
+    if not isinstance(raw, (str, Decimal)):
+        return None
+    try:
+        freight = Decimal(str(raw).replace(",", "").strip())
+    except InvalidOperation:
+        return None
+    return freight if freight.is_finite() else None
+
+
 def _tax_rate_for_line(work: _LineWork) -> Decimal | None:
-    return _field_decimal(work.line, "tax_rate") or (
+    return _line_tax_rate(work.line) or (
         _field_decimal(work.po_line, "tax_rate") if work.po_line is not None else None
     )
 
@@ -962,7 +996,7 @@ def _apply_financial_checks(
                             ),
                             ReasonCode.UOM_MISMATCH,
                         )
-                invoice_tax_rate = _field_decimal(work.line, "tax_rate")
+                invoice_tax_rate = _line_tax_rate(work.line)
                 po_tax_rate = _field_decimal(work.po_line, "tax_rate")
                 if invoice_tax_rate is not None:
                     if invoice_tax_rate not in config.tax_rates:
@@ -1052,13 +1086,21 @@ def _apply_financial_checks(
             else:
                 line_total_available = False
             if quantity is not None and rate is not None and amount is not None:
+                expected_amount = quantity * rate - discount
+                freight = _line_freight(line)
+                if (
+                    freight is not None
+                    and not _tolerance_pass(amount, expected_amount, arithmetic_rule)
+                    and _tolerance_pass(amount, expected_amount + freight, arithmetic_rule)
+                ):
+                    expected_amount += freight
                 _check_math(
                     header_checks[invoice.document_id],
                     case_reasons[invoice.document_id],
                     "s5.line_math",
                     ReasonCode.MATH_ERROR,
                     amount,
-                    quantity * rate - discount,
+                    expected_amount,
                     arithmetic_rule,
                 )
         taxable = _taxable(invoice.document)
@@ -1135,10 +1177,13 @@ def _apply_financial_checks(
         tax_bases: list[Decimal] = []
         for line in invoice.document.lines:
             line_amount = _line_amount(line)
-            tax_rate = _field_decimal(line, "tax_rate")
+            tax_rate = _line_tax_rate(line)
             if line_amount is not None and tax_rate is not None:
                 tax_bases.append(line_amount * tax_rate / _HUNDRED)
-        if tax_bases:
+        header_tax_read = any(
+            _decimal(_value(getattr(header, name))) is not None for name in ("cgst", "sgst", "igst")
+        )
+        if tax_bases and header_tax_read:
             expected_tax = sum(tax_bases, _ZERO)
             actual_tax = sum(
                 (

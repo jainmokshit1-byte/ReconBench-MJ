@@ -208,3 +208,73 @@ def test_spec_conflict_categories_cover_model_capacity_size_power_dimensions_and
 
     assert spec_tokens_conflict(left, right)
     assert not spec_tokens_conflict(left, left)
+
+
+def _pinned(line: DocLine, po_line_no: str, source: FieldSource) -> DocLine:
+    ref = _field(po_line_no).model_copy(update={"source": source})
+    return line.model_copy(update={"po_line_ref": ref})
+
+
+def test_a_persons_accepted_item_match_aligns_a_weak_line_to_that_po_line() -> None:
+    invoice = _line(1, "", hsn="84717090", uom="NOS")
+    pos = (_line(7, "", hsn="84717090", uom="PCS"), _line(8, "Unrelated chair"))
+
+    result = align_lines((_pinned(invoice, "8", FieldSource.MANUAL),), pos, _config())[0]
+
+    assert (result.po_line_no, result.state) == (8, AlignmentState.ALIGNED)
+
+
+@pytest.mark.parametrize(("ref", "source"), [("8", FieldSource.RULE), ("99", FieldSource.MANUAL)])
+def test_a_read_or_unknown_po_line_reference_does_not_pin(ref: str, source: FieldSource) -> None:
+    # Only a person's value pins: never a printed or AI-read reference, nor a missing PO line.
+    invoice = _line(1, "", hsn="84717090", uom="NOS")
+    pos = (_line(7, "", hsn="84717090", uom="PCS"), _line(8, "Unrelated chair"))
+
+    result = align_lines((_pinned(invoice, ref, source),), pos, _config())[0]
+
+    assert (result.po_line_no, result.state) == (7, AlignmentState.UNSURE)
+
+
+def test_a_serial_number_beside_the_item_is_not_a_spec_conflict() -> None:
+    invoice = _line(1, "Gaming RAM DDR5 16GB CL40 25476593921 25476596394")
+    po = _line(1, "GAMING RAM DDR5 16GB CL40")
+
+    result = align_lines((invoice,), (po,), _config())[0]
+
+    assert result.state is AlignmentState.ALIGNED
+
+
+def test_a_word_run_into_a_model_code_is_not_a_spec_conflict() -> None:
+    spaced = normalize_item_text("Mid tower cabinet RGB 2024 compact black")
+    joined = normalize_item_text("MID TOWER CABINET RGB 2024COMPACT BLACK")
+    plain = normalize_item_text("Graphics card RTX 4070")
+
+    assert not spec_tokens_conflict(spaced, joined)
+    # A suffix the other side never prints is a different model.
+    assert spec_tokens_conflict(normalize_item_text("Graphics card RTX4070super"), plain)
+
+
+def test_a_long_title_with_equal_quantity_and_rate_is_aligned() -> None:
+    title = (
+        "Travel pouch organizer 8x5 inch with 1 year warranty portable storage organizer"
+        " for cable charger earphone power bank hard disk gadgets travel bag"
+    )
+    po = _line(
+        1, "TRAVEL POUCH ORGANIZER 8X5 INCH WITH 1 YEAR WARRANTY", quantity="1", rate="268.58"
+    )
+
+    same = align_lines((_line(1, title, quantity="1", rate="268.58"),), (po,), _config())[0]
+    other_rate = align_lines((_line(1, title, quantity="1", rate="270"),), (po,), _config())[0]
+
+    assert same.state is AlignmentState.ALIGNED
+    assert same.score == Decimal("0.8000")
+    assert other_rate.state is AlignmentState.UNSURE
+
+
+def test_equal_quantity_and_rate_never_override_a_spec_conflict() -> None:
+    invoice = _line(1, "Acer laptop A515-58 16GB RAM", quantity="1", rate="50000")
+    po = _line(1, "Acer laptop A515-58 8GB RAM", quantity="1", rate="50000")
+
+    result = align_lines((invoice,), (po,), _config())[0]
+
+    assert result.state is AlignmentState.UNSURE

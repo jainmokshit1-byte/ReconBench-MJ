@@ -20,7 +20,14 @@ from decimal import Decimal
 from enum import StrEnum
 
 from reconbench_core.extraction.header import norm
-from reconbench_core.extraction.layout import PageLayout, TextLine, Word, full_rows, typical_height
+from reconbench_core.extraction.layout import (
+    PageLayout,
+    PageSource,
+    TextLine,
+    Word,
+    full_rows,
+    typical_height,
+)
 from reconbench_core.extraction.values import Reading, read_number
 
 
@@ -440,6 +447,9 @@ _HSN = re.compile(r"\b(?:HSN|SAC)\s*(?:CODE)?\s*[:#-]?\s*([0-9@O.]{4,12})", re.I
 _HSN_SHAPE = re.compile(r"^(?:\d{4}|\d{6}|\d{8})$")
 _SMALL_QTY = re.compile(r"^\d{1,5}(?:\.0{1,3})?$")
 _CODE_LIKE = re.compile(r"^[A-Z0-9][A-Z0-9/#._-]{5,}$", re.I)
+# Tesseract reads a 0 inside a product code as "@" ("PA-142@", "5@W", "SR1@GB"). An "@" touching
+# a digit is repaired; "@" before a percent ("IGST@18%") is a tax rate and stays.
+_OCR_AT_ZERO = re.compile(r"(?<=[0-9])@|@(?=[0-9])(?![0-9.]*%)")
 
 
 _UOM_WORDS = frozenset(
@@ -501,6 +511,16 @@ def _drop_leading_noise(text: str) -> str:
         tokens = tokens[1:]
     # OCR reads a cell border or speck just before the first letter as a quote.
     return " ".join(tokens).lstrip("\"'`|_,;:")
+
+
+def fix_ocr_at_zero(text: str) -> str:
+    """Read an at-sign touching a digit as 0 (a run such as 1@@ takes a few passes)."""
+
+    while True:
+        fixed = _OCR_AT_ZERO.sub("0", text)
+        if fixed == text:
+            return text
+        text = fixed
 
 
 def _row_text(words: Sequence[Word]) -> str:
@@ -598,6 +618,8 @@ def extract_tables(pages: Sequence[PageLayout]) -> TableResult:
             text = _row_text(row.words)
             upper = norm_spaces(text)
             description = _row_text(by_col.get(Col.DESCRIPTION, []))
+            if page.source == PageSource.OCR:
+                description = fix_ocr_at_zero(description)
             left_text = norm_spaces(
                 _row_text([w for c, ws in by_col.items() if c in _TEXT_COLS for w in ws])
             )
@@ -709,4 +731,5 @@ __all__ = [
     "TableResult",
     "extract_tables",
     "find_heading",
+    "fix_ocr_at_zero",
 ]

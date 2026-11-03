@@ -208,3 +208,44 @@ def test_an_ai_read_invoice_matches_after_a_person_verifies_its_values(
     matched = _match_and_run(scratch_engine, actor)
     assert _invoice_po_link_states(scratch_engine, actor) == ["auto"]
     assert matched.status.value == "matched", matched.reason_codes
+
+
+def test_a_persons_accepted_item_match_clears_a_weak_item_match(
+    scratch_engine: Engine, tmp_path: Path
+) -> None:
+    actor, ingestion, invoice_id, _queue = _upload_set(scratch_engine, tmp_path, "flow-item")
+    details = ingestion.get_document(actor.workspace_id, invoice_id)
+    assert details is not None
+    # The invoice names the item differently from the PO (a person corrects the wording).
+    [line] = details["lines"]
+    renamed = ingestion.correct_invoice_document(
+        actor,
+        invoice_id,
+        expected_version=int(details["document"]["version"]),
+        header_patch={},
+        lines_patch=[{"id": line["id"], "line_no": 1, "description": "PW 100 assy kit"}],
+        verified=True,
+        reason="synthetic wording",
+    )
+    assert renamed is not None
+    held = _match_and_run(scratch_engine, actor)
+    assert held.status.value != "matched"
+    assert {code.value for code in held.reason_codes} & {"ITEM_UNSURE", "ITEM_NOT_ON_PO"}
+
+    # "Accept item match": the person ties invoice line 1 to PO line 1.
+    current = ingestion.get_document(actor.workspace_id, invoice_id)
+    assert current is not None
+    [line] = current["lines"]
+    accepted = ingestion.correct_invoice_document(
+        actor,
+        invoice_id,
+        expected_version=int(current["document"]["version"]),
+        header_patch={},
+        lines_patch=[{"id": line["id"], "line_no": 1, "po_line_ref": "1"}],
+        verified=False,
+        reason="Item match accepted by a person",
+    )
+    assert accepted is not None
+
+    matched = _match_and_run(scratch_engine, actor)
+    assert matched.status.value == "matched", matched.reason_codes

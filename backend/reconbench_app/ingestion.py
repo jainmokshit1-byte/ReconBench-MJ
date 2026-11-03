@@ -181,6 +181,9 @@ INVOICE_LINE_COLUMNS: Mapping[str, str] = {
     "quantity": "quantity",
     "rate": "rate",
     "amount": "amount",
+    "tax_rate": "tax_rate",
+    # "Accept item match": the PO line a person ties this invoice line to.
+    "po_line_ref": "po_line_ref",
 }
 _COMMON_CORRECTION_HEADER_COLUMNS: Mapping[str, str] = {
     "doc_no": "doc_no",
