@@ -431,6 +431,7 @@ class ExportService:
             .where(
                 source_file.c.workspace_id == workspace_id,
                 source_file.c.status.in_(["failed", "partial"]),
+                source_file.c.removed_at.is_(None),
             )
             .order_by(source_file.c.display_name, source_file.c.id)
         ):
