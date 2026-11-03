@@ -18,9 +18,10 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - Web app — vitest 74 passed, lint + typecheck OK (2026-11-02, D118, Node v24.19.0 from nvm, not on PATH) — web/
 
 ## Tests
-- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1549 passed, 22 skipped, 262 s, 2026-11-02 (b14)
+- `backend/.venv/Scripts/pytest.exe backend/tests/{unit,parsers,property,scenarios} -q` — 1579 passed, 22 skipped, 294 s, 2026-11-03 (uncommitted: LINK_INFERRED, AI_LINES_MISSING, Verify re-match, zero-amount rows, split tax rate, PO/GRN AI reading; engine 0.1.15; web vitest 79 passed, tsc + lint clean)
 - `pytest backend/tests/integration` — run on disposable postgres:16.15 at 127.0.0.1:15499: test_phase4_task_411_413.py (3 passed), test_ai_vision.py (15 passed), test_pd2f_waiting_for_reading.py (18 passed, b12), test_ai_runner.py (32 passed, b12), test_pd2c_pd2d_reading.py (9 passed), test_pd3a_no_ai_calls.py (3 passed), test_ingestion.py (4 passed, b13), test_phase4_task_411_413.py (3 passed, b13), test_pd_ledger_scopes.py (3 passed); 3 failures on HEAD (KNOWN_ISSUES: test_ai_h1, test_page_split); test_infrastructure_ready needs MinIO/S3 (D113)
 - Web: `npx tsc -b`, `npm run lint`, `npx vitest run` (74 passed, D118); Playwright e2e not run
+- Integration, 3 Nov 2026 (uncommitted changes, throwaway postgres:16.15): test_flow_three_way_match (3, new: digital Matched, zero row Matched, AI invoice Matched after Verify), test_pd4d_verify_ai_values 10, test_ai_vision 16, test_pd2c_pd2d_reading 10, test_pd2f_waiting_for_reading 18, test_vendor_rematch 2, test_phase4_task_411_413 3, test_pd2b_reason_code_migration 3, test_ingestion 4, test_reupload_withdrawn 6, test_pd2b_review_marks_fields 5 — all passed; only KI-003 failures (test_ai_h1 1, test_page_split 2)
 - `make accuracy-bench` — not run: needs Docker worker image and owner's local truth set
 
 ## Active task
