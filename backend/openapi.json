@@ -1473,6 +1473,18 @@
             ],
             "title": "Lines"
           },
+          "override_reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Override Reason"
+          },
           "payment_terms": {
             "anyOf": [
               {
@@ -2355,6 +2367,18 @@
               }
             ],
             "title": "Lines"
+          },
+          "override_reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Override Reason"
           },
           "payment_terms": {
             "anyOf": [
@@ -3696,7 +3720,8 @@
           "GRN_OVER_PO",
           "LATE_DELIVERY",
           "AI_VALUE_UNVERIFIED",
-          "AI_LINES_MISSING"
+          "AI_LINES_MISSING",
+          "SERIAL_DIFF"
         ],
         "title": "ReasonCode",
         "type": "string"

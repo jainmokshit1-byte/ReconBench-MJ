@@ -1811,6 +1811,8 @@ export interface components {
             irn?: string | null;
             /** Lines */
             lines?: components["schemas"]["DocumentLineCorrection"][] | null;
+            /** Override Reason */
+            override_reason?: string | null;
             /** Payment Terms */
             payment_terms?: string | null;
             /** Place Of Supply */
@@ -1982,6 +1984,8 @@ export interface components {
             irn?: string | null;
             /** Lines */
             lines?: components["schemas"]["InvoiceLineCorrection"][] | null;
+            /** Override Reason */
+            override_reason?: string | null;
             /** Payment Terms */
             payment_terms?: string | null;
             /** Place Of Supply */
@@ -2430,7 +2434,7 @@ export interface components {
          * ReasonCode
          * @enum {string}
          */
-        ReasonCode: "DUP_INVOICE" | "NO_PO_LINK" | "LINK_INFERRED" | "LOW_CONFIDENCE_DATA" | "DUP_SUSPECTED" | "ITEM_UNSURE" | "NO_TEXT_LAYER" | "VENDOR_MISMATCH" | "PO_NOT_OPEN" | "ITEM_NOT_ON_PO" | "QTY_OVER_PO" | "QTY_OVER_GRN" | "RATE_HIGH" | "TOTAL_MISMATCH" | "MATH_ERROR" | "PO_VALUE_EXCEEDED" | "CURRENCY_DIFF" | "UOM_MISMATCH" | "DATE_ORDER" | "GRN_PENDING" | "RATE_LOW" | "TAX_RATE_DIFF" | "TAX_TYPE_MISMATCH" | "HSN_DIFF" | "GSTIN_INVALID" | "EXTRA_CHARGE" | "GRN_OVER_PO" | "LATE_DELIVERY" | "AI_VALUE_UNVERIFIED" | "AI_LINES_MISSING";
+        ReasonCode: "DUP_INVOICE" | "NO_PO_LINK" | "LINK_INFERRED" | "LOW_CONFIDENCE_DATA" | "DUP_SUSPECTED" | "ITEM_UNSURE" | "NO_TEXT_LAYER" | "VENDOR_MISMATCH" | "PO_NOT_OPEN" | "ITEM_NOT_ON_PO" | "QTY_OVER_PO" | "QTY_OVER_GRN" | "RATE_HIGH" | "TOTAL_MISMATCH" | "MATH_ERROR" | "PO_VALUE_EXCEEDED" | "CURRENCY_DIFF" | "UOM_MISMATCH" | "DATE_ORDER" | "GRN_PENDING" | "RATE_LOW" | "TAX_RATE_DIFF" | "TAX_TYPE_MISMATCH" | "HSN_DIFF" | "GSTIN_INVALID" | "EXTRA_CHARGE" | "GRN_OVER_PO" | "LATE_DELIVERY" | "AI_VALUE_UNVERIFIED" | "AI_LINES_MISSING" | "SERIAL_DIFF";
         /** ReasonCodeCatalog */
         ReasonCodeCatalog: {
             /** Items */
