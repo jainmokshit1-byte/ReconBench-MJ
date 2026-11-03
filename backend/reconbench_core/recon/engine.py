@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Any
 from uuid import UUID
 
 from reconbench_core.align import AlignmentResult, align_lines
@@ -64,6 +65,9 @@ _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
 _SPLIT_TAX_EQUAL_TOLERANCE = Decimal("0.02")
 _SPLIT_TAX_RATE_TOLERANCE = Decimal("0.05")
+# A freight share folded into a line amount is a small surcharge on the line's own value.
+_SPREAD_FREIGHT_MAX_SHARE = Decimal("0.05")
+_FREIGHT_WORDS = ("freight", "courier", "shipping")
 _ACTIVE_LINK_STATES = {LinkState.AUTO, LinkState.CONFIRMED, LinkState.SUGGESTED}
 _DUPLICATE_NUMBER_LOOKALIKE_FOLD = str.maketrans(
     {"O": "0", "I": "1", "L": "1", "|": "1", "S": "5", "B": "8", "Z": "2"}
@@ -330,6 +334,7 @@ def _check_math(
     actual: Decimal,
     expected: Decimal,
     tolerance: Tolerance,
+    extra_evidence: dict[str, Any] | None = None,
 ) -> bool:
     difference = actual - expected
     passed = _tolerance_pass(actual, expected, tolerance)
@@ -343,7 +348,10 @@ def _check_math(
             actual=actual,
             variance=difference,
             tolerance=tolerance,
-            evidence={"formula": "absolute or percentage variance per configured limit_mode"},
+            evidence={
+                "formula": "absolute or percentage variance per configured limit_mode",
+                **(extra_evidence or {}),
+            },
         )
     )
     if not passed:
@@ -543,11 +551,13 @@ def _build_grn_ledger(
     return accepted, rejected, grn_ids, fallback_received
 
 
-def _invoice_net_rate(line: DocLine) -> Decimal | None:
+def _invoice_net_rate(line: DocLine, freight_share: Decimal = _ZERO) -> Decimal | None:
+    """Amount per unit; an accepted spread-freight share is not part of the price."""
+
     quantity = _line_qty(line)
     amount = _line_amount(line)
     if quantity not in (None, _ZERO) and amount is not None:
-        return amount / quantity
+        return (amount - freight_share) / quantity
     return _field_decimal(line, "rate")
 
 
@@ -707,6 +717,75 @@ def _lump_sum_line(
     return po_amount
 
 
+def _decimal_text(raw: object) -> Decimal | None:
+    if not isinstance(raw, (str, Decimal)):
+        return None
+    try:
+        value = Decimal(str(raw).replace(",", "").strip())
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() else None
+
+
+def _printed_freight_figures(document: Document) -> list[Decimal]:
+    """Freight totals the invoice prints: a header extra and/or freight/courier CHARGE lines."""
+
+    figures: list[Decimal] = []
+    header_freight = _decimal_text(document.header.extras.get("freight"))
+    if header_freight is not None and header_freight > _ZERO:
+        figures.append(header_freight)
+    charged = _ZERO
+    for line in document.lines:
+        if _value(line.line_type) is not LineType.CHARGE:
+            continue
+        description = (_text(_value(line.description)) or "").casefold()
+        amount = _field_decimal(line, "amount")
+        if amount is not None and any(word in description for word in _FREIGHT_WORDS):
+            charged += amount
+    if charged > _ZERO:
+        figures.append(charged)
+    return figures
+
+
+def _spread_freight_shares(
+    document: Document, tolerance: Tolerance
+) -> tuple[dict[int, Decimal], Decimal | None]:
+    """Per-line freight folded into line amounts, accepted only when it adds up to the print.
+
+    A line whose amount differs from qty x rate - discount fails line math. Those excesses are
+    taken as freight shares only if every failing line has a positive excess of at most
+    ``_SPREAD_FREIGHT_MAX_SHARE`` of its value and the excesses sum to a printed freight figure
+    within the arithmetic tolerance. Otherwise nothing is accepted and the lines keep failing.
+    """
+
+    excess: dict[int, Decimal] = {}
+    for line in document.lines:
+        if _value(line.line_type) is LineType.CHARGE:
+            continue
+        quantity = _line_qty(line)
+        rate = _field_decimal(line, "rate")
+        amount = _line_amount(line)
+        if quantity is None or rate is None or amount is None:
+            continue
+        base = quantity * rate - (_field_decimal(line, "discount") or _ZERO)
+        if _tolerance_pass(amount, base, tolerance):
+            continue
+        freight = _line_freight(line)
+        if freight is not None and _tolerance_pass(amount, base + freight, tolerance):
+            continue
+        share = amount - base
+        if share <= _ZERO or base <= _ZERO or share > base * _SPREAD_FREIGHT_MAX_SHARE:
+            return {}, None
+        excess[line.line_no] = share
+    if not excess:
+        return {}, None
+    total = sum(excess.values(), _ZERO)
+    for printed in _printed_freight_figures(document):
+        if _tolerance_pass(total, printed, tolerance):
+            return excess, printed
+    return {}, None
+
+
 def _tax_rate_for_line(work: _LineWork) -> Decimal | None:
     return _line_tax_rate(work.line) or (
         _field_decimal(work.po_line, "tax_rate") if work.po_line is not None else None
@@ -815,6 +894,8 @@ def _apply_financial_checks(
                     case_reasons,
                 )
 
+        arithmetic_rule = _rule(config, "arithmetic", invoice.vendor_id, None)
+        freight_shares, freight_printed = _spread_freight_shares(invoice.document, arithmetic_rule)
         for work in sorted(invoice_works, key=lambda item: item.line.line_no):
             amount = _line_amount(work.line)
             work.line_taxable = amount or _ZERO
@@ -976,7 +1057,9 @@ def _apply_financial_checks(
                     )
             elif work.po_line is not None:
                 po_rate = _field_decimal(work.po_line, "rate")
-                invoice_rate = _invoice_net_rate(work.line)
+                invoice_rate = _invoice_net_rate(
+                    work.line, freight_shares.get(work.line.line_no, _ZERO)
+                )
                 work.po_rate = po_rate
                 work.invoice_rate = invoice_rate
                 if quantity is not None and po_rate is not None:
@@ -1156,7 +1239,6 @@ def _apply_financial_checks(
                 )
 
         expected_by_invoice[invoice.document_id] = expected if matched_any else _ZERO
-        arithmetic_rule = _rule(config, "arithmetic", invoice.vendor_id, None)
         line_total = _ZERO
         line_total_available = True
         for line in invoice.document.lines:
@@ -1177,6 +1259,9 @@ def _apply_financial_checks(
                     and _tolerance_pass(amount, expected_amount + freight, arithmetic_rule)
                 ):
                     expected_amount += freight
+                share = freight_shares.get(line.line_no)
+                if share is not None:
+                    expected_amount += share
                 _check_math(
                     header_checks[invoice.document_id],
                     case_reasons[invoice.document_id],
@@ -1185,6 +1270,9 @@ def _apply_financial_checks(
                     amount,
                     expected_amount,
                     arithmetic_rule,
+                    {"freight_share": str(share), "freight_total": str(freight_printed)}
+                    if share is not None
+                    else None,
                 )
         taxable = _taxable(invoice.document)
         if taxable is not None and line_total_available and invoice.document.lines:
