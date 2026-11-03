@@ -93,8 +93,10 @@ def test_downgrade_removes_only_the_code_and_upgrade_adds_it_back() -> None:
             before = dict(
                 connection.execute(
                     sa.text(
-                        "SELECT code, count(*) FROM reason_code WHERE code <> :code GROUP BY code"
+                        "SELECT code, count(*) FROM reason_code "
+                        "WHERE code <> :code AND code <> 'SERIAL_DIFF' GROUP BY code"
                     ),
+                    # SERIAL_DIFF arrives later (0037), so the downgrade removes it too.
                     {"code": _CODE},
                 ).all()
             )
