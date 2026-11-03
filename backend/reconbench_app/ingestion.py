@@ -269,6 +269,37 @@ _REVIEWED_HEADER_FIELDS = frozenset(
 _REVIEWED_LINE_FIELDS = frozenset({"quantity", "rate", "amount"})
 _AI_SNIPPET_LIMIT = 500
 _CORRECTION_QA_CODE = "CORRECTION_QA_FAILED"
+# Confidence given to a saved value that failed arithmetic QA and is not verified: below the
+# 0.70 extraction gate, so the invoice stays in Needs review until a person overrides it.
+_QA_FAILED_CONFIDENCE = Decimal("0.50")
+_QA_LINE_FAILURE = re.compile(r"^line (\d+) amount$")
+_QA_LINE_FIELDS = frozenset({"quantity", "rate", "amount", "discount"})
+_QA_TOTAL_FIELDS = frozenset({"taxable_total", "cgst", "sgst", "igst", "round_off", "grand_total"})
+
+
+def _qa_untrusted_fields(
+    failures: Sequence[str],
+) -> tuple[frozenset[str], dict[int, frozenset[str]]]:
+    """The header fields and (line number, fields) that failed correction QA name.
+
+    "line N amount" names that line's quantity, rate and amount. "taxable total" names the
+    taxable total and the grand total; "grand total" names every total. A failure this map
+    does not know leaves the grand total unverified, the critical header value.
+    """
+
+    header: set[str] = set()
+    lines: dict[int, frozenset[str]] = {}
+    for failure in failures:
+        match = _QA_LINE_FAILURE.match(failure)
+        if match is not None:
+            lines[int(match.group(1))] = _QA_LINE_FIELDS
+        elif failure == "taxable total":
+            header |= {"taxable_total", "grand_total"}
+        elif failure == "grand total":
+            header |= _QA_TOTAL_FIELDS
+        else:
+            header.add("grand_total")
+    return frozenset(header), lines
 
 
 def _correction_header_columns(doc_type: str) -> Mapping[str, str]:
@@ -4477,11 +4508,15 @@ class IngestionService:
         verified: bool,
         reason: str | None,
         ai_suggestion_refs: Sequence[AiSuggestionRef] = (),
+        override_reason: str | None = None,
     ) -> dict[str, Any] | None:
         """Append a human-reviewed document version and preserve correction evidence.
 
         Invoice saves run deterministic arithmetic QA (TR-PAR-5); a failure is
-        flagged as a warning. Values taken from grounded suggestions must still
+        flagged as a warning, the values are saved, and the values the failure names
+        are not marked verified and stay below the extraction gate. A person who
+        checked them anyway saves again with ``override_reason``; the override is
+        audited. Values taken from grounded suggestions must still
         match the current suggestion; their evidence keeps its quote, page and
         ``ai_call_id``.
         """
@@ -4808,13 +4843,30 @@ class IngestionService:
 
             changed_header_fields = set(header_changes)
             any_correction = bool(changed_header_fields or changed_line_fields or removed_line_ids)
-            should_verify = verified
+            qa = (
+                _correction_qa(new_version, new_lines)
+                if doc_type == DocType.INVOICE.value
+                else None
+            )
+            # Values a failed QA names are saved but not verified, unless a person gives a
+            # reason to trust them anyway (override, audited below).
+            override = (override_reason or "").strip() or None
+            qa_failed = qa is not None and not qa["passed"]
+            qa_header, qa_lines = (
+                _qa_untrusted_fields(qa["failures"]) if qa is not None and qa_failed else ((), {})
+            )
+            qa_overridden = bool(qa_failed and override)
+            held_header = frozenset() if qa_overridden else frozenset(qa_header)
+            held_lines = {} if qa_overridden else qa_lines
+            override_header = frozenset(qa_header) if qa_overridden else frozenset()
+            override_lines = qa_lines if qa_overridden else {}
+            should_verify = verified and (not qa_failed or qa_overridden)
             needs_verification = (
                 not should_verify
                 if any_correction or verified
                 else bool(current_version["needs_verification"])
             )
-            if verified and not any_correction and not current_version["needs_verification"]:
+            if should_verify and not any_correction and not current_version["needs_verification"]:
                 needs_verification = False
             new_version["needs_verification"] = needs_verification
             new_version["verification_reasons"] = (
@@ -4828,11 +4880,6 @@ class IngestionService:
                 "verified": not needs_verification,
                 "reason": reason,
             }
-            qa = (
-                _correction_qa(new_version, new_lines)
-                if doc_type == DocType.INVOICE.value
-                else None
-            )
             if qa is not None:
                 extras["correction_qa"] = qa
             new_version["extras"] = extras
@@ -4845,9 +4892,21 @@ class IngestionService:
                 new_lines=new_lines,
             )
 
+            def held(kind: str, line_no: int | None, name: str) -> bool:
+                """Whether failed correction QA names this value (not verified)."""
+
+                if kind == "header":
+                    return name in held_header
+                return name in held_lines.get(line_no or 0, ())
+
+            def overridden(kind: str, line_no: int | None, name: str) -> bool:
+                if kind == "header":
+                    return name in override_header
+                return name in override_lines.get(line_no or 0, ())
+
             def manual_evidence(key: tuple[str, int | None, str]) -> dict[str, Any]:
                 grounded = ai_evidence.get(key)
-                verified_values = {
+                verified_values: dict[str, Any] = {
                     "source": "manual",
                     "origin": FieldOrigin.MANUAL.value,
                     "confidence": None,
@@ -4855,6 +4914,17 @@ class IngestionService:
                     "verified_by": str(actor.actor_id),
                     "verified_at": sa.func.now(),
                 }
+                if held(key[0], key[1], key[2]):
+                    # Saved, but failed QA: not verified. The source is not "manual" because
+                    # the engine's gate counts a manual value as checked by a person.
+                    verified_values.update(
+                        source="rule",
+                        confidence=_QA_FAILED_CONFIDENCE,
+                        verification=FieldVerification.NONE.value,
+                        verified_by=None,
+                        verified_at=None,
+                    )
+                    qa_held_fields.add(key[2] if key[0] == "header" else f"line {key[1]} {key[2]}")
                 if grounded is None:
                     return {
                         **verified_values,
@@ -4912,6 +4982,8 @@ class IngestionService:
             is_invoice = doc_type == DocType.INVOICE.value
             # Unchanged values that marking the document reviewed verified (P2, PD-2b).
             verified_fields: set[str] = set()
+            # Values saved but held back from verification by failed correction QA.
+            qa_held_fields: set[str] = set()
 
             def verify(item: dict[str, Any], name: str) -> None:
                 item.update(
@@ -4920,6 +4992,32 @@ class IngestionService:
                     verified_at=sa.func.now(),
                 )
                 verified_fields.add(name)
+
+            def settle_carried(
+                item: dict[str, Any],
+                kind: str,
+                line_no: int | None,
+                name: str,
+                label: str,
+                reviewed: bool,
+            ) -> None:
+                """Verify or hold one unchanged value carried to the new version."""
+
+                if held(kind, line_no, name):
+                    confidence = item.get("confidence")
+                    item.update(
+                        verification=FieldVerification.NONE.value,
+                        verified_by=None,
+                        verified_at=None,
+                        confidence=min(confidence, _QA_FAILED_CONFIDENCE)
+                        if confidence is not None
+                        else _QA_FAILED_CONFIDENCE,
+                    )
+                    if item["source"] == FieldSource.MANUAL.value:
+                        item["source"] = FieldSource.RULE.value
+                    qa_held_fields.add(label)
+                elif reviewed or (overridden(kind, line_no, name) and not _read_by_ai(item)):
+                    verify(item, label)
 
             # Only each value's latest row moves to the new version. The copies share one
             # time and their ids are not ordered, so an older row copied as well could hide a
@@ -4948,18 +5046,25 @@ class IngestionService:
                             ),
                         )
                         manual_evidence_done.add(("line", old_line_id, field_name))
-                    elif verified and _verified_by_review(
-                        item,
-                        references=("po_ref",),
-                        shown_key_fields=(
-                            _REVIEWED_LINE_FIELDS & shown_line_fields.get(old_line_id, set())
-                            if is_invoice
-                            else frozenset()
-                        ),
-                    ):
-                        verify(
+                    else:
+                        line_number = line_no_by_owner.get(old_line_id)
+                        settle_carried(
                             item,
-                            f"line {line_no_by_owner.get(old_line_id)} {item['field_name']}",
+                            "line",
+                            line_number,
+                            str(item["field_name"]),
+                            f"line {line_number} {item['field_name']}",
+                            verified
+                            and _verified_by_review(
+                                item,
+                                references=("po_ref",),
+                                shown_key_fields=(
+                                    _REVIEWED_LINE_FIELDS
+                                    & shown_line_fields.get(old_line_id, set())
+                                    if is_invoice
+                                    else frozenset()
+                                ),
+                            ),
                         )
                 else:
                     item["document_version_id"] = new_version_id
@@ -4973,16 +5078,24 @@ class IngestionService:
                             **manual_evidence(("header", None, field_name)),
                         )
                         manual_evidence_done.add(("header", None, field_name))
-                    elif verified and _verified_by_review(
-                        item,
-                        references=("po_refs", "grn_refs"),
-                        shown_key_fields=(
-                            _REVIEWED_HEADER_FIELDS & set(header_patch)
-                            if is_invoice
-                            else frozenset()
-                        ),
-                    ):
-                        verify(item, str(item["field_name"]))
+                    else:
+                        settle_carried(
+                            item,
+                            "header",
+                            None,
+                            str(item["field_name"]),
+                            str(item["field_name"]),
+                            verified
+                            and _verified_by_review(
+                                item,
+                                references=("po_refs", "grn_refs"),
+                                shown_key_fields=(
+                                    _REVIEWED_HEADER_FIELDS & set(header_patch)
+                                    if is_invoice
+                                    else frozenset()
+                                ),
+                            ),
+                        )
                 item["id"] = new_id()
                 item.pop("created_at", None)
                 connection.execute(sa.insert(evidence_table).values(**item))
@@ -5074,6 +5187,15 @@ class IngestionService:
                     "needs_verification": needs_verification,
                     "verified_fields": sorted(verified_fields),
                     "correction_qa": qa,
+                    "qa_unverified_fields": sorted(qa_held_fields),
+                    "qa_override": (
+                        {
+                            "reason": override,
+                            "failures": list(qa["failures"]) if qa is not None else [],
+                        }
+                        if qa_overridden
+                        else None
+                    ),
                     "ai_suggestion_refs": [
                         {
                             "ai_call_id": str(ai_call_id),
