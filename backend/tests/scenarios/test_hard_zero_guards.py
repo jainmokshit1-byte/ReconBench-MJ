@@ -498,3 +498,19 @@ def test_hard_zero_target_never_returns_inactive_provider() -> None:
         target_provider, target_model = rules_snap.target(hook)
         assert target_provider is None
         assert target_model is None
+
+
+def test_no_reference_fallback_link_is_suggested_even_with_the_most_permissive_config() -> None:
+    invoice, docs, pos = mapping_case._fallback_case()
+    config = MappingConfig(
+        link_auto_accept=Decimal("0"),
+        step3_min_score=Decimal("0"),
+        step3_min_lead=Decimal("0"),
+    )
+
+    results = resolve_links(docs, pos, config)
+    result = next(r for r in results if r.document_id == invoice.document_id)
+
+    assert result.links
+    assert all(link.state is LinkState.SUGGESTED for link in result.links)
+    assert all(link.method is LinkMethod.CONTENT for link in result.links)
