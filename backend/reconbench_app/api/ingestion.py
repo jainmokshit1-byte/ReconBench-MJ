@@ -230,6 +230,8 @@ class _CorrectionBodyBase(BaseModel):
     place_of_supply: str | None = Field(default=None, max_length=256)
     verified: bool = False
     reason: str | None = Field(default=None, max_length=500)
+    # A person's reason to trust values that failed arithmetic QA (saved unverified otherwise).
+    override_reason: str | None = Field(default=None, max_length=500)
     ai_suggestion_refs: list[AiSuggestionRefBody] = Field(default_factory=list, max_length=200)
 
 
@@ -911,7 +913,7 @@ def create_manual_invoice(
             source_file_id,
             header_patch=body.model_dump(
                 exclude_unset=True,
-                exclude={"lines", "verified", "reason", "ai_suggestion_refs"},
+                exclude={"lines", "verified", "reason", "override_reason", "ai_suggestion_refs"},
                 mode="python",
             ),
             lines_patch=(
@@ -958,7 +960,7 @@ def correct_invoice_document(
             expected_version=expected_version,
             header_patch=body.model_dump(
                 exclude_unset=True,
-                exclude={"lines", "verified", "reason", "ai_suggestion_refs"},
+                exclude={"lines", "verified", "reason", "override_reason", "ai_suggestion_refs"},
                 mode="python",
             ),
             lines_patch=(
@@ -968,6 +970,7 @@ def correct_invoice_document(
             ),
             verified=body.verified,
             reason=body.reason,
+            override_reason=body.override_reason,
             ai_suggestion_refs=[
                 AiSuggestionRef(
                     ai_call_id=ref.ai_call_id,
