@@ -556,6 +556,21 @@ def _line_consistent(quantity: object, rate: object, amount: object) -> bool | N
     return abs(quantity * rate - amount) <= tolerance
 
 
+def _split_tax_rate(values: Mapping[str, object]) -> bool:
+    """A line's tax rate that only fits one of two equal CGST/SGST amounts (half the GST rate)."""
+
+    rate, amount = values.get("tax_rate"), values.get("amount")
+    cgst, sgst = values.get("cgst"), values.get("sgst")
+    if not all(isinstance(value, Decimal) for value in (rate, amount, cgst, sgst)):
+        return False
+    assert isinstance(rate, Decimal) and isinstance(amount, Decimal)
+    assert isinstance(cgst, Decimal) and isinstance(sgst, Decimal)
+    one_tax = amount * rate / 100
+    return (
+        cgst > 0 and abs(cgst - sgst) <= _LINE_TOLERANCE and abs(one_tax - cgst) <= _LINE_TOLERANCE
+    )
+
+
 def _ocr_consistent_line(ocr: Document | None, amount: Decimal) -> bool:
     if ocr is None:
         return False
@@ -708,6 +723,11 @@ def check_reading(
             dropped["empty_line"] += 1
             continue
         amount = values.get("amount")
+        if _split_tax_rate(values):
+            # "CGST 9%" read as the line's rate: the half of the real GST rate, so it is
+            # left out; the PO's rate (not a half rate) then serves the line's tax checks.
+            dropped["split_tax_rate"] += 1
+            cells = [cell for cell in cells if cell.name != "tax_rate"]
         if (
             isinstance(amount, Decimal)
             and _line_consistent(values.get("quantity"), values.get("rate"), amount) is False

@@ -81,5 +81,18 @@ def test_tail_period_is_bounded_and_short_text_has_none() -> None:
 def test_log_text_holds_only_counts() -> None:
     secret = {**_LINE, "description": "SECRET-INVOICE-4417", "amount": "98,765.43"}
     text = answer_shape(json.dumps(_answer([secret]), indent=2)).log_text()
-    assert re.fullmatch(r"[a-z_]+=\d+( [a-z_]+=\d+){8}", text)
+    assert re.fullmatch(r"[a-z_]+=\d+( [a-z_]+=\d+){8} names=-", text)
     assert "SECRET" not in text and "98,765.43" not in text and "4417" not in text
+
+
+def test_repeated_field_names_are_counted_but_unknown_names_and_values_are_not() -> None:
+    fields = [
+        {"name": "po_ref", "text": "PO-SECRET-1", "page": 1, "box_2d": [1, 2, 3, 4]},
+        {"name": "po_ref", "text": "PO-SECRET-2", "page": 1, "box_2d": [1, 2, 3, 5]},
+        {"name": "doc_no", "text": "INV-SECRET", "page": 1, "box_2d": [1, 2, 3, 6]},
+        {"name": "not_a_field_SECRET", "text": "x", "page": 1, "box_2d": [1, 2, 3, 7]},
+    ]
+    shape = answer_shape(json.dumps({**_answer([]), "fields": fields}, indent=2))
+    assert shape.names == (("po_ref", 2), ("doc_no", 1))
+    assert shape.log_text().endswith("names=po_ref:2,doc_no:1")
+    assert "SECRET" not in shape.log_text()

@@ -361,6 +361,8 @@ class ReasonCode(StrEnum):
     LATE_DELIVERY = "LATE_DELIVERY"
     # A value read by AI that no person has verified yet (PD-2b).
     AI_VALUE_UNVERIFIED = "AI_VALUE_UNVERIFIED"
+    # The AI reading carries fewer invoice lines than the rules reading of the same file.
+    AI_LINES_MISSING = "AI_LINES_MISSING"
 
 
 class CheckOutcome(StrEnum):
@@ -415,6 +417,7 @@ EXTRA_CHARGE = ReasonCode.EXTRA_CHARGE
 GRN_OVER_PO = ReasonCode.GRN_OVER_PO
 LATE_DELIVERY = ReasonCode.LATE_DELIVERY
 AI_VALUE_UNVERIFIED = ReasonCode.AI_VALUE_UNVERIFIED
+AI_LINES_MISSING = ReasonCode.AI_LINES_MISSING
 REASON_CODES = tuple(ReasonCode)
 
 
@@ -839,4 +842,5 @@ __all__ = [
     "GRN_OVER_PO",
     "LATE_DELIVERY",
     "AI_VALUE_UNVERIFIED",
+    "AI_LINES_MISSING",
 ]

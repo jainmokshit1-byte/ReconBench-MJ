@@ -1309,6 +1309,21 @@ def evaluate(
                 )
             )
             case_reasons[invoice.document_id].append(ReasonCode.AI_VALUE_UNVERIFIED)
+        if ReasonCode.AI_LINES_MISSING in invoice.document.reason_codes:
+            # The AI reading left out lines the rules read; a person checks the line list.
+            case_header_checks[invoice.document_id].append(
+                _make_check(
+                    "s1.ai_lines_read",
+                    CheckOutcome.REVIEW,
+                    code=ReasonCode.AI_LINES_MISSING,
+                    level=ReasonLevel.REVIEW,
+                    evidence={
+                        "message": "The AI reading has fewer lines than the rules reading; "
+                        "compare the line list with the page."
+                    },
+                )
+            )
+            case_reasons[invoice.document_id].append(ReasonCode.AI_LINES_MISSING)
         duplicate_id = exact_duplicates.get(invoice.document_id)
         if duplicate_id is not None:
             case_header_checks[invoice.document_id].append(
@@ -1430,6 +1445,7 @@ def evaluate(
                         evidence={"method": selected_link.method.value},
                     )
                 )
+                case_reasons[invoice.document_id].append(ReasonCode.LINK_INFERRED)
             for grn_link in active_links:
                 grn_record = documents[grn_link.from_document_id]
                 if (
@@ -1498,8 +1514,11 @@ def evaluate(
             work.checks.extend(prechecks)
             work.reasons.extend(pre_reasons)
             is_charge = _value(line.line_type) is LineType.CHARGE
-            if not is_charge and (
-                line_alignment is None or line_alignment.state is AlignmentState.NOT_ON_PO
+            # A row that bills nothing (e.g. "Shipping 0.00") needs no PO line.
+            if (
+                not is_charge
+                and _line_amount(line) != _ZERO
+                and (line_alignment is None or line_alignment.state is AlignmentState.NOT_ON_PO)
             ):
                 work.checks.append(
                     _make_check(
@@ -1606,7 +1625,10 @@ def evaluate(
                         )
                     )
                     work.reasons.append(ReasonCode.ITEM_UNSURE)
-                elif work.alignment.state is AlignmentState.NOT_ON_PO:
+                elif (
+                    work.alignment.state is AlignmentState.NOT_ON_PO
+                    and _line_amount(work.line) != _ZERO
+                ):
                     work.checks.append(
                         _make_check(
                             "s3.item_alignment",

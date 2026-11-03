@@ -72,10 +72,11 @@ WIRED_DOC_TYPES: frozenset[str] = frozenset({"invoice", "po", "grn"})
 # The existing correction endpoint accepts manual saves for each wired document type.
 CORRECTABLE_DOC_TYPES: frozenset[str] = WIRED_DOC_TYPES
 PDF_METHODS = frozenset({"pdf_text", "pdf_ocr"})
-# AI reads only scanned invoices: a PDF with any page the scan check found scanned (D103
-# decisions 1 and 3). Digital invoices, an OCR assist on a digital page included, and PO/GRN
-# files are always read by rules (PD-2d).
-READ_DOC_TYPES: frozenset[str] = frozenset({"invoice"})
+# AI reads only scanned documents: a PDF with any page the scan check found scanned (D103
+# decisions 1 and 3). Since 3 Nov 2026 the one scanned-invoice switch covers scanned POs and
+# GRNs too (owner decision). Digital files, an OCR assist on a digital page included, are
+# always read by rules (PD-2d).
+READ_DOC_TYPES: frozenset[str] = frozenset({"invoice", "po", "grn"})
 
 SKIP_SOURCE_CHANGED = "SOURCE_CHANGED"
 SKIP_NOT_ELIGIBLE = "NOT_ELIGIBLE"
@@ -165,12 +166,13 @@ def vision_eligibility(facts: VisionFacts, *, mode: str, max_pages: int) -> Visi
     ):
         return VisionEligibility(False, "NOT_PDF")
     if facts.doc_type not in READ_DOC_TYPES or not facts.scanned:
+        # The reason string predates PO/GRN reading ("scanned document"); kept as stored.
         return VisionEligibility(False, "NOT_SCANNED_INVOICE")
     if facts.page_count < 1:
         return VisionEligibility(False, "NO_PAGES")
     if facts.page_count > max_pages:
         return VisionEligibility(False, "TOO_MANY_PAGES")
-    # With the switch on AI every scanned invoice is read, whether or not the rules
+    # With the switch on AI every scanned invoice, PO and GRN is read, whether or not the rules
     # reading needs a check (owner, 29 Oct 2026, step 6 D1).
     return VisionEligibility(True)
 

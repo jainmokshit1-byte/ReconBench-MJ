@@ -21,9 +21,10 @@ from reconbench_app.db.ids import new_id
 from reconbench_app.db.metadata import metadata
 from reconbench_app.ingestion import BatchVersionConflict, IngestionFailure, IngestionService
 from reconbench_app.settings import Settings
+from reconbench_core.schema import UploadZone
 from sqlalchemy.engine import Engine
 from tests.integration.test_pd_no_duplicates import _invoice, _setup, _upload_invoice
-from tests.integration.test_phase4_task_411_413 import scratch_engine
+from tests.integration.test_phase4_task_411_413 import _grn_csv, _upload_csv, scratch_engine
 
 __all__ = ["scratch_engine"]
 
@@ -428,3 +429,92 @@ def test_the_verify_endpoint_needs_the_loaded_version_and_one_clear_choice(
         )
         assert nothing.status_code == 422, nothing.text
         assert nothing.json()["code"] == "ai_value_none_to_verify"
+
+
+def test_a_grn_value_read_by_ai_can_be_verified(scratch_engine: Engine, tmp_path: Any) -> None:
+    """3 Nov 2026: the scanned-document switch covers GRNs, so their AI values are verified
+    like an invoice's (no AI_VERIFY_UNSUPPORTED)."""
+
+    changed = "line 1 received_qty"
+    actor, ingestion, batch_id = _setup(scratch_engine, "pd4d-grn", tmp_path)
+    _upload_csv(
+        ingestion,
+        actor,
+        batch_id,
+        zone=UploadZone.GRN,
+        display_name="grn-pd4d.csv",
+        content=_grn_csv("GRN-PD4D-1", date(2026, 9, 10), "PO-PD4D-1"),
+        job_base=10,
+        mapping={"PO Ref": "po_refs", "GRN No": "doc_no", "GRN Date": "doc_date"},
+    )
+    document = metadata.tables["document"]
+    with scratch_engine.connect() as connection:
+        document_id = connection.execute(
+            sa.select(document.c.id).where(
+                document.c.workspace_id == actor.workspace_id,
+                document.c.doc_type == "grn",
+                document.c.doc_no == "GRN-PD4D-1",
+            )
+        ).scalar_one()
+    _copy_version(scratch_engine, document_id, method="pdf_ocr", ai=False)
+    _copy_version(scratch_engine, document_id, method="ai_first", ai=True, changed=changed)
+
+    before = _details(ingestion, actor, document_id)
+    values = _by_label(before)
+    assert {"doc_no", changed} <= set(values)
+    assert not any(item["verified"] for item in values.values())
+    assert values[changed]["agrees"] is False
+    chosen = values[changed]
+
+    after = ingestion.verify_ai_values(
+        actor,
+        document_id,
+        expected_version=int(before["document"]["version"]),
+        values=[(chosen["line_id"], chosen["field_name"])],
+    )
+
+    assert after is not None
+    assert {label for label, item in _by_label(after).items() if item["verified"]} == {changed}
+    assert [
+        item["after_state"]["verified_fields"] for item in _audit(scratch_engine, document_id)
+    ] == [[changed]]
+
+    # "Verify all" covers the values that agree with the OCR reading, as on an invoice.
+    everything = ingestion.verify_ai_values(
+        actor,
+        document_id,
+        expected_version=int(after["document"]["version"]),
+        all_agreeing=True,
+    )
+    assert everything is not None
+    assert all(item["verified"] for item in everything["ai_values"])
+
+
+def test_verifying_the_last_ai_value_queues_vendor_and_link_matching_again(
+    scratch_engine: Engine, tmp_path: Any
+) -> None:
+    # Links rest on no unverified AI value (PD-2b), so they are re-matched only once all are.
+    actor, ingestion, document_id = _ai_read_invoice(scratch_engine, "pd4d-rematch", tmp_path)
+    queue = ingestion.queue
+    before = _details(ingestion, actor, document_id)
+    jobs_before = len(queue.jobs)  # type: ignore[attr-defined]
+
+    partial = ingestion.verify_ai_values(
+        actor,
+        document_id,
+        expected_version=int(before["document"]["version"]),
+        all_agreeing=True,
+    )
+    assert partial is not None
+    assert len(queue.jobs) == jobs_before  # type: ignore[attr-defined]
+
+    item = _by_label(partial)[_DIFFERENT]
+    last = ingestion.verify_ai_values(
+        actor,
+        document_id,
+        expected_version=int(partial["document"]["version"]),
+        values=[(item["line_id"], item["field_name"])],
+    )
+    assert last is not None and all(value["verified"] for value in last["ai_values"])
+    new_jobs = queue.jobs[jobs_before:]  # type: ignore[attr-defined]
+    assert [name for name, _file in new_jobs] == ["resolve_vendors"]

@@ -226,6 +226,35 @@ def test_line_arithmetic_against_a_consistent_ocr_line() -> None:
     assert check.dropped["line_arithmetic"] == 1
 
 
+def _taxed_line(**cells: str) -> VisionLine:
+    base = {"description": "Item", "quantity": "10", "rate": "100.00", "amount": "1000.00"}
+    return VisionLine(1, (200, 50, 220, 900), {**base, **cells})
+
+
+def test_a_half_gst_rate_beside_equal_cgst_and_sgst_is_left_out() -> None:
+    check = _check(lines=(_taxed_line(tax_rate="9", cgst="90.00", sgst="90.00"),))
+    [line] = check.lines
+    assert line.value("tax_rate") is None
+    assert line.value("cgst") == Decimal("90.00") and line.value("amount") == Decimal("1000.00")
+    assert check.dropped["split_tax_rate"] == 1
+
+
+@pytest.mark.parametrize(
+    "cells",
+    [
+        {"tax_rate": "18", "cgst": "90.00", "sgst": "90.00"},  # the whole GST rate
+        {"tax_rate": "9", "cgst": "90.00"},  # no SGST cell to compare with
+        {"tax_rate": "9", "cgst": "90.00", "sgst": "60.00"},  # unequal taxes
+        {"tax_rate": "18", "igst": "180.00"},
+    ],
+)
+def test_other_line_tax_rates_are_kept(cells: dict[str, str]) -> None:
+    check = _check(lines=(_taxed_line(**cells),))
+    [line] = check.lines
+    assert line.value("tax_rate") == Decimal(cells["tax_rate"])
+    assert "split_tax_rate" not in check.dropped
+
+
 def test_annotations_stay_annotations() -> None:
     reading = VisionReading(
         "invoice",

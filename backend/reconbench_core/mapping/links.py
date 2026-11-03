@@ -3275,6 +3275,12 @@ def resolve_links(
     for update in verification_updates:
         updates_by_source.setdefault(update.document_id, []).append(update)
 
+    # Scanned POs and GRNs can be read by AI too: a link to one also waits for its check.
+    unverified_ai = {
+        document.document_id
+        for document in sorted_documents
+        if _has_unverified_ai_values(document.document)
+    } | {po.document_id for po in sorted_pos if _has_unverified_ai_values(po.document)}
     final: list[LinkResolution] = []
     for source in sorted_documents:
         result = output[source.document_id]
@@ -3302,24 +3308,25 @@ def resolve_links(
             result = result.model_copy(
                 update={"links": _honour_line_rejections(source, result.links)}
             )
-        if _has_unverified_ai_values(source.document):
-            # A value read by AI counts only after a person's check (PD-2b): no link that
-            # rests on such a document is automatic, whatever the method (step 6 R1, PD-3b).
-            result = result.model_copy(
-                update={
-                    "links": tuple(
-                        link.model_copy(
-                            update={
-                                "state": LinkState.SUGGESTED,
-                                "evidence": f"{link.evidence}; AI-read values not verified",
-                            }
-                        )
-                        if link.state is LinkState.AUTO
-                        else link
-                        for link in result.links
+        # A value read by AI counts only after a person's check (PD-2b): no link that
+        # rests on such a document is automatic, whatever the method (step 6 R1, PD-3b).
+        result = result.model_copy(
+            update={
+                "links": tuple(
+                    link.model_copy(
+                        update={
+                            "state": LinkState.SUGGESTED,
+                            "evidence": f"{link.evidence}; AI-read values not verified",
+                        }
                     )
-                }
-            )
+                    if link.state is LinkState.AUTO
+                    and unverified_ai
+                    & {source.document_id, link.to_document_id, link.via_document_id}
+                    else link
+                    for link in result.links
+                )
+            }
+        )
         issue, detail = last_issues[source.document_id]
         reason_detail = result.reason_detail or detail
         reference_text = result.reference_text

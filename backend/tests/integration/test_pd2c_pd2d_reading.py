@@ -43,7 +43,7 @@ from tests.integration.test_ai_vision import (
     keys,
     make_world,
 )
-from tests.support.scan_images import scanned_invoice_pdf
+from tests.support.scan_images import scanned_invoice_pdf, tesseract_with_english
 
 # Fixtures shared with the vision mechanics tests (their gate patch is not imported).
 __all__ = ["engine", "keys", "make_world"]
@@ -237,10 +237,78 @@ def _switch_audit(engine: Engine, world: World) -> list[tuple[Any, Any]]:
 # --------------------------------------------------------------------------- PD-2d
 
 
+def _scanned_po_lines(number: str) -> tuple[str, ...]:
+    return (
+        "PURCHASE ORDER",
+        f"PO No: PO/SYN/26-27/{number}",
+        "PO Date: 01/04/2026",
+        f"Supplier: {SUPPLIER_NAME}",
+        f"Supplier GSTIN: {SUPPLIER_GSTIN}",
+        "1  Synthetic Laptop Model X1   8471   2 Nos   50,000.00   1,00,000.00",
+        "Taxable Value: 1,00,000.00",
+    )
+
+
+def _scanned_grn_lines(number: str) -> tuple[str, ...]:
+    return (
+        "GOODS RECEIPT NOTE",
+        f"GRN No: GRN/SYN/26-27/{number}",
+        "Date: 05/04/2026",
+        f"Supplier: {SUPPLIER_NAME}",
+        f"GSTIN: {SUPPLIER_GSTIN}",
+        f"Reference No. & Date: PO/SYN/26-27/{number} 02/04/2026",
+        "Synthetic Laptop Model X1      2 Nos",
+    )
+
+
+def test_scanned_po_and_grn_follow_the_one_switch(engine: Engine, make_world: Any) -> None:
+    """3 Nov 2026: with the switch on rules a scanned PO/GRN makes 0 AI requests; on AI it is
+    read by the company server like a scanned invoice and waits for that reading."""
+
+    if not tesseract_with_english():
+        pytest.skip("Tesseract with English data is required to read a synthetic scan")
+    world = make_world()
+    _company_server(engine, world, capable=True, scanned="rules")
+    rules_ids = _upload(
+        world, scanned_invoice_pdf(_scanned_po_lines("04-078")), name="po-rules.pdf", zone="po"
+    ) + _upload(
+        world, scanned_invoice_pdf(_scanned_grn_lines("04-078")), name="grn-rules.pdf", zone="grn"
+    )
+    assert rules_ids
+    assert world.queue.vision_versions == [] and _request_count(engine, world) == 0
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.update(SETTINGS)
+            .where(SETTINGS.c.workspace_id == world.workspace_id)
+            .values(scanned_invoice_reader="ai", version=SETTINGS.c.version + 1)
+        )
+    ai_ids = _upload(
+        world, scanned_invoice_pdf(_scanned_po_lines("04-079")), name="po-ai.pdf", zone="po"
+    ) + _upload(
+        world, scanned_invoice_pdf(_scanned_grn_lines("04-079")), name="grn-ai.pdf", zone="grn"
+    )
+    assert ai_ids
+    read = {_current(engine, document_id)["id"] for document_id in ai_ids}
+    assert set(world.queue.vision_versions) == read
+    assert _prepare(world) == ["queued"] * len(read)
+    assert _request_count(engine, world) == len(read)
+    with engine.connect() as connection:
+        providers = set(
+            connection.scalars(
+                sa.select(REQUESTS.c.provider).where(REQUESTS.c.workspace_id == world.workspace_id)
+            )
+        )
+    assert providers == {"vllm"}
+
+
 def test_rules_switch_digital_invoices_and_po_grn_files_make_zero_ai_requests(
     engine: Engine, make_world: Any
 ) -> None:
-    """Every upload below makes 0 ``ai_request`` rows; scans read with rules stay rules."""
+    """Every upload below makes 0 ``ai_request`` rows; scans read with rules stay rules.
+
+    The digital PO and GRN files stay rules-only with the switch on AI (a scanned PO/GRN is
+    read by AI: ``test_scanned_po_and_grn_follow_the_one_switch``)."""
 
     world = make_world()
     _company_server(engine, world, capable=True, scanned="rules")

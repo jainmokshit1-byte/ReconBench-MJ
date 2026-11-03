@@ -998,7 +998,7 @@ def test_runner_logs_unknown_when_failing_call_not_identifiable() -> None:
 
 _SHAPE_LOG = re.compile(
     r"vision_answer_shape request=\S+ call=(page \d+|band) finish=\S+ out=\d+"
-    r"( [a-z_]+=\d+){9}"
+    r"( [a-z_]+=\d+){9} names=(-|[a-z_]+:\d+(,[a-z_]+:\d+)*)"
 )
 
 

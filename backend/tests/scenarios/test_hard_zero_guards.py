@@ -298,12 +298,46 @@ def test_ai_read_po_reference_at_full_confidence_is_suggested_never_auto(
     assert not result.field_verifications
 
 
+@pytest.mark.parametrize("verification", [FieldVerification.NONE, FieldVerification.USER])
+def test_a_link_to_a_po_whose_number_was_read_by_ai_waits_for_a_person(
+    verification: FieldVerification,
+) -> None:
+    # Scanned POs can be read by AI too: the link's target counts like its source.
+    invoice = mapping_case._source(
+        10,
+        mapping_case._document(
+            mapping_case._invoice_xml("INV-10", po_ref="PO-100", qty="100", amount="1000"),
+            DocType.INVOICE,
+        ),
+    )
+    po = mapping_case._po(20, mapping_case._document(mapping_case._po_xml("PO-100"), DocType.PO))
+    doc_no = po.document.header.doc_no
+    assert doc_no is not None
+    header = po.document.header.model_copy(
+        update={
+            "doc_no": doc_no.model_copy(
+                update={
+                    "origin": FieldOrigin.AI,
+                    "source": FieldSource.AI,
+                    "confidence": Decimal("1"),
+                    "verification": verification,
+                }
+            )
+        }
+    )
+    ai_po = po.model_copy(update={"document": po.document.model_copy(update={"header": header})})
+
+    result = resolve_links([invoice], [ai_po])[0]
+
+    assert result.links
+    expected = LinkState.AUTO if verification is FieldVerification.USER else LinkState.SUGGESTED
+    assert [link.state for link in result.links] == [expected]
+
+
 # --- FALSE_MATCHED: an invoice read by AI is never Matched before a person verifies it (PD-2b)
 
 
-@pytest.mark.parametrize(
-    "verification", [FieldVerification.NONE, FieldVerification.SYSTEM_CHECK]
-)
+@pytest.mark.parametrize("verification", [FieldVerification.NONE, FieldVerification.SYSTEM_CHECK])
 def test_ai_read_invoice_at_full_confidence_is_never_matched_until_a_person_verifies_it(
     verification: FieldVerification,
 ) -> None:
@@ -464,4 +498,3 @@ def test_hard_zero_target_never_returns_inactive_provider() -> None:
         target_provider, target_model = rules_snap.target(hook)
         assert target_provider is None
         assert target_model is None
-

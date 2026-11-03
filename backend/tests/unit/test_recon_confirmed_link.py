@@ -105,6 +105,25 @@ def test_an_unconfirmed_link_below_the_threshold_still_needs_review(state: LinkS
     assert case.status is CaseStatus.NEEDS_REVIEW
 
 
+@pytest.mark.parametrize("state", [LinkState.SUGGESTED, LinkState.AUTO])
+def test_an_unconfirmed_po_link_below_the_threshold_is_a_case_reason(state: LinkState) -> None:
+    # The check was always there; the case's own reason list now says it too.
+    case = _case(state, LinkMethod.CONTENT, "0.88")
+    assert ReasonCode.LINK_INFERRED in case.reason_codes
+    assert len(case.reason_codes) == len(set(case.reason_codes))
+
+
+def test_a_confirmed_or_sure_po_link_is_not_a_case_reason() -> None:
+    assert (
+        ReasonCode.LINK_INFERRED
+        not in _case(LinkState.CONFIRMED, LinkMethod.CONTENT, "0.88").reason_codes
+    )
+    assert (
+        ReasonCode.LINK_INFERRED
+        not in _case(LinkState.AUTO, LinkMethod.CONTENT, "0.99").reason_codes
+    )
+
+
 def test_a_confirmed_content_link_reads_like_a_verified_link() -> None:
     confirmed = _case(LinkState.CONFIRMED, LinkMethod.CONTENT, "0.88")
     verified = _case(LinkState.AUTO, LinkMethod.CONTENT, "0.99")

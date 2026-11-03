@@ -387,6 +387,9 @@ def merge_readings(
         # The AI read the page, so it is no longer unreadable; it still needs a person.
         reasons_out.discard(ReasonCode.NO_TEXT_LAYER)
         reasons_out.add(ReasonCode.LOW_CONFIDENCE_DATA)
+    if any(item.outcome == "ocr_only_line" for item in line_checks):
+        # The merged version carries only the lines the AI read; say so on the document.
+        reasons_out.add(ReasonCode.AI_LINES_MISSING)
     document = ocr.model_copy(
         update={
             "header": header,

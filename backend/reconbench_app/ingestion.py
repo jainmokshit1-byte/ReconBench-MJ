@@ -25,6 +25,7 @@ import sqlalchemy as sa
 from botocore.exceptions import BotoCoreError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from reconbench_core.extraction.extract import accept_date
+from reconbench_core.extraction.merge import CROSS_CHECK_KEY
 from reconbench_core.extraction.pages import split_pages
 from reconbench_core.extraction.vision import (
     align_lines as align_vision_lines,
@@ -54,6 +55,7 @@ from reconbench_core.schema import (
     FieldVerification,
     FileFormat,
     InvoiceHeader,
+    ReasonCode,
     UploadZone,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -450,6 +452,22 @@ def _event(
             job_id=job_id,
             detail=dict(detail) if detail is not None else None,
         )
+    )
+
+
+def rules_only_line_numbers(document: Document) -> list[int]:
+    """Rules-reading line numbers the AI merge left out (``ocr_only_line`` cross-checks)."""
+
+    crosses = document.header.extras.get(CROSS_CHECK_KEY, ())
+    return sorted(
+        {
+            int(parts[1])
+            for item in crosses
+            if isinstance(item, Mapping)
+            and item.get("outcome") == "ocr_only_line"
+            and len(parts := str(item.get("field", "")).split(":")) == 3
+            and parts[1].isdigit()
+        }
     )
 
 
@@ -2583,14 +2601,14 @@ class IngestionService:
     def _queue_vision_reading(
         self, connection: Connection, workspace_id: UUID, version_ids: Sequence[UUID]
     ) -> None:
-        """Queue vision page preparation for scanned invoices; never blocks parsing.
+        """Queue vision page preparation for scanned invoices, POs and GRNs; never blocks parsing.
 
-        Only scanned invoices with the switch on AI are read (``scanned_readings``). Each
+        Only scanned documents with the switch on AI are read (``scanned_readings``). Each
         one waits for its reading in this same transaction, so mapping never sees its
         rules version as ready (PD-2f); one the reader can't take, or that can't be
         queued, fails at once with the reason (D5). H1 is never queued (D103, PD-2d):
-        digital invoices, PO/GRN files and scanned invoices with the switch on rules make
-        no LLM call. The H1 code is kept.
+        digital files and scanned files with the switch on rules make no LLM call. The H1
+        code is kept.
         """
 
         if self.ai_hooks is None or not version_ids:
@@ -3439,7 +3457,7 @@ class IngestionService:
         document: Document,
         ai_call_id: UUID,
     ) -> UUID:
-        """Append the AI reading of a scanned invoice as its current version (PD-2e).
+        """Append the AI reading of a scanned document as its current version (PD-2e).
 
         Runs in the general worker's consensus transaction. ``extraction_method`` is
         ``ai_first`` and ``reading_method`` ``ai`` (the database check ties them). Every AI
@@ -3534,7 +3552,61 @@ class IngestionService:
                 version=document_table.c.version + 1,
             )
         )
+        if ReasonCode.AI_LINES_MISSING in document.reason_codes:
+            self._warn_ai_lines_missing(
+                connection,
+                workspace_id=workspace_id,
+                document_id=document_id,
+                version_id=version_id,
+                file_id=cast(UUID, previous_version["source_file_id"]),
+                document=document,
+            )
         return version_id
+
+    @staticmethod
+    def _warn_ai_lines_missing(
+        connection: Connection,
+        *,
+        workspace_id: UUID,
+        document_id: UUID,
+        version_id: UUID,
+        file_id: UUID,
+        document: Document,
+    ) -> None:
+        """Tell the person the AI version left out lines the rules reading had.
+
+        The earlier open warning of an older AI version is closed, so one stays open.
+        The rules reading's line numbers are listed; no values are copied.
+        """
+
+        numbers = rules_only_line_numbers(document)
+        table = metadata.tables["document_warning"]
+        connection.execute(
+            sa.update(table)
+            .where(
+                table.c.workspace_id == workspace_id,
+                table.c.document_id == document_id,
+                table.c.code == ReasonCode.AI_LINES_MISSING.value,
+                table.c.resolved_at.is_(None),
+            )
+            .values(resolved_at=sa.func.now())
+        )
+        connection.execute(
+            sa.insert(table).values(
+                id=new_id(),
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version_id=version_id,
+                source_file_id=file_id,
+                code=ReasonCode.AI_LINES_MISSING.value,
+                level="warning",
+                message=(
+                    f"The AI reading left out {len(numbers)} line(s) the rules reading found; "
+                    "compare the line list with the page."
+                ),
+                detail={"rules_line_numbers": numbers},
+            )
+        )
 
     @staticmethod
     def _write_warnings(
@@ -4438,7 +4510,7 @@ class IngestionService:
                 # Step 6 D4: the AI answer would land on an outdated version (PD-2f).
                 raise IngestionFailure(
                     "READING_PENDING",
-                    "This invoice is waiting for its AI reading. "
+                    "This document is waiting for its AI reading. "
                     "Choose Retry or Read with rules first.",
                 )
             doc_type = str(current_document["doc_type"])
@@ -5106,7 +5178,7 @@ class IngestionService:
             raise BatchVersionConflict("The document changed after it was loaded.")
         if current["reading_state"] not in states:
             raise IngestionFailure(
-                "READING_STATE_CHANGED", "This invoice's reading changed; reload the page."
+                "READING_STATE_CHANGED", "This document's reading changed; reload the page."
             )
         return current
 
@@ -5114,7 +5186,7 @@ class IngestionService:
     def retry_reading(
         self, actor: ActorContext, document_id: UUID, *, expected_version: int
     ) -> dict[str, Any] | None:
-        """A person asks the active provider to read a failed invoice again (PD-2f).
+        """A person asks the active provider to read a failed document again (PD-2f).
 
         Only while the switch is on AI and the reader can take the file (D6); the request
         goes to the active provider only and never replays a cached answer. Audited.
@@ -5169,7 +5241,7 @@ class IngestionService:
     def read_with_rules(
         self, actor: ActorContext, document_id: UUID, *, expected_version: int
     ) -> dict[str, Any] | None:
-        """A person chooses the rules reading of a waiting or failed invoice (PD-2f).
+        """A person chooses the rules reading of a waiting or failed document (PD-2f).
 
         The version the rules read is already current; from now on mapping, vendor
         resolution and reconciliation use it, and a late AI answer is ignored. Audited.
@@ -5200,7 +5272,7 @@ class IngestionService:
                     "document_version_id": str(version_id),
                 },
                 after_state={"reading_state": reading_state.READY},
-                reason="Invoice read with rules by user choice.",
+                reason="Document read with rules by user choice.",
             )
             source_file_id = connection.scalar(
                 sa.select(version_table.c.source_file_id).where(
@@ -5261,9 +5333,11 @@ class IngestionService:
                 return None
             if int(current_document["version"]) != expected_version:
                 raise BatchVersionConflict("The document changed after it was loaded.")
-            if current_document["doc_type"] != DocType.INVOICE.value:
+            if current_document["doc_type"] not in _AI_VERIFY_DOC_TYPES:
                 raise IngestionFailure(
-                    "AI_VERIFY_UNSUPPORTED", "Values read by AI are verified on invoices only."
+                    "AI_VERIFY_UNSUPPORTED",
+                    "Values read by AI are verified on invoices, purchase orders and goods "
+                    "receipts only.",
                 )
             version_id = cast(UUID, current_document["current_version_id"])
             version = (
@@ -5375,6 +5449,14 @@ class IngestionService:
                 scope_id=document_id,
                 reason="values read by AI verified by user",
             )
+            if len(chosen) == len(waiting) and version["source_file_id"] is not None:
+                # The last AI value is verified: links held as suggestions only because of
+                # unverified AI values (links.py, PD-2b) are matched again; it queues mapping.
+                self.queue.enqueue(
+                    "resolve_vendors",
+                    file_id=cast(UUID, version["source_file_id"]),
+                    connection=connection,
+                )
         return self.get_document(actor.workspace_id, document_id)
 
     def _record_correction_qa(
@@ -6490,6 +6572,10 @@ def _verified_by_review(
     field_name = str(row["field_name"])
     return field_name in references or field_name in shown_key_fields
 
+
+# Document types whose AI-read values a person verifies (invoice since PD-4d; PO and GRN
+# since the scanned-document switch covers them, 3 Nov 2026).
+_AI_VERIFY_DOC_TYPES = frozenset({DocType.INVOICE.value, DocType.PO.value, DocType.GRN.value})
 
 # Rules readings of a PDF: the OCR cross-check a value read by AI is shown beside (PD-4d).
 _CROSS_CHECK_METHODS = frozenset({ExtractionMethod.PDF_TEXT.value, ExtractionMethod.PDF_OCR.value})

@@ -324,13 +324,25 @@ def _facts(**overrides: Any) -> VisionFacts:
         (_facts(), "rules_only", "MODE_OFF"),
         (_facts(file_format="xml", extraction_method="xml_profile"), "ai_first", "NOT_PDF"),
         (_facts(extraction_method="manual"), "ai_first", "NOT_PDF"),
-        # PD-2d: only scanned invoices; digital invoices and PO/GRN files are rules only.
+        # PD-2d: only scanned documents; digital invoices, POs and GRNs are rules only.
         (_facts(extraction_method="pdf_text", scanned=False), "ai_first", "NOT_SCANNED_INVOICE"),
         # An OCR assist on a digital page is ``pdf_ocr`` but not scanned (D103 decision 1).
         (_facts(scanned=False), "ai_first", "NOT_SCANNED_INVOICE"),
-        (_facts(doc_type="po"), "ai_first", "NOT_SCANNED_INVOICE"),
-        (_facts(doc_type="grn"), "ai_first", "NOT_SCANNED_INVOICE"),
-        (_facts(doc_type="po", extraction_method="pdf_text"), "ai_first", "NOT_SCANNED_INVOICE"),
+        (_facts(doc_type="po", scanned=False), "ai_first", "NOT_SCANNED_INVOICE"),
+        (_facts(doc_type="grn", scanned=False), "ai_first", "NOT_SCANNED_INVOICE"),
+        (
+            _facts(doc_type="po", extraction_method="pdf_text", scanned=False),
+            "ai_first",
+            "NOT_SCANNED_INVOICE",
+        ),
+        # Other document types stay unwired.
+        (_facts(doc_type="credit_note"), "ai_first", "NOT_PDF"),
+        (
+            _facts(doc_type="po", file_format="xml", extraction_method="xml_profile"),
+            "ai_first",
+            "NOT_PDF",
+        ),
+        (_facts(doc_type="grn", page_count=9), "ai_first", "TOO_MANY_PAGES"),
         (_facts(page_count=9), "ai_first", "TOO_MANY_PAGES"),
         (_facts(page_count=0), "ai_first", "NO_PAGES"),
     ],
@@ -342,6 +354,16 @@ def test_ineligible_versions(facts: VisionFacts, mode: str, reason: str) -> None
 def test_only_scanned_invoice_pdfs_are_eligible() -> None:
     facts = _facts(needs_verification=False)
     assert vision_eligibility(facts, mode="ai_first", max_pages=8).eligible
+
+
+@pytest.mark.parametrize("doc_type", ["invoice", "po", "grn"])
+@pytest.mark.parametrize("mode", ["ai_assisted", "ai_first"])
+def test_scanned_invoice_po_and_grn_pdfs_are_eligible(doc_type: str, mode: str) -> None:
+    # Owner decision 3 Nov 2026: the one scanned-invoice switch covers scanned POs and GRNs.
+    assert vision_eligibility(_facts(doc_type=doc_type), mode=mode, max_pages=8).eligible
+    assert vision_eligibility(
+        _facts(doc_type=doc_type, extraction_method="pdf_text"), mode=mode, max_pages=8
+    ).eligible
 
 
 def test_every_scanned_invoice_is_eligible_even_when_the_rules_reading_needs_no_check() -> None:

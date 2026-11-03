@@ -20,6 +20,7 @@ class CheckDefinition:
 
 
 CHECK_REGISTRY = (
+    CheckDefinition("s1.ai_lines_read", 1, "S1"),
     CheckDefinition("s1.ai_values_verified", 1, "S1"),
     CheckDefinition("s1.exact_duplicate", 1, "S1"),
     # Version 2 (PD-2b): a value a person verified or corrected counts as certain.

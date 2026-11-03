@@ -196,7 +196,8 @@
         "EXTRA_CHARGE",
         "GRN_OVER_PO",
         "LATE_DELIVERY",
-        "AI_VALUE_UNVERIFIED"
+        "AI_VALUE_UNVERIFIED",
+        "AI_LINES_MISSING"
       ],
       "title": "ReasonCode",
       "type": "string"

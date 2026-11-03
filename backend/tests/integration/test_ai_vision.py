@@ -97,7 +97,7 @@ CONSENSUS_DECISIONS = metadata.tables["consensus_decision"]
 def _reader_mechanics_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test-only: the digital fixture counts as scanned and any active reader may read it.
 
-    PO/GRN files stay unreadable (``READ_DOC_TYPES`` is not widened).
+    PO/GRN files are readable too (``READ_DOC_TYPES``, 3 Nov 2026).
     """
 
     pages = vision._version_pages
@@ -1058,14 +1058,32 @@ def test_an_answer_nothing_can_merge_fails_the_reading(
     assert _reading(engine, document_id) == ("failed", reading_state.MERGE_FAILED)
 
 
-def test_grn_pdfs_are_never_read_by_ai(engine: Engine, make_world: Any) -> None:
-    """PD-2d: PO/GRN files are always read by rules, even with the reader gate open."""
+def test_scanned_grn_pdfs_are_read_by_ai_with_the_switch_on_ai(
+    engine: Engine, make_world: Any
+) -> None:
+    """3 Nov 2026: the one scanned-document switch covers GRNs (the fixture marks it scanned)."""
 
     world = make_world()
-    _upload(world, _grn_pdf(), name="vision-grn.pdf", zone="grn")
+    document_id = _upload(world, _grn_pdf(), name="vision-grn.pdf", zone="grn")
+    assert len(world.queue.vision_versions) == 1
+    assert _reading(engine, document_id) == ("waiting", None)
+    assert _prepare(world) == ["queued"]
+    assert len(world.ai_queue.request_ids) == 1
+    assert len(_vision_requests(engine, world)) == 1
+    assert _page_rows(engine, world) != []
+
+
+def test_grn_pdfs_with_the_switch_on_rules_make_no_ai_request(
+    engine: Engine, make_world: Any
+) -> None:
+    """With the switch on rules a GRN is read by rules, whatever the reader gate says."""
+
+    world = make_world(vision_on=False)
+    document_id = _upload(world, _grn_pdf(), name="vision-grn-rules.pdf", zone="grn")
     assert world.queue.vision_versions == []
     assert world.ai_queue.request_ids == [] and _vision_requests(engine, world) == []
     assert _page_rows(engine, world) == []
+    assert _reading(engine, document_id) == ("ready", None)
 
 
 def test_without_page_images_no_h1_is_queued(make_world: Any) -> None:

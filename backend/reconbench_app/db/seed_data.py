@@ -682,4 +682,17 @@ REASON_CODES = (
         "is_proposed": False,
         "is_active": True,
     },
+    {
+        # Not added to existing workspaces by a migration; the web has the same text.
+        "code": "AI_LINES_MISSING",
+        "level": "review",
+        "stage": "S1",
+        "title": "AI reading is missing lines",
+        "message": "The AI reading has fewer lines than the rules reading of the same file.",
+        "suggested_action": "Compare the invoice line list with the page before verifying.",
+        "overridable": True,
+        "level_configurable": False,
+        "is_proposed": False,
+        "is_active": True,
+    },
 )

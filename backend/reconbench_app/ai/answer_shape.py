@@ -10,7 +10,10 @@ number or coordinate from the answer is ever returned or logged.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
+
+from reconbench_core.extraction.vision import FIELD_KINDS
 
 TAIL_PERIOD_MAX = 400
 """Longest repeating unit (characters) looked for at the end of an answer."""
@@ -20,6 +23,9 @@ TAIL_REPEATS = 3
 _ROW_KEY = re.compile(r'"description"\s*:')
 _BOX = re.compile(r'"box_2d"\s*:\s*\[([^\]]*)\]')
 _SPACE = re.compile(r"\s+")
+_NAME = re.compile(r'"name"\s*:\s*"([a-z_]+)"')
+NAMES_LOGGED = 12
+"""Most repeated field names that the log line lists."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,13 +46,17 @@ class AnswerShape:
     """``\\u`` escapes, which cost several tokens each."""
     tail_period: int
     """Smallest unit (1..TAIL_PERIOD_MAX) the end repeats TAIL_REPEATS times; 0 if none."""
+    names: tuple[tuple[str, int], ...] = ()
+    """The most repeated field names with their counts; only names of the reader's fixed
+    list are counted (anything else is not named)."""
 
     def log_text(self) -> str:
         return (
             f"chars={self.chars} ws_outside={self.ws_outside} "
             f"newlines_outside={self.newlines_outside} longest_ws_run={self.longest_ws_run} "
             f"rows={self.rows} boxes={self.boxes} distinct_boxes={self.distinct_boxes} "
-            f"unicode_escapes={self.unicode_escapes} tail_period={self.tail_period}"
+            f"unicode_escapes={self.unicode_escapes} tail_period={self.tail_period} "
+            f"names={','.join(f'{name}:{count}' for name, count in self.names) or '-'}"
         )
 
 
@@ -84,6 +94,11 @@ def answer_shape(content: str) -> AnswerShape:
         distinct_boxes=len(set(boxes)),
         unicode_escapes=content.count("\\u"),
         tail_period=_tail_period(content),
+        names=tuple(
+            Counter(name for name in _NAME.findall(content) if name in FIELD_KINDS).most_common(
+                NAMES_LOGGED
+            )
+        ),
     )
 
 

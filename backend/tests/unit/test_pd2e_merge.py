@@ -47,9 +47,10 @@ def _ocr(
     *,
     lines: tuple[dict[str, Any], ...] = (),
     reasons: tuple[ReasonCode, ...] = (ReasonCode.NO_TEXT_LAYER,),
+    doc_type: str = "invoice",
     **overrides: dict[str, Any],
 ) -> Document:
-    header: dict[str, Any] = {"doc_type": "invoice", "extras": {"source": "ocr"}}
+    header: dict[str, Any] = {"doc_type": doc_type, "extras": {"source": "ocr"}}
     header.update({name: _field(value) for name, value in (fields or {}).items()})
     header.update(overrides)
     return Document.model_validate(
@@ -66,9 +67,10 @@ def _check(
     lines: tuple[AcceptedLine, ...] = (),
     pages: tuple[VisionPageKind, ...] = (),
     annotations: tuple[AcceptedAnnotation, ...] = (),
+    doc_kind: str = "invoice",
 ) -> VisionCheck:
     return VisionCheck(
-        doc_kind="invoice",
+        doc_kind=doc_kind,
         fields=fields,
         lines=lines,
         annotations=annotations,
@@ -255,6 +257,21 @@ def test_a_line_only_the_rules_read_is_listed_for_the_person() -> None:
     assert len(result.document.lines) == 1
     [only] = [item for item in result.cross_checks if item.outcome == "ocr_only_line"]
     assert (only.field, only.ocr) == ("line:2:*", "7.00")
+    # The document itself says so, not only the cross-check kept in its extras.
+    assert ReasonCode.AI_LINES_MISSING in result.document.reason_codes
+
+
+def test_no_missing_lines_reason_when_the_ai_read_every_line() -> None:
+    ocr_lines = (
+        {"line_no": 1, "amount": _field(Decimal("100.00"))},
+        {"line_no": 2, "amount": _field(Decimal("7.00"))},
+    )
+    result = merge_readings(
+        _ocr({"doc_no": "INV-1"}, lines=ocr_lines),
+        _check(lines=(_line(1, "100.00"), _line(2, "7.00"))),
+    )
+    assert not [item for item in result.cross_checks if item.outcome == "ocr_only_line"]
+    assert ReasonCode.AI_LINES_MISSING not in result.document.reason_codes
 
 
 def test_without_ai_lines_the_ocr_lines_stay() -> None:
@@ -266,6 +283,8 @@ def test_without_ai_lines_the_ocr_lines_stay() -> None:
     [line] = result.document.lines
     assert line.amount is not None and line.amount.value == Decimal("100.00")
     assert line.amount.origin is FieldOrigin.OCR
+    # No AI lines at all keeps every rules line; nothing was left out.
+    assert ReasonCode.AI_LINES_MISSING not in result.document.reason_codes
 
 
 def test_an_empty_answer_is_not_usable_and_changes_no_value() -> None:
@@ -339,6 +358,91 @@ def test_non_empty_different_ocr_list_is_still_disagree() -> None:
     assert cross["outcome"] == "disagree"
     assert cross["reason"] == LLM_DISAGREEMENT
     assert [item.field for item in result.disagreements] == ["header:po_refs"]
+
+
+def _qty_line(index: int, qty: str) -> AcceptedLine:
+    cells = (
+        AcceptedCell("description", f"Synthetic item {index}", f"Synthetic item {index}"),
+        AcceptedCell("quantity", qty, Decimal(qty)),
+    )
+    return AcceptedLine(index, 1, BOX, cells)
+
+
+def test_a_scanned_grn_merges_with_received_qty_from_the_ai_quantity() -> None:
+    """3 Nov 2026: the scanned-document switch covers GRNs; the merge already handles them."""
+
+    ocr_lines = (
+        {
+            "line_no": 1,
+            "description": _field("Synthetic item 1"),
+            "received_qty": _field(Decimal("2")),
+        },
+    )
+    result = merge_readings(
+        _ocr(
+            {"doc_no": "GRN-55", "supplier_invoice_no": "SYN-INV-1"},
+            lines=ocr_lines,
+            doc_type="grn",
+        ),
+        _check(
+            _ai("doc_no", "doc_no", "GRN-55", "GRN-55"),
+            _ai("po_ref", "po_ref", "PO-1", "PO-1"),
+            lines=(_qty_line(1, "5"),),
+            doc_kind="goods_receipt",
+        ),
+    )
+    document = result.document
+    assert document.header.doc_type.value == "grn"
+    [line] = document.lines
+    # The GRN's AI "quantity" is the received quantity; no invoice-style quantity is set.
+    assert line.received_qty is not None and line.received_qty.value == Decimal("5")
+    assert line.quantity is None
+    for value in (line.received_qty, document.header.doc_no, document.header.po_refs):
+        assert value is not None
+        assert (value.origin, value.source, value.verification) == (
+            FieldOrigin.AI,
+            FieldSource.AI,
+            FieldVerification.NONE,
+        )
+        assert value.confidence is not None and value.confidence < Decimal("0.70")
+    assert document.needs_verification
+    crosses = {item.field: item for item in result.cross_checks}
+    assert crosses["line:1:received_qty"].outcome == "disagree"
+    assert crosses["line:1:received_qty"].ocr == "2"
+    assert crosses["header:doc_no"].outcome == "agree"
+    # The rules reading's other header value stays its OCR value.
+    invoice_no = document.header.supplier_invoice_no  # type: ignore[union-attr]
+    assert invoice_no is not None and invoice_no.origin is FieldOrigin.OCR
+
+
+def test_a_scanned_po_merges_header_values_and_takes_no_status_from_the_ai() -> None:
+    result = merge_readings(
+        _ocr({"doc_no": "PO-77", "grand_total": Decimal("1000.00")}, doc_type="po"),
+        _check(
+            _ai("doc_no", "doc_no", "PO-77", "PO-77"),
+            _ai("supplier_name", "text", "Synthetic Supplier", "Synthetic Supplier"),
+            _ai("grand_total", "money", "1,180.00", Decimal("1180.00")),
+            _ai("payment_terms", "text", "30 days", "30 days"),
+            # A reader answer named "status" has no PO status field to land in.
+            _ai("status", "text", "open", "open"),
+            doc_kind="purchase_order",
+        ),
+    )
+    header = result.document.header
+    assert header.doc_type.value == "po"
+    assert header.doc_no is not None and header.doc_no.value == "PO-77"
+    assert header.vendor_name is not None and header.vendor_name.origin is FieldOrigin.AI
+    assert header.grand_total is not None and header.grand_total.value == Decimal("1180.00")
+    assert header.payment_terms is not None  # type: ignore[union-attr]
+    for value in (header.doc_no, header.vendor_name, header.grand_total):
+        assert value is not None
+        assert (value.origin, value.verification) == (FieldOrigin.AI, FieldVerification.NONE)
+        assert value.confidence is not None and value.confidence < Decimal("0.70")
+    # No PO status comes from the AI: the field stays empty and is not cross-checked.
+    assert header.status is None  # type: ignore[union-attr]
+    assert not any(item.field == "header:status" for item in result.cross_checks)
+    assert "status" in header.extras["vision"]["other_fields"]
+    assert result.document.needs_verification
 
 
 def test_person_held_empty_value_is_still_person_kept() -> None:
