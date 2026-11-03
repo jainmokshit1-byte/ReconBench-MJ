@@ -165,3 +165,10 @@ export function checkRows(
     };
   });
 }
+
+// The correction body for "Accept item match": every line is sent (a correction removes the
+// lines it leaves out); only the accepted line gets the PO line reference.
+export function itemMatchLines(value: unknown, lineNo: number, poLineNo: number): Array<Record<string, unknown>> {
+  const current = Array.isArray(value) ? value.filter((line): line is Record<string, unknown> => typeof line === "object" && line !== null) : [];
+  return current.map((line) => ({ id: line["id"], line_no: line["line_no"], ...(line["line_no"] === lineNo ? { po_line_ref: String(poLineNo) } : {}) }));
+}

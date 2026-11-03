@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router";
 import type { CaseSummary } from "../api/reconciliation";
 import { checkRows, REASON_TEXT } from "../utils/reconChecks";
 import { CaseFixLinks, CaseTableRow, CheckTable } from "./ReconciliationPage";
+import { itemMatchLines } from "../utils/reconChecks";
 
 // The engine's ReasonCode values (reconbench_core/schema ReasonCode), checked in order.
 const ENGINE_REASON_CODES = [
@@ -175,5 +176,26 @@ describe("case Issues column and fix links", () => {
   it("shows no fix link for other reasons", () => {
     renderFix(["RATE_HIGH", "QTY_OVER_PO"]);
     expect(screen.queryAllByRole("link")).toHaveLength(0);
+  });
+});
+
+describe("itemMatchLines", () => {
+  it("keeps every line and sets the PO line only on the accepted one", () => {
+    const body = itemMatchLines(
+      [
+        { id: "a", line_no: 1, description: "x" },
+        { id: "b", line_no: 2, description: "y" },
+      ],
+      2,
+      5,
+    );
+    expect(body).toEqual([
+      { id: "a", line_no: 1 },
+      { id: "b", line_no: 2, po_line_ref: "5" },
+    ]);
+  });
+
+  it("returns nothing for a missing line list", () => {
+    expect(itemMatchLines(undefined, 1, 1)).toEqual([]);
   });
 });

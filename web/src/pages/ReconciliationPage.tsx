@@ -19,12 +19,12 @@ import {
   retryReconciliationExport,
   runManualReconciliation,
 } from "../api/reconciliation";
-import { listCurrentDocuments, type DocumentRow } from "../api/ingestion";
+import { correctDocument, getDocumentDetails, listCurrentDocuments, type DocumentRow } from "../api/ingestion";
 import type { CaseDetailResponse, CaseSummary, ExportSummary, RunSummary } from "../api/reconciliation";
 import { AiLineOpinion } from "../components/AiLineOpinion";
 import { AiSharingBanner } from "../components/AiSharingBanner";
 import { PageHeader } from "../components/PageHeader";
-import { checkRows, reasonTitle, REASON_TEXT, type CheckRow, type ReasonText } from "../utils/reconChecks";
+import { checkRows, itemMatchLines, reasonTitle, REASON_TEXT, type CheckRow, type ReasonText } from "../utils/reconChecks";
 import { useAuth } from "../auth/useAuth";
 import { usePeriod } from "../contexts/usePeriod";
 
@@ -484,6 +484,22 @@ export function ReconciliationPage() {
   const caseInvoiceId = typeof detailCase?.["invoice_id"] === "string" ? detailCase["invoice_id"] : (selectedItem?.invoice_id ?? null);
   const caseVendorId = typeof detailCase?.["vendor_id"] === "string" ? detailCase["vendor_id"] : (selectedItem?.vendor_id ?? null);
   const caseReasonCodes = Array.isArray(detailCase?.["reason_codes"]) ? detailCase["reason_codes"].filter((code): code is string => typeof code === "string") : (selectedItem?.reason_codes ?? []);
+  const canCorrect = hasCapability("files.upload");
+  const [itemNotice, setItemNotice] = useState<string | null>(null);
+  // "Accept item match": a person ties a weakly matched invoice line to the PO line shown.
+  const acceptItemMatch = useCallback(async (lineNo: number, poLineNo: number) => {
+    if (!caseInvoiceId || !user?.csrf_token) return;
+    try {
+      const document = await getDocumentDetails(caseInvoiceId);
+      const lines = itemMatchLines(document["lines"], lineNo, poLineNo);
+      const header = document["document"];
+      const version = typeof header === "object" && header !== null ? Number((header as Record<string, unknown>)["version"]) : Number.NaN;
+      await correctDocument(caseInvoiceId, version, { lines, verified: false, reason: "Item match accepted by a person" }, user.csrf_token);
+      setItemNotice(`Line ${lineNo} is now matched to PO line ${poLineNo}. Run reconciliation again to update the status.`);
+    } catch (cause: unknown) {
+      setItemNotice(cause instanceof Error ? cause.message : "The item match could not be saved.");
+    }
+  }, [caseInvoiceId, user?.csrf_token]);
 
   const selectCaseFromRow = useCallback((caseId: string) => selectCase(caseId), [selectCase]);
   const toggleCaseSelection = useCallback((caseId: string, selected: boolean) => {
@@ -678,7 +694,8 @@ export function ReconciliationPage() {
             </section>
             <section className="case-panel-section"><h3>Why this status</h3><CheckTable rows={checkRows(checks(detail.case["checks"]), reasonCatalogue)} /></section>
             <section className="case-panel-section" aria-label="Cumulative PO and GRN ledger"><h3>Cumulative PO / GRN ledger</h3><div className="case-ledger-list">{detail.lines.map((line, index) => <div className="case-ledger-row" key={`ledger-${String(line["line_no"])}-${index}`}><strong>Line {String(line["line_no"] ?? index + 1)}</strong><span>PO ordered <b>{String(line["po_qty"] ?? "—")}</b></span><span>Billed before <b>{String(line["billed_before"] ?? "—")}</b></span><span>This invoice <b>{String(line["billed_qty"] ?? "—")}</b></span><span>GRN accepted <b>{String(line["grn_accepted_cum"] ?? "—")}</b></span><span>Balance after <b>{String(line["balance_after"] ?? "—")}</b></span></div>)}{!detail.lines.length ? <p>No linked line ledger is available for this case.</p> : null}</div></section>
-            <section className="case-panel-section"><h3>Invoice | PO | GRN lines</h3><div className="case-lines-wrap"><table className="case-lines-table"><thead><tr><th>Line</th><th>Item result</th><th>Invoice qty</th><th>PO qty</th><th>GRN accepted</th><th>Billed before</th><th>Balance after</th><th>Status</th></tr></thead><tbody>{detail.lines.map((line, index) => <tr key={`${String(line["line_no"])}-${index}`}><td>{String(line["line_no"] ?? index + 1)}</td><td>{label(line["alignment_state"])}<AiLineOpinion value={line["ai_opinion"]} /></td><td>{String(line["billed_qty"] ?? "—")}</td><td>{String(line["po_qty"] ?? "—")}</td><td>{String(line["grn_accepted_cum"] ?? "—")}</td><td>{String(line["billed_before"] ?? "—")}</td><td>{String(line["balance_after"] ?? "—")}</td><td>{label(line["status"])}</td></tr>)}</tbody></table></div></section>
+            {itemNotice ? <p className="case-item-notice" role="status">{itemNotice}</p> : null}
+            <section className="case-panel-section"><h3>Invoice | PO | GRN lines</h3><div className="case-lines-wrap"><table className="case-lines-table"><thead><tr><th>Line</th><th>Item result</th><th>Invoice qty</th><th>PO qty</th><th>GRN accepted</th><th>Billed before</th><th>Balance after</th><th>Status</th></tr></thead><tbody>{detail.lines.map((line, index) => <tr key={`${String(line["line_no"])}-${index}`}><td>{String(line["line_no"] ?? index + 1)}</td><td>{label(line["alignment_state"])}<AiLineOpinion value={line["ai_opinion"]} />{canCorrect && line["alignment_state"] === "unsure" && typeof line["po_line_no"] === "number" && typeof line["line_no"] === "number" ? <button className="text-link" type="button" onClick={() => void acceptItemMatch(line["line_no"] as number, line["po_line_no"] as number)}>Accept match to PO line {line["po_line_no"]}</button> : null}</td><td>{String(line["billed_qty"] ?? "—")}</td><td>{String(line["po_qty"] ?? "—")}</td><td>{String(line["grn_accepted_cum"] ?? "—")}</td><td>{String(line["billed_before"] ?? "—")}</td><td>{String(line["balance_after"] ?? "—")}</td><td>{label(line["status"])}</td></tr>)}</tbody></table></div></section>
             <section className="case-panel-section"><h3>Source evidence</h3>{detail.documents.map((document, index) => <details className="case-evidence-document" key={`${String(document["document_id"])}-${index}`}><summary>{label(document["doc_type"])} · {String(document["doc_no"] ?? "No document number")} · {displayDate(document["doc_date"])}</summary><div className="case-evidence-fields">{Array.isArray(document["fields"]) ? document["fields"].map((field, fieldIndex) => isEvidenceField(field) ? <EvidenceField key={`${field.field}-${fieldIndex}`} field={field} /> : null) : null}<small>Source file: {String(document["display_name"] ?? "unavailable")}</small></div></details>)}</section>
             <section className="case-panel-section"><h3>Decision history</h3><ol className="case-history">{detail.history.map((event, index) => <li key={`${String(event["id"])}-${index}`}><strong>{label(event["action"])}</strong><span>{String(event["reason"] ?? event["note"] ?? "")}</span><small>{String(event["occurred_at"] ?? "")}</small></li>)}</ol>{!detail.history.length ? <p>No human actions yet.</p> : null}</section>
             {canDecide ? <div className="case-action-bar"><button className="button button-primary" type="button" onClick={() => setActionDialog("approve")}><Check size={14} /> Approve</button><button className="button" type="button" onClick={() => setActionDialog("hold")}>Hold</button><button className="button button-danger" type="button" onClick={() => setActionDialog("reject")}>Reject</button><button className="button button-subtle" type="button" onClick={() => setActionDialog("note")}>Add note</button>{detail.case["overlay"] ? <button className="button button-subtle" type="button" onClick={() => { setActionText(""); setActionDialog("release"); }}>Release decision</button> : null}</div> : <div className="case-readonly-state">Read-only view. You do not have permission to change this case.</div>}
