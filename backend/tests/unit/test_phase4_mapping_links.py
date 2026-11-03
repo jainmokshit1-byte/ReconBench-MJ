@@ -2205,3 +2205,28 @@ def test_fallback_does_not_change_an_already_linked_invoice() -> None:
     result = resolve_links([invoice], [po])[0]
     assert result.links
     assert all(link.method is LinkMethod.LABELED for link in result.links)
+
+
+def test_no_reference_undated_grn_of_an_unpriced_po_is_suggested() -> None:
+    # The PO was read with no lines (balance unknown, 0) and the GRN with no date.
+    invoice = _source(10, _document(_bare_invoice_xml(), DocType.INVOICE))
+    grn_xml = _bare_grn_xml("GRN-F", "PO-F").replace("<GRNDate>20260201</GRNDate>", "")
+    grn = _verify_header_reference(_source(11, _document(grn_xml, DocType.GRN)), "po_refs")
+    po = _po(20, _document(_bare_po_xml("PO-F", total="0"), DocType.PO)).model_copy(
+        update={"open_balance": Decimal("0")}
+    )
+    result = _result_for(resolve_links([invoice, grn], [po]), invoice)
+    po_links = [link for link in result.links if link.link_type.value == "inv_po"]
+    assert len(po_links) == 1 and po_links[0].state is LinkState.SUGGESTED
+
+
+def test_no_reference_spent_priced_po_gives_no_link() -> None:
+    invoice, docs, pos = _fallback_case()
+    xml = _bare_po_xml("PO-F").replace(
+        "</PurchaseOrder>",
+        "<Line><Description>Item</Description><Quantity>1</Quantity><Rate>1000</Rate>"
+        "<Amount>1000</Amount></Line></PurchaseOrder>",
+    )
+    spent = _po(20, _document(xml, DocType.PO)).model_copy(update={"open_balance": Decimal("0")})
+    assert _document(xml, DocType.PO).lines, "fixture must have a priced line"
+    assert not _result_for(resolve_links(docs, [spent]), invoice).links

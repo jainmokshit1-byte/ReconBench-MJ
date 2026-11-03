@@ -3042,6 +3042,10 @@ def _amount_and_date_agree(
     return abs((invoice_date - target_date).days) <= config.date_normal_days
 
 
+def _has_priced_lines(document: Document) -> bool:
+    return any(line.quantity is not None and line.rate is not None for line in document.lines)
+
+
 def _unreferenced_fallback_links(
     source: MappingDocument,
     documents: tuple[MappingDocument, ...],
@@ -3078,7 +3082,8 @@ def _unreferenced_fallback_links(
         if (
             po.vendor_id != source.vendor_id
             or po.document_id in source.rejected_po_ids
-            or po.open_balance <= _ZERO
+            # A PO read without priced lines has no known balance, not a spent one.
+            or (po.open_balance <= _ZERO and _has_priced_lines(po.document))
             or (status is not None and status.value in {POStatus.CANCELLED, POStatus.CLOSED})
         ):
             continue
