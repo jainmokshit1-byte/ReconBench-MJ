@@ -587,7 +587,7 @@ def get_case(case_id: UUID, request: Request) -> Response:
         value["fields"] = fields_by_version.get(cast(UUID, value["current_version_id"]), [])
         evidence_docs.append(value)
     content = {
-        "case": to_jsonable({**dict(row), "is_stale": is_stale}),
+        "case": to_jsonable({**dict(row), "case_id": row["id"], "is_stale": is_stale}),
         "lines": to_jsonable(
             [
                 {**dict(item), "ai_opinion": opinion_states[cast(UUID, item["id"])]}

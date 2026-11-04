@@ -716,6 +716,8 @@ def test_case_payload_shows_late_opinion_and_never_answers_304_while_it_can_chan
     with _case_client(engine, world) as client:
         first = client.get(f"/api/v1/cases/{case_id}")
         assert first.status_code == 200, first.text
+        # The web case panel opens only when the detail names the case it was asked for.
+        assert first.json()["case"]["case_id"] == str(case_id)
         etag = first.headers["ETag"]
         lines = {line["line_no"]: line["ai_opinion"] for line in first.json()["lines"]}
         assert lines == {
