@@ -2694,3 +2694,26 @@ vendor_name               8        0        2       10      80.0%         [0.490
   - the old code cannot read SERIAL_DIFF, so first check that no case or catalogue use blocks it (owner's go);
   - downgrade to 0036 only with the owner's go;
   - restore the b17 dump only if data went wrong.
+
+## D126 - b18 live: re-read with rules, GRN link confirm, override, field errors (4 Nov 2026)
+- **What:** no engine or rules change (engine 0.1.17, Alembic 0037, rules hash unchanged). Tag `live-20261104-b18`. One lead plus two Sonnet sub-agents.
+- **Changes:**
+  - **Read again with rules:** `POST /documents/{id}/reading/reread-rules`, `IngestionService.reread_with_rules`, and a button in ReadingStatus. A ready document's stored file is read again by the rules only, never AI, as a new current version. Earlier versions are kept and no verification is carried over.
+    - It refuses, changing nothing, when the file's document count changed or the document can't be found again.
+    - It is audited as `document.reread_rules`.
+  - **GRN link confirm:** `mapping_service._edit_link_in` lets a person confirm or remove an invoice→GRN link, never move it. Confirming keeps the link's evidence. The Mapping page has a "Confirm GRN link" button. A suggested GRN link kept a case in LINK_INFERRED with no way to clear it.
+  - **Override:** the correction editor shows "Values don't add up" when the version's correction QA failed. It sends `override_reason` only when the reviewed box is ticked and a reason is given.
+  - **Field-named 422 errors:** `api/conventions.py:validation_errors` gives a plain reason without echoing the value. The web renders text such as "Line 2 · Discount: must have at most 2 decimals".
+- **Verified:**
+  - offline suite: 1672 passed;
+  - web: 95 passed, tsc and lint clean (the HealthPage test flakes under full-suite load and passes on re-run);
+  - mypy --strict, lint-imports and the rules hash pass;
+  - integration: new test_reread_rules, test_grn_link_confirm and the related files pass.
+- **Known test-harness issue (not b18):** running `test_pd2f_waiting_for_reading` before `test_pd4d_verify_ai_values` leaves a session open on the template DB. The next clones then error with "source database has active sessions". It is the same on b17 `main`; run those files separately.
+- **Deploy:**
+  - pre-checks: queue 0; Alembic 0037; switch rules v48 (owner's change);
+  - backup `live-db-20261104-b18.dump` (7,641,540 bytes), restored with 59 tables identical;
+  - `:pre-b18` rollback tags;
+  - the first build was interrupted by a Docker engine restart. Live stayed on b17, the counts were re-checked unchanged, and the second build was OK;
+  - setup kept 0037; `/readyz` 200; new code in api, worker and ai-worker; 0 log errors; all counters unchanged.
+- **Rollback:** re-tag `:pre-b18` → `:latest`, then `docker compose up -d api worker ai-worker`. No migration to undo.

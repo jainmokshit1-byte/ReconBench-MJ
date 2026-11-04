@@ -1,5 +1,5 @@
 # Project status
-Last verified: 2026-11-04, live as live-20261104-b17 (run-2 fixes + health page; engine 0.1.17, migration 0037, D124/D125) (pushed to origin/main; branch renamed from phase2-hosted-ci); switch on AI (version 47); 152 ai_request; KI-006 root cause found, fix deferred; step-10 record still owed
+Last verified: 2026-11-04, live as live-20261104-b18 (re-read with rules, GRN link confirm, override, field errors; engine 0.1.17, migration 0037, D126) (pushed to origin/main; branch renamed from phase2-hosted-ci); switch on rules (version 48); 152 ai_request; KI-006 root cause found, fix deferred; step-10 record still owed
 
 ## Components
 Status: working-verified | implemented-untested | partial | stub | broken | not-found | unknown
@@ -25,6 +25,7 @@ Unit-level "working-verified" = offline suite passed this session; not proven on
 - `make accuracy-bench` — not run: needs Docker worker image and owner's local truth set
 
 ## Active task
+- b18 (4 Nov, live, D126): "Read again with rules" for ready documents, "Confirm GRN link" on Mapping, "Values don't add up" override in the correction editor, field-named save errors. Owner next: §7 confirm GRN link; §8 override with a reason; §10 Document total 400; re-run Reconciliation.
 - b17 (4 Nov, live, D124/D125): lump-sum amount rule (PD-3c), unread-header-totals review, line-tax totals + derived grand total, spread freight, serial check (SERIAL_DIFF), suggested fallback link, failed-QA saves not verified (+override_reason, no web control yet), export Not included / PO Balance / own GSTIN / payable incl. GST, OCR orientation warning, health page. Tests 1672 offline, 89 integration, web 83. Owner next: confirm §10 links, re-read §7, fix §8 taxable, re-run Reconciliation.
 - Step 9 complete (D117): KI-008 and KI-009 fixed in code and deployed (tag live-20261031-b10); doc-4 retried twice (2 vLLM requests against a budget of 1, 0 Gemini), each 3774 in / 3386 out; KI-009 fixed on beta (doc-4 stayed waiting, then failed at the request's own finish); both requests hit the output cap on page 1 (detail=at_output_cap, KI-006 confirmed); KI-008 partly seen (Retry got its own cache_key, no cache hit), end to end not yet seen.
 - Step 10 (31 Oct, after D117; record still owed, next free D-number): b11 (37cf3b4) sizes image tokens from real pixels, so doc-4's cap is 4096 (verified on beta). Doc-4 still filled 4096 (2 requests, one from the owner's re-upload). b12 (930ac02) logs `vision_answer_shape` counts per AI call. Its retry showed about 52 header fields on page 1 plus pretty-printed JSON (51% whitespace), not a loop and not rotation (KNOWN_ISSUES KI-006). Requests 129 → 132, 0 Gemini.
